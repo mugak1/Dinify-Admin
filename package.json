@@ -1,0 +1,50 @@
+{
+  "name": "dinify-admin",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "ng": "ng",
+    "start": "ng serve",
+    "build": "ng build",
+    "build:prod": "ng build --configuration=production",
+    "watch": "ng build --watch --configuration=development",
+    "test": "ng test",
+    "test:ci": "ng test --watch=false --browsers=ChromeHeadlessNoSandbox",
+    "lint": "eslint .",
+    "type-check": "tsc --noEmit -p tsconfig.app.json",
+    "check:tokens": "node scripts/check-design-tokens.mjs --self-test && node scripts/check-design-tokens.mjs",
+    "check:mock-isolation": "node scripts/check-mock-isolation.mjs"
+  },
+  "dependencies": {
+    "@angular/common": "^21.2.18",
+    "@angular/compiler": "^21.2.18",
+    "@angular/core": "^21.2.18",
+    "@angular/forms": "^21.2.18",
+    "@angular/platform-browser": "^21.2.18",
+    "@angular/router": "^21.2.18",
+    "@fontsource-variable/plus-jakarta-sans": "^5.2.8",
+    "rxjs": "^7.8.2",
+    "tslib": "^2.3.0",
+    "zone.js": "~0.15.1"
+  },
+  "devDependencies": {
+    "@angular/build": "^21.2.19",
+    "@angular/cli": "~21.2.19",
+    "@angular/compiler-cli": "^21.2.18",
+    "@eslint/js": "^9.39.5",
+    "@types/jasmine": "~4.3.0",
+    "angular-eslint": "^21.4.0",
+    "eslint": "^9.39.5",
+    "jasmine-core": "~4.5.0",
+    "karma": "~6.4.0",
+    "karma-chrome-launcher": "~3.1.0",
+    "karma-coverage": "~2.2.0",
+    "karma-jasmine": "~5.1.0",
+    "karma-jasmine-html-reporter": "~2.0.0",
+    "karma-spec-reporter": "^0.0.36",
+    "postcss": "^8.5.23",
+    "tailwindcss": "^3.4.1",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.67.0"
+  }
+}

@@ -1,0 +1,130 @@
+/* Plus Jakarta Sans — the ONE typeface. Gabarito and Bricolage Grotesque are the
+   customer surfaces' identity and are deliberately absent: that identity is exactly
+   what must not be reproduced on the control plane (spec §16). */
+@import '@fontsource-variable/plus-jakarta-sans/wght.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /*
+   * THE TOKEN TABLE. Every colour in this application is defined here and nowhere
+   * else — scripts/check-design-tokens.mjs fails the build if anything under
+   * `src/app` spells a hex, an rgb()/hsl() literal, an arbitrary text/rounded size,
+   * or a second font family. That guard is what keeps the §16 brand-red review cheap:
+   * without it the tokens are a suggestion.
+   *
+   * Values are HSL triples, not hex, so Tailwind's `/<alpha-value>` opacity modifier
+   * works (`bg-admin-accent/10`). Same construction as Dinify-Frontend.
+   */
+  :root {
+    /* --- Chrome: the dark frame. Half of what makes this application
+       --- unmistakable at a glance beside the restaurant portal. --- */
+    --admin-chrome: 220 13% 9%;
+    --admin-chrome-raised: 220 13% 13%;
+    --admin-chrome-border: 220 13% 19%;
+    --admin-chrome-fg: 216 12% 92%;
+    --admin-chrome-fg-muted: 218 10% 64%;
+
+    /* --- Working area: light, where the reading and the deciding happen. --- */
+    --admin-canvas: 220 18% 97%;
+    --admin-surface: 0 0% 100%;
+    --admin-surface-sunken: 210 20% 98%;
+    --admin-border: 218 16% 90%;
+    --admin-border-strong: 217 13% 81%;
+    --admin-fg: 223 14% 10%;
+    --admin-fg-muted: 217 9% 39%;
+    --admin-fg-subtle: 217 8% 55%;
+
+    /*
+     * --admin-accent IS brand red #FF2C32, byte-identical to Dinify-Frontend's
+     * --primary so the two surfaces' accent cannot drift.
+     *
+     * THIS IS THE SINGLE INTERACTIVE COLOUR. Every button, link, focus ring and
+     * selected state reads it and nothing else, so spec §16's pending "brand red at
+     * real density" review is a ONE-LINE change here — not a sweep through the
+     * component tree.
+     */
+    --admin-accent: 358 100% 59%;
+    --admin-accent-hover: 358 78% 51%;
+    --admin-accent-fg: 0 0% 100%;
+    --admin-accent-soft: 0 100% 96%;
+
+    /* Destructive ONLY — never the accent. White on this is ~6.4:1; white on brand
+       red is only ~3.7:1, so small white-on-red text must land here. */
+    --admin-danger: 3 71% 41%;
+    --admin-danger-hover: 3 72% 33%;
+    --admin-danger-fg: 0 0% 100%;
+    --admin-danger-soft: 6 76% 95%;
+
+    /* "Careful" — distinct from both "do this" and "this destroys something". */
+    --admin-warning: 26 90% 37%;
+    --admin-warning-fg: 0 0% 100%;
+    --admin-warning-soft: 36 93% 94%;
+
+    /* --- Lifecycle states. The vocabulary is fixed by
+       --- restaurants_app.controllers.lifecycle: onboarding / live / suspended /
+       --- offboarded. `suspended` shares the warning hue deliberately (suspension IS
+       --- the careful state); `offboarded` is a heavier, flatter grey than `neutral`
+       --- so "closed" and "no status" are not the same pill. --- */
+    --admin-state-onboarding: 251 65% 54%;
+    --admin-state-onboarding-soft: 250 82% 96%;
+    --admin-state-live: 156 76% 27%;
+    --admin-state-live-soft: 150 42% 93%;
+    --admin-state-suspended: 26 90% 37%;
+    --admin-state-suspended-soft: 36 93% 94%;
+    --admin-state-offboarded: 220 13% 26%;
+    --admin-state-offboarded-soft: 220 13% 89%;
+    --admin-state-neutral: 217 9% 45%;
+    --admin-state-neutral-soft: 216 16% 96%;
+    /* TEST is separated by FORM as well as hue — it is the only SOLID-FILLED pill in
+       the system, so it cannot be mistaken for a lifecycle state at a glance. §16:
+       test restaurants must be unmistakable. */
+    --admin-state-test: 207 88% 35%;
+    --admin-state-test-fg: 0 0% 100%;
+
+    --admin-shadow: 220 20% 10%;
+
+    /* Three radius steps, 8px maximum — far tighter than the sibling's 20px
+       `rounded-card`. Tight corners at this density read as a control plane. */
+    --admin-radius-sm: 3px;
+    --admin-radius-md: 5px;
+    --admin-radius-lg: 8px;
+  }
+
+  html {
+    /* 16px, the browser default. NOT the sibling's 14px: its own config records that
+       root as the origin of the arbitrary `text-[..px]` values it later had to sweep
+       out. Every size in this app is px-fixed regardless, so the root is simply
+       honest about it. */
+    font-size: 16px;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    @apply bg-canvas text-ink font-sans text-admin-body antialiased;
+    margin: 0;
+    min-height: 100vh;
+  }
+
+  /* VISIBLE FOCUS EVERYWHERE (§16 — keyboard-first, not mouse-only). Declared once,
+     in the accent, so nothing has to remember to add it and nothing can suppress it
+     by omission. */
+  :focus-visible {
+    outline: 2px solid hsl(var(--admin-accent));
+    outline-offset: 2px;
+    border-radius: var(--admin-radius-sm);
+  }
+
+  /* An element that manages its own focus ring (table rows) opts out here rather
+     than fighting the rule above. */
+  [data-focus-ring='self']:focus-visible {
+    outline: none;
+  }
+
+  th {
+    text-align: left;
+    font-weight: 600;
+  }
+}

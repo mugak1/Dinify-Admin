@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # NOTE: plain `npm ci`. Dinify-Frontend passes `--legacy-peer-deps`; that flag is
+      # NOT carried over, and its absence is deliberate rather than an oversight. A
+      # clean install of this dependency set resolves with no peer conflicts, and so
+      # does the sibling's own today — the flag there is a historical artefact. See
+      # CLAUDE.md. There is no `overrides` block either: the sibling's four entries
+      # exist for firebase-tools / gaxios / ng2-charts transitives, none of which are
+      # dependencies here.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npm run type-check
+
+      - name: Lint
+        run: npm run lint
+
+      # The design-token gate (ADMIN-TOKENS-00), BEFORE the suite so a token
+      # regression fails fast. `--self-test` runs first: a matcher that silently
+      # stopped matching would otherwise pass everything forever, and "the tree is
+      # clean today" is not evidence that a gate works. This is what keeps the §16
+      # brand-red review a one-line change instead of a sweep.
+      - name: Design-token gate
+        run: npm run check:tokens
+
+      - name: Test
+        run: npm run test:ci
+
+      - name: Build (production)
+        run: npm run build:prod
+
+      # Must run AFTER build:prod — it scans the built output. Fails if the mock
+      # authentication transport or the primitives gallery reached a production
+      # bundle. A mock authenticator shipped to the control plane is an
+      # authentication bypass with a friendly name.
+      - name: Mock-isolation gate
+        run: npm run check:mock-isolation

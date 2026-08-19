@@ -1,0 +1,31 @@
+name: Dependency Audit
+
+# Weekly npm audit sweep so the audit-zero state cannot silently erode.
+# Scheduled + manual only — NOT triggered on PRs, so it never produces a PR check and
+# cannot become a required/blocking gate. Fails (firing GitHub's scheduled-workflow
+# notification) when a high/critical advisory is found; lower severities still print
+# to the run log for visibility. Mirrors Dinify-Frontend's audit.yml.
+on:
+  schedule:
+    - cron: '30 6 * * 1'   # Mondays 06:30 UTC (09:30 EAT)
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high

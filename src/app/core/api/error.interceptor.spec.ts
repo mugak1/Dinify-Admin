@@ -1,5 +1,6 @@
 import {
   HttpClient,
+  HttpContext,
   HttpErrorResponse,
   provideHttpClient,
   withInterceptors,
@@ -21,8 +22,10 @@ import {
   REQUEST_ID_HEADER,
 } from './api.constants';
 import { csrfInterceptor } from './csrf.interceptor';
+import { SUPPRESS_DEFECT_REPORT } from './http-context';
 import { DefectService } from './defect.service';
 import { errorClassifierInterceptor } from './error.interceptor';
+import { AdminServiceStatus } from './service-status';
 
 const SESSION_BODY = {
   username: 'operator',
@@ -82,6 +85,7 @@ describe('errorClassifierInterceptor', () => {
   let backend: HttpTestingController;
   let router: jasmine.SpyObj<Router>;
   let defects: DefectService;
+  let status: AdminServiceStatus;
   let store: SessionStore;
   let auth: StubAuthApi;
   let elevation: StubElevation;
@@ -107,10 +111,71 @@ describe('errorClassifierInterceptor', () => {
     http = TestBed.inject(HttpClient);
     backend = TestBed.inject(HttpTestingController);
     defects = TestBed.inject(DefectService);
+    status = TestBed.inject(AdminServiceStatus);
     store = TestBed.inject(SessionStore);
   });
 
   afterEach(() => backend.verify());
+
+  // ── PRECONDITION ───────────────────────────────────────────────────────────────
+  describe('no usable response — prior to all four cases', () => {
+    it('marks the service unavailable on a dead network, and does NOT sign anyone out', () => {
+      store.adopt(SESSION_BODY);
+      http.get(PROTECTED).subscribe({ error: () => undefined });
+
+      backend.expectOne(PROTECTED).error(new ProgressEvent('error'));
+
+      expect(status.unavailable()).toBeTrue();
+      // The server never denied this session. Clearing it here would be a statement
+      // about the operator's credentials that nothing in the exchange supports.
+      expect(store.isAuthenticated()).toBeTrue();
+      expect(router.navigate).not.toHaveBeenCalled();
+    });
+
+    it('treats a 5xx as unavailable rather than as an unclassified defect', () => {
+      http.get(PROTECTED).subscribe({ error: () => undefined });
+      backend
+        .expectOne(PROTECTED)
+        .flush({ detail: 'boom' }, { status: 502, statusText: 'Bad Gateway', headers: { [REQUEST_ID_HEADER]: 'req-502' } });
+
+      // A server answering incoherently is the same ACTIONABLE state as one not
+      // answering: retry or report, and no operator action resolves it.
+      expect(status.unavailable()).toBeTrue();
+      expect(status.requestId()).toBe('req-502');
+      expect(defects.current()).toBeNull();
+    });
+
+    it('is NOT silenced by the suppression the auth transport sets', () => {
+      // Suppressing a 401 on an auth route is right — the login form renders it.
+      // Suppressing a 502 is how an afternoon disappears.
+      http
+        .get(apiUrl(AUTH_ROUTES.session), { context: new HttpContext().set(SUPPRESS_DEFECT_REPORT, true) })
+        .subscribe({ error: () => undefined });
+      backend
+        .expectOne(apiUrl(AUTH_ROUTES.session))
+        .flush('<html>502</html>', { status: 502, statusText: 'Bad Gateway' });
+
+      expect(status.unavailable()).toBeTrue();
+    });
+
+    it('clears itself as soon as anything answers', () => {
+      status.reportUnavailable('req-old');
+
+      http.get(PROTECTED).subscribe();
+      backend.expectOne(PROTECTED).flush({ ok: true });
+
+      // Self-healing, so the shell banner never has to be dismissed by hand.
+      expect(status.unavailable()).toBeFalse();
+      expect(status.requestId()).toBeNull();
+    });
+
+    it('counts a 401 as reachable — being told "no" is being told something', () => {
+      http.get(PROTECTED).subscribe({ error: () => undefined });
+      backend.expectOne(PROTECTED).flush({ detail: 'gone' }, { status: 401, statusText: 'Unauthorized' });
+
+      expect(status.unavailable()).toBeFalse();
+    });
+  });
 
   // ── CASE 1 ─────────────────────────────────────────────────────────────────────
   describe('401 — the session is gone', () => {
@@ -341,15 +406,18 @@ describe('errorClassifierInterceptor', () => {
 
   // ── Everything else ────────────────────────────────────────────────────────────
   describe('unclassified failures', () => {
-    it('reports a 500 as a defect, with the request id', () => {
+    it('reports an unexpected 4xx as a defect, with the request id', () => {
+      // 5xx is deliberately NOT here any more: the transport precondition claims it
+      // first, because "the service is not answering usefully" is a different thing to
+      // tell an operator than "this request was wrong".
       http.get(PROTECTED).subscribe({ error: () => undefined });
       backend
         .expectOne(PROTECTED)
-        .flush({ detail: 'boom' }, { status: 500, statusText: 'Server Error', headers: { [REQUEST_ID_HEADER]: 'req-500' } });
+        .flush({ detail: 'boom' }, { status: 418, statusText: 'Teapot', headers: { [REQUEST_ID_HEADER]: 'req-418' } });
 
       expect(defects.current()).toEqual({
         message: 'boom',
-        requestId: 'req-500',
+        requestId: 'req-418',
         kind: 'unclassified',
       });
     });
@@ -369,7 +437,7 @@ describe('errorClassifierInterceptor', () => {
       http.post(apiUrl(AUTH_ROUTES.login), {}).subscribe({ error: () => undefined });
       backend
         .expectOne(apiUrl(AUTH_ROUTES.login))
-        .flush({ status: 500, message: 'x' }, { status: 500, statusText: 'x' });
+        .flush({ status: 418, message: 'x' }, { status: 418, statusText: 'x' });
       // login/ is routed through the transport in production, which suppresses; here
       // the raw call does report, so assert the flag itself rather than the route.
       expect(defects.current()?.kind).toBe('unclassified');

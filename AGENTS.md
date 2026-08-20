@@ -14,10 +14,17 @@ Before making changes:
 5. Do not make broad refactors unless explicitly requested.
 6. Run `./scripts/verify.sh` before preparing a PR and paste the output.
 
-Two rules that are easy to break by habit:
+Four rules that are easy to break by habit:
 - Global navigation is FIVE destinations. New capability becomes a restaurant-detail
   tab or a needs-attention condition, never a sixth sidebar item.
 - Filters go in the URL via `core/url/query-param.ts`, never in component state.
+- Never branch on `instanceof HttpErrorResponse`. Mock-mode errors are an `Error`
+  subclass carrying `status`, so an instanceof check is dead code in the one mode this
+  work gets reviewed in. Use `classifyTransportFailure` from
+  `core/api/transport-failure.ts`.
+- An unreachable service is NOT a signed-out operator. Never clear the session store
+  for a failure the server did not answer — see the three bootstrap outcomes in
+  `CLAUDE.md`.
 
 For Codex Desktop work:
 - Use Worktree mode by default.

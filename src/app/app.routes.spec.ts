@@ -6,14 +6,19 @@ import { DEV_ROUTES } from './dev/dev-tools';
 import { NAV_DESTINATIONS } from './shell/navigation';
 
 /**
- * The scheme this application serves, per spec §9.2. Thirteen addresses, and each one
- * is a contract: the needs-attention items on Home link INTO them, so a rename is a
- * broken link somewhere the operator was told to look.
+ * The scheme this application serves, per spec §9.2, plus `/unavailable`. Fourteen
+ * addresses, and each one is a contract: the needs-attention items on Home link INTO
+ * them, so a rename is a broken link somewhere the operator was told to look.
+ *
+ * `/unavailable` is not a §9.2 destination and not a navigable one — it is the third
+ * bootstrap outcome, and it exists because a login form is the wrong thing to show an
+ * operator whose control plane is not answering.
  */
 const EXPECTED_PATHS = [
   '/',
   '/activity',
   '/login',
+  '/unavailable',
   '/receivables',
   '/receivables/:invoiceId',
   '/restaurants',
@@ -89,6 +94,16 @@ describe('app routes', () => {
 
     const shell = findRoute(routes, '');
     expect(shell?.canActivate?.length).toBe(1);
+  });
+
+  it('keeps /unavailable outside the shell, and gated to the state it names', () => {
+    // Outside, because there is no session to render a frame around. Gated, because a
+    // bookmarked URL must not claim an outage while the service is answering — that is
+    // the same confident false statement as a dead backend reading "Invalid
+    // credentials.", arriving from the other side.
+    const unavailable = findRoute(routes, 'unavailable');
+    expect(unavailable?.component).toBeDefined();
+    expect(unavailable?.canActivate?.length).toBe(1);
   });
 
   it('guards every authenticated destination through the shell', () => {

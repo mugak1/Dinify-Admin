@@ -1,8 +1,14 @@
 import { TestBed } from '@angular/core/testing';
 import { Observable, Subject, of, throwError } from 'rxjs';
 
+import { AdminServiceStatus } from '../api/service-status';
+import { NoticeService } from '../notices/notice.service';
 import { AdminAuthApi, ADMIN_AUTH } from './admin-auth.api';
-import { ElevationCancelledError, ElevationService } from './elevation.service';
+import {
+  ElevationAbandonedError,
+  ElevationCancelledError,
+  ElevationService,
+} from './elevation.service';
 import { AdminElevateResponse, SecondFactorMethod } from './session.model';
 import { SessionStore } from './session.store';
 
@@ -35,12 +41,16 @@ describe('ElevationService', () => {
   let service: ElevationService;
   let api: StubApi;
   let store: SessionStore;
+  let notices: NoticeService;
+  let status: AdminServiceStatus;
 
   beforeEach(() => {
     api = new StubApi();
     TestBed.configureTestingModule({ providers: [{ provide: ADMIN_AUTH, useValue: api }] });
     service = TestBed.inject(ElevationService);
     store = TestBed.inject(SessionStore);
+    notices = TestBed.inject(NoticeService);
+    status = TestBed.inject(AdminServiceStatus);
   });
 
   it('opens on the first request and counts every waiter', () => {
@@ -147,6 +157,64 @@ describe('ElevationService', () => {
 
     expect(api.calls.length).toBe(1);
     gate.complete();
+  });
+
+  it('records the recovery-code count, which elevate/ reports and used to drop', () => {
+    api.next = of({
+      elevated_at: '2026-08-19T12:00:00+00:00',
+      used_recovery_code: true,
+      recovery_codes_remaining: 1,
+    });
+
+    service.request().subscribe({ error: () => undefined });
+    service.submit('a-recovery-code');
+
+    // A re-elevation SPENDS a recovery code exactly as a sign-in does. Dropping the
+    // count here is how an operator reaches zero without ever being told.
+    expect(notices.notice()?.facts).toContain('One recovery code remains.');
+  });
+
+  it('DRAINS the queue when the service does not answer, rather than hanging', () => {
+    api.next = throwError(() => ({ status: 0 }));
+
+    const errors: unknown[] = [];
+    service.request().subscribe({ error: (err) => errors.push(err) });
+    service.request().subscribe({ error: (err) => errors.push(err) });
+    service.submit('123456');
+
+    // A refused CODE keeps the modal open so the operator can try again. A refused
+    // CONNECTION cannot be tried again into, and leaving two requests attached to a
+    // prompt that can never settle is a hang.
+    expect(errors.length).toBe(2);
+    expect(errors.every((err) => err instanceof ElevationAbandonedError)).toBeTrue();
+    expect(service.isOpen()).toBeFalse();
+    // Reported here as well as from the interceptor: mock mode has no interceptor, and
+    // the shell banner is the only thing that explains why the dialog just closed.
+    expect(status.unavailable()).toBeTrue();
+  });
+
+  it('drains the queue when the session ended underneath it', () => {
+    api.next = throwError(() => ({ status: 401, error: { detail: 'gone' } }));
+
+    let raised: unknown = null;
+    service.request().subscribe({ error: (err) => (raised = err) });
+    service.submit('123456');
+
+    // The classifier has already routed to /login. A modal left open over the login
+    // form would be gating an action with no session left to run in.
+    expect(raised).toBeInstanceOf(ElevationAbandonedError);
+    expect(service.isOpen()).toBeFalse();
+  });
+
+  it('says WHY it is open, so a deliberate re-auth is not described as an action', () => {
+    service.request('deliberate').subscribe({ error: () => undefined });
+    expect(service.reason()).toBe('deliberate');
+
+    // A real refusal joining the same attempt makes it action-required: something IS
+    // waiting on it now, and the copy should say so.
+    service.request().subscribe({ error: () => undefined });
+    expect(service.reason()).toBe('action-required');
+    expect(service.waiting()).toBe(2);
   });
 
   it('starts a fresh attempt after one settles', () => {

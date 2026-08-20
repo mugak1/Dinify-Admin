@@ -1,6 +1,6 @@
 import { Routes } from '@angular/router';
 
-import { authGuard } from './core/auth/auth.guard';
+import { authGuard, serviceUnavailableGuard } from './core/auth/auth.guard';
 import { DEV_ROUTES } from './dev/dev-tools';
 import { ActivityPage } from './features/activity.page';
 import { HomePage } from './features/home.page';
@@ -15,6 +15,7 @@ import {
   RestaurantSupportTab,
 } from './features/restaurant-tabs.pages';
 import { RestaurantsPage } from './features/restaurants.page';
+import { ServiceUnavailablePage } from './features/service-unavailable.page';
 import { SupportIssuePage, SupportPage } from './features/support.pages';
 import { ShellComponent } from './shell/shell.component';
 
@@ -28,7 +29,7 @@ import { ShellComponent } from './shell/shell.component';
  *   /restaurants/:id/readiness        /receivables/:invoiceId
  *   /restaurants/:id/billing          /activity
  *   /restaurants/:id/support          /login
- *   /restaurants/:id/activity
+ *   /restaurants/:id/activity         /unavailable
  *
  * ── THE DETAIL TABS ARE CHILDREN, NOT SIBLINGS ────────────────────────────────────
  *
@@ -42,6 +43,13 @@ import { ShellComponent } from './shell/shell.component';
  *
  * Nothing about the authenticated frame should render for an unauthenticated
  * operator — not the navigation, not an empty operator chip.
+ *
+ * ── AND SO DOES /unavailable ──────────────────────────────────────────────────────
+ *
+ * Neither is a DESTINATION — global navigation is still exactly five (§9). They are
+ * the two states in which the operator has no session to work with, and they are
+ * separate because they need opposite things from the operator: one asks for
+ * credentials, the other must not.
  *
  * ── FILTERS GO IN THE QUERY STRING, NOT HERE ──────────────────────────────────────
  *
@@ -57,6 +65,14 @@ import { ShellComponent } from './shell/shell.component';
  */
 export const routes: Routes = [
   { path: 'login', component: LoginPage, title: 'Sign in · Dinify Admin' },
+
+  {
+    path: 'unavailable',
+    component: ServiceUnavailablePage,
+    title: 'Unavailable · Dinify Admin',
+    // Guarded so a bookmarked URL cannot claim an outage that is not happening.
+    canActivate: [serviceUnavailableGuard],
+  },
 
   {
     path: '',

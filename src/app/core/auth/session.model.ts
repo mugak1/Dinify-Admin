@@ -68,3 +68,28 @@ export interface AdminElevateResponse {
  * Sending a default here would reinstate exactly that ordering.
  */
 export type SecondFactorMethod = 'totp' | 'recovery';
+
+/**
+ * Is this actually a session, or merely a 200?
+ *
+ * A body that parses as JSON but is not this shape is NOT a signed-out state, and the
+ * bare catch that used to swallow the resulting `TypeError` said it was. `adopt()`
+ * reaches `server_time` to anchor the clock, so a shapeless body fails there — deep
+ * inside the store, one frame away from anything that could describe it. Checking
+ * here turns that into a nameable transport failure the operator can act on.
+ *
+ * Field-for-field against `AdminSessionResponse` above, which is field-for-field
+ * against `AdminSessionView`.
+ */
+export function isAdminSessionResponse(value: unknown): value is AdminSessionResponse {
+  if (typeof value !== 'object' || value === null) return false;
+  const body = value as Record<string, unknown>;
+  return (
+    typeof body['username'] === 'string' &&
+    typeof body['email'] === 'string' &&
+    typeof body['issued_at'] === 'string' &&
+    typeof body['expires_at'] === 'string' &&
+    (body['elevated_at'] === null || typeof body['elevated_at'] === 'string') &&
+    typeof body['server_time'] === 'string'
+  );
+}

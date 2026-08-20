@@ -640,6 +640,52 @@ runners, which is why the old SSH path died at connect timeout. The backend's
 `AWS_DEPLOY_ROLE_ARN` repository *variable* (an ARN is not a secret) which the workflow
 compares byte-for-byte against the ARN pinned in the file before authenticating.
 
+### THE PRIVILEGE BOUNDARY — TWO JOBS, AND IT MUST STAY TWO JOBS
+
+**No application or npm dependency code may ever run in a job carrying
+`id-token: write`.** That is the invariant; everything below is how it is kept.
+
+`id-token: write` is a JOB-level permission. When a job holds it the runner exports
+`ACTIONS_ID_TOKEN_REQUEST_URL` and `ACTIONS_ID_TOKEN_REQUEST_TOKEN` into **every** step
+of that job from the first one onward, so any code executing there — including an
+`npm ci` lifecycle script from any transitive dependency — can mint an OIDC token and
+exchange it for the deploy role's AWS credentials. `configure-aws-credentials` is a
+CONSUMER of that capability, not its source. **Putting the build before the AWS action
+is therefore NOT a boundary**, which is what an earlier revision of the workflow
+incorrectly claimed. Step ordering inside one job protects nothing.
+
+| job | `id-token` | runs |
+|---|---|---|
+| `prepare` | **absent** (`contents: read`, `actions: read` only) | certification, `npm ci`, `build:prod`, mock-isolation, packaging |
+| `deploy` | `write` | artifact validation, OIDC, S3, SSM, served-state assertions |
+
+`deploy` has **no checkout at all**, no `npm`, no package.json script and no Angular
+build. It runs workflow shell, first-party actions and the AWS CLI, and it treats the
+incoming tarball strictly as DATA — validated, hashed, uploaded, never extracted and
+never executed on the privileged side. Do not merge these jobs, and do not add a build
+or a checkout to `deploy`.
+
+Two consequences worth keeping straight:
+
+- **Identity crosses the boundary as step/job OUTPUTS, never `$GITHUB_ENV`.** The
+  untrusted npm phase sits between certification and the privileged job, and
+  `$GITHUB_ENV` is mutable job-wide state. `deploy` additionally re-derives the SHA and
+  mode from the raw workflow inputs and requires exact equality with what `prepare`
+  certified, and re-runs the ancestry and CI checks against *current* main through the
+  API — no checkout needed.
+- **The authoritative artifact digest is computed in `deploy`, not in `prepare`.** The
+  build job's digest is diagnostic only. What names the S3 key and what the box
+  re-derives is the SHA-256 of the bytes that actually arrived, so the attestation
+  covers what crossed the boundary rather than what the build claimed it sent. The
+  archive is also validated there — member shapes, and `release.txt` read out of the
+  tarball in memory and required to attest the revalidated SHA — all **before** OIDC
+  authentication.
+
+`prepare` checks out with `persist-credentials: false` and then asserts no
+`http.*.extraheader` credential is present, because that job goes on to run `npm ci`.
+Nothing after checkout needs an authenticated git operation: `fetch-depth: 0` brings the
+history down, so the ancestry proof and the target checkout are both purely local.
+
 ### The release layout on the box
 ```
 /var/www/dinify-admin                      → SYMLINK to the live release
@@ -671,11 +717,19 @@ admits an untested commit, and CI-green alone admits a PR-branch run (CI runs on
 or a commit since dropped from main.
 
 **`mode=rollback` re-points the symlink at an already-installed release and does
-nothing else** — no build, no `npm ci`, no S3 upload, no extraction, no repair. If the
-release directory is not already on the box it fails; rollback never reconstructs one.
-That makes reverting a seconds-scale operation rather than a rebuild of old code.
+nothing else** — no build, no `npm ci`, no artifact upload or download, no S3 transfer,
+no extraction, no repair. If the release directory is not already on the box it fails;
+rollback never reconstructs one. That makes reverting a seconds-scale operation rather
+than a rebuild of old code.
 
-### What makes the job green
+**The free-space floor does not apply to rollback**, and that is deliberate. The 512 MiB
+check guards the one path that writes bytes — installing a NEW release — and lives
+inside that branch. A rollback downloads nothing, extracts nothing and installs nothing,
+so gating it on free space would withhold emergency recovery in exactly the degraded
+situation that most needs it. Re-promoting an already-installed release is the same case
+and is likewise ungated.
+
+### What makes the run green
 Nothing the workflow believes about itself. The box asserts `DEPLOYED-HEAD: <sha>` only
 after its own local checks pass through Apache (release.txt, admin health, root, a deep
 SPA route); if any fail it atomically restores the previous symlink target and **still

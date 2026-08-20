@@ -14,13 +14,43 @@ name: Deploy Admin
 # No workflow in this repository references `secrets.` at all: OIDC needs no stored
 # credential. Do not reintroduce SSH, rsync, or Firebase Hosting here.
 #
-# THE INVARIANT THIS WORKFLOW EXISTS TO PROTECT: the job is green only when the PUBLIC
-# origin is actually serving the commit that was requested. A deploy that reports
-# success while the box stays on an older release is the exact defect class the backend
-# closed on 2026-08-08 (a green deploy that did not deploy, undetected for 39 hours).
-# So the box asserts what it promoted (DEPLOYED-HEAD), and the runner then independently
-# re-reads https://admin.dinifyapp.com/release.txt over the public internet. The
-# workflow's intention is never the evidence.
+# ══════════════════════════════════════════════════════════════════════════════════
+# THE PRIVILEGE BOUNDARY — WHY THIS IS TWO JOBS AND MUST STAY TWO JOBS
+# ══════════════════════════════════════════════════════════════════════════════════
+#
+# `id-token: write` is granted at the JOB level. When a job holds it, the runner
+# exports ACTIONS_ID_TOKEN_REQUEST_URL and ACTIONS_ID_TOKEN_REQUEST_TOKEN into the
+# environment of EVERY step in that job, from its first step onward. Any code that
+# executes there — including an `npm ci` lifecycle script from any transitive
+# dependency — can read those variables, mint an OIDC token and exchange it for the
+# deploy role's AWS credentials.
+#
+# `aws-actions/configure-aws-credentials` is merely a convenient CONSUMER of that
+# capability; it is not what creates it. So "we build before the AWS action runs" is
+# NOT a boundary, and an earlier revision of this file claimed it was. Ordering steps
+# inside one job protects nothing.
+#
+# The real boundary is job separation:
+#
+#   prepare  — NO id-token: write. Certifies the target and runs npm/Angular. Cannot
+#              request an OIDC token, so dependency code has no path to AWS.
+#   deploy   — id-token: write. Runs only trusted workflow and first-party action
+#              code. No npm, no application checkout, no package.json scripts.
+#
+# The built tarball crosses between them as a GitHub Actions artifact — data, never
+# executed on the privileged side. THE INVARIANT: no application or dependency code
+# ever runs in a job carrying `id-token: write`. Do not merge these jobs back
+# together, and do not add a build, an `npm` invocation or an application checkout to
+# `deploy`.
+#
+# ══════════════════════════════════════════════════════════════════════════════════
+# THE INVARIANT THE WHOLE WORKFLOW EXISTS TO PROTECT: the run is green only when the
+# PUBLIC origin is actually serving the commit that was requested. A deploy that
+# reports success while the box stays on an older release is the exact defect class
+# the backend closed on 2026-08-08 (a green deploy that did not deploy, undetected for
+# 39 hours). So the box asserts what it promoted (DEPLOYED-HEAD), and the runner then
+# independently re-reads https://admin.dinifyapp.com/release.txt over the public
+# internet. The workflow's intention is never the evidence.
 
 on:
   workflow_dispatch:
@@ -51,27 +81,39 @@ env:
   ARTIFACT_BUCKET: dinify-deploy-artifacts-767397669083-eu-west-2
   PUBLIC_HOST: admin.dinifyapp.com
   NODE_VERSION: "20"
+  ARTIFACT_NAME: admin-release
+  ARTIFACT_FILE: artifact.tar.gz
 
 jobs:
-  deploy:
+  # ════════════════════════════════════════════════════════════════════════════════
+  # PREPARE — UNPRIVILEGED. This is the only job that runs npm, and it is deliberately
+  # incapable of obtaining AWS credentials: it has no `id-token: write`, so the OIDC
+  # request variables are never present in its environment.
+  # ════════════════════════════════════════════════════════════════════════════════
+  prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
 
-    # Minimum viable set, and every entry is load-bearing:
-    #   id-token: write  — mint the OIDC token AWS trusts for the deploy role
-    #   contents: read   — check out the repository to build the target commit
-    #   actions: read    — let the certification step LIST CI runs, which is the only
-    #                      thing standing between a dispatch box and an untested commit
+    # NO id-token: write. Read-only, and nothing more than certification and build need.
+    #   contents: read — check out the repository to build the target commit
+    #   actions: read  — list CI runs, the only thing standing between a dispatch box
+    #                    and an untested commit
     permissions:
-      id-token: write
       contents: read
       actions: read
+
+    outputs:
+      sha: ${{ steps.validate.outputs.sha }}
+      mode: ${{ steps.validate.outputs.mode }}
+      main_sha: ${{ steps.certify.outputs.main_sha }}
+      build_digest: ${{ steps.package.outputs.build_digest }}
 
     steps:
       # ------------------------------------------------------------------------------
       # The admin OIDC role's trust policy is pinned to refs/heads/main. Running from
-      # any other ref could not assume the role anyway — but failing here, before AWS is
-      # touched, produces a comprehensible error instead of an opaque STS denial.
+      # any other ref could not assume the role anyway — but failing here, before any
+      # work happens, produces a comprehensible error instead of an opaque STS denial
+      # two jobs later.
       # ------------------------------------------------------------------------------
       - name: Refuse to run outside refs/heads/main
         shell: bash
@@ -95,10 +137,15 @@ jobs:
       # ultimately runs a script as root on the box, so no event-derived value is ever
       # textually interpolated into a run: script with raw ${{ }} — GitHub expands those
       # into the script body before the shell sees them, and no amount of quoting helps.
-      # Everything arrives through env: and is read as a quoted shell variable, and only
-      # the VALIDATED forms are handed onward through $GITHUB_ENV.
+      # Everything arrives through env: and is read as a quoted shell variable.
+      #
+      # IDENTITY LEAVES THIS STEP AS A STEP OUTPUT, NOT VIA $GITHUB_ENV. $GITHUB_ENV is
+      # mutable job-wide state, and the untrusted npm/build phase runs between here and
+      # the privileged job. A step output is written once and read by name, so the
+      # identity being deployed cannot be rewritten by anything that runs in between.
       # ------------------------------------------------------------------------------
       - name: Validate dispatch inputs
+        id: validate
         shell: bash
         env:
           INPUT_SHA: ${{ inputs.sha }}
@@ -113,19 +160,45 @@ jobs:
             deploy|rollback) ;;
             *) echo "::error::Rejected mode '${INPUT_MODE}': must be exactly 'deploy' or 'rollback'." >&2; exit 1 ;;
           esac
-          echo "TARGET_SHA=${INPUT_SHA}" >> "$GITHUB_ENV"
-          echo "MODE=${INPUT_MODE}" >> "$GITHUB_ENV"
+          echo "sha=${INPUT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "mode=${INPUT_MODE}" >> "$GITHUB_OUTPUT"
           echo "Target ${INPUT_SHA}, mode ${INPUT_MODE}."
 
-      - name: Check out repository (full history for ancestry proof)
+      # ------------------------------------------------------------------------------
+      # `persist-credentials: false` is a SECURITY control, not a tidy-up: this job goes
+      # on to run `npm ci`, and checkout's default behaviour writes an authenticated
+      # `http.<url>.extraheader` into .git/config that any dependency install script
+      # could read and use against this repository. Nothing after checkout needs an
+      # authenticated git operation — `fetch-depth: 0` brings the whole history down
+      # here, so the ancestry proof and the target checkout are both purely local.
+      # ------------------------------------------------------------------------------
+      - name: Check out repository (full history, no persisted credentials)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Assert no git credential was persisted
+        shell: bash
+        run: |
+          set -euo pipefail
+          # An assertion rather than an assumption: if a future edit re-enables
+          # credential persistence, this fails before npm ever runs.
+          if git config --local --get-regexp '^http\..*\.extraheader$' >/dev/null 2>&1; then
+            echo "::error::A git credential is persisted in .git/config. It must not be present while npm runs." >&2
+            exit 1
+          fi
+          if [ -f "$HOME/.git-credentials" ]; then
+            echo "::error::\$HOME/.git-credentials exists; refusing to run the build with a readable credential." >&2
+            exit 1
+          fi
+          echo "No persisted git credential."
 
       # ------------------------------------------------------------------------------
-      # EXACT TARGET CERTIFICATION — BOTH CONDITIONS, FOR BOTH MODES, BEFORE AWS AUTH.
+      # EXACT TARGET CERTIFICATION — BOTH CONDITIONS, FOR BOTH MODES, BEFORE ANY
+      # APPLICATION OR DEPENDENCY CODE RUNS.
       #
-      #   (a) the SHA is an ancestor of CURRENT origin/main, and
+      #   (a) the SHA is an ancestor of main, and
       #   (b) the SHA has a successful run of .github/workflows/ci.yml on branch main.
       #
       # Neither alone is sufficient. Ancestry alone admits a commit that never passed
@@ -137,24 +210,33 @@ jobs:
       # The workflow is queried BY FILE PATH (ci.yml), not by display name: the display
       # name is literally "CI", and coupling a deploy gate to mutable display text is
       # how a rename silently disables it.
+      #
+      # `github.sha` is main's tip at dispatch, supplied by GitHub rather than by the
+      # operator. The ancestry test runs against local objects, so it needs no network
+      # and no credential. The privileged job repeats this against CURRENT main through
+      # the API, which also covers main having moved on since dispatch.
       # ------------------------------------------------------------------------------
       - name: Certify target commit (ancestry + successful CI on main)
+        id: certify
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.validate.outputs.sha }}
+          MAIN_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          git fetch --no-tags --prune origin +refs/heads/main:refs/remotes/origin/main
-          MAIN_SHA="$(git rev-parse refs/remotes/origin/main)"
-          echo "Current origin/main: ${MAIN_SHA}"
+          if [[ ! "$MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::github.sha is not a 40-character hex commit SHA." >&2
+            exit 1
+          fi
+          echo "main tip at dispatch: ${MAIN_SHA}"
 
           if ! git cat-file -e "${TARGET_SHA}^{commit}" 2>/dev/null; then
             echo "::error::${TARGET_SHA} is not a commit object in this repository." >&2
             exit 1
           fi
-
           if ! git merge-base --is-ancestor "$TARGET_SHA" "$MAIN_SHA"; then
-            echo "::error::${TARGET_SHA} is not an ancestor of current origin/main (${MAIN_SHA}). Only commits still in main's history may be deployed." >&2
+            echo "::error::${TARGET_SHA} is not an ancestor of main (${MAIN_SHA}). Only commits still in main's history may be deployed." >&2
             exit 1
           fi
           echo "Ancestry: ${TARGET_SHA} is in main's history."
@@ -169,25 +251,29 @@ jobs:
             echo "::error::Refusing ${TARGET_SHA}: no successful CI run on branch main exists for it. A PR-branch green run is not sufficient." >&2
             exit 1
           fi
+          rm -f ci-runs.json
+          echo "main_sha=${MAIN_SHA}" >> "$GITHUB_OUTPUT"
           echo "CI certification: ${GREEN} successful CI run(s) on main for ${TARGET_SHA}."
 
       # ------------------------------------------------------------------------------
-      # BUILD HAPPENS BEFORE AWS AUTHENTICATION, DELIBERATELY. `npm ci` executes
-      # third-party install scripts; there is no reason for live AWS credentials to be
-      # sitting in the environment while it does. A build failure therefore also never
-      # reaches AWS at all.
+      # Everything from here to the artifact upload is the UNTRUSTED phase. It runs
+      # only for mode=deploy, and only after the target has been certified above.
       #
-      # The full type/lint/test suite is NOT re-run here — CI already proved this exact
-      # SHA green on main, which is the precondition enforced above. What DOES re-run is
-      # the mock-isolation gate, because it must scan the exact dist/ that ships: a mock
+      # The full type/lint/test suite is NOT re-run — CI already proved this exact SHA
+      # green on main, which is the precondition enforced above. What DOES re-run is the
+      # mock-isolation gate, because it must scan the exact dist/ that ships: a mock
       # authentication transport reaching the control plane is an authentication bypass
       # with a friendly name.
       # ------------------------------------------------------------------------------
       - name: Check out the exact target commit
         if: inputs.mode == 'deploy'
         shell: bash
+        env:
+          TARGET_SHA: ${{ steps.validate.outputs.sha }}
         run: |
           set -euo pipefail
+          # Purely local: the object is already present from the full-depth fetch, so
+          # this needs no credential.
           git checkout --detach "$TARGET_SHA"
           HEAD_NOW="$(git rev-parse HEAD)"
           if [ "$HEAD_NOW" != "$TARGET_SHA" ]; then
@@ -225,16 +311,24 @@ jobs:
       # ------------------------------------------------------------------------------
       # release.txt is the SERVED-COMMIT ATTESTATION. It is written only after the build
       # and the mock-isolation gate have passed, it travels inside the artifact, and it
-      # is what both the box and the public assertion later read back. Apache serves it
-      # no-store, so the assertion cannot be satisfied by a cached copy.
+      # is what the privileged job, the box and the public assertion all read back.
+      # Apache serves it no-store, so the assertion cannot be satisfied by a cached copy.
       # ------------------------------------------------------------------------------
       - name: Validate dist/ and stamp release.txt
         if: inputs.mode == 'deploy'
         shell: bash
+        env:
+          TARGET_SHA: ${{ steps.validate.outputs.sha }}
         run: |
           set -euo pipefail
-          [ -d dist ] || { echo "::error::dist/ does not exist after build." >&2; exit 1; }
-          [ -f dist/index.html ] && [ -s dist/index.html ] || { echo "::error::dist/index.html is missing or empty." >&2; exit 1; }
+          if [ ! -d dist ]; then
+            echo "::error::dist/ does not exist after build." >&2
+            exit 1
+          fi
+          if [ ! -f dist/index.html ] || [ ! -s dist/index.html ]; then
+            echo "::error::dist/index.html is missing or empty." >&2
+            exit 1
+          fi
           if [ "$(find dist -type f | wc -l)" -lt 1 ]; then
             echo "::error::dist/ contains no files." >&2
             exit 1
@@ -251,27 +345,254 @@ jobs:
       # ONE tar.gz of the CONTENTS of dist/ — no wrapper directory, so index.html and
       # release.txt land at the release root on extraction. Archive metadata is
       # normalised and gzip runs with -n so an identical tree produces an identical
-      # artifact; the digest is then what the box independently re-derives.
+      # artifact.
+      #
+      # The digest computed here is DIAGNOSTIC ONLY. The authoritative digest — the one
+      # that names the S3 key and that the box re-derives — is computed in the
+      # privileged job, AFTER the artifact has crossed the job boundary, so that what
+      # is attested is what actually arrived rather than what this job says it sent.
       # ------------------------------------------------------------------------------
-      - name: Package artifact and compute digest
+      - name: Package artifact
+        id: package
         if: inputs.mode == 'deploy'
         shell: bash
         run: |
           set -euo pipefail
           tar --sort=name --owner=0 --group=0 --numeric-owner \
               --mtime='UTC 2020-01-01' --format=gnu \
-              -C dist -cf - . | gzip -n > artifact.tar.gz
-          ARTIFACT_SHA256="$(sha256sum artifact.tar.gz | cut -d' ' -f1)"
+              -C dist -cf - . | gzip -n > "${ARTIFACT_FILE}"
+          BUILD_DIGEST="$(sha256sum "${ARTIFACT_FILE}" | cut -d' ' -f1)"
+          echo "build_digest=${BUILD_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "artifact bytes         : $(stat -c%s "${ARTIFACT_FILE}")"
+          echo "artifact sha256 (build): ${BUILD_DIGEST}"
+
+      - name: Upload prepared release artifact
+        if: inputs.mode == 'deploy'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_FILE }}
+          if-no-files-found: error
+          # Transport only. The permanent artifact store is the private S3 object; this
+          # exists purely to carry the tarball across the privilege boundary.
+          retention-days: 1
+          # The payload is already gzipped; re-compressing the zip wrapper buys nothing.
+          compression-level: 0
+
+  # ════════════════════════════════════════════════════════════════════════════════
+  # DEPLOY — PRIVILEGED. The ONLY job with `id-token: write`.
+  #
+  # Nothing here executes application source or third-party npm code: no checkout of
+  # the target, no `npm`, no package.json script, no Angular build. It runs workflow
+  # shell, first-party GitHub actions and the AWS CLI, and it treats the incoming
+  # tarball strictly as DATA — validated, hashed and uploaded, never extracted and
+  # never executed on this side of the boundary.
+  # ════════════════════════════════════════════════════════════════════════════════
+  deploy:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+
+    steps:
+      # ------------------------------------------------------------------------------
+      # IDENTITY REVALIDATION AT THE BOUNDARY. The raw workflow inputs are re-read and
+      # re-validated here from scratch, then required to equal what `prepare` certified.
+      # Trusting `needs.prepare.outputs.*` alone would mean this job never independently
+      # checks what it is about to deploy; re-deriving from `inputs.*` and demanding
+      # exact agreement means a disagreement between the two is a hard failure rather
+      # than a silent preference for one of them.
+      # ------------------------------------------------------------------------------
+      - name: Revalidate deploy identity and agree with prepare
+        shell: bash
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+          INPUT_MODE: ${{ inputs.mode }}
+          PREPARED_SHA: ${{ needs.prepare.outputs.sha }}
+          PREPARED_MODE: ${{ needs.prepare.outputs.mode }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$INPUT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Workflow input sha is not a full 40-character lowercase hex SHA." >&2
+            exit 1
+          fi
+          case "$INPUT_MODE" in
+            deploy|rollback) ;;
+            *) echo "::error::Workflow input mode '${INPUT_MODE}' is neither deploy nor rollback." >&2; exit 1 ;;
+          esac
+          if [ "$INPUT_SHA" != "$PREPARED_SHA" ]; then
+            echo "::error::Identity mismatch: workflow input sha '${INPUT_SHA}' does not equal the SHA prepare certified ('${PREPARED_SHA}')." >&2
+            exit 1
+          fi
+          if [ "$INPUT_MODE" != "$PREPARED_MODE" ]; then
+            echo "::error::Identity mismatch: workflow input mode '${INPUT_MODE}' does not equal prepare's mode ('${PREPARED_MODE}')." >&2
+            exit 1
+          fi
+          echo "Identity agreed with prepare: ${INPUT_SHA} / ${INPUT_MODE}."
+
+      # ------------------------------------------------------------------------------
+      # Certification is repeated here, independently of `prepare`, and it is cheap
+      # because it needs no checkout: the compare endpoint answers ancestry directly.
+      # `merge_base_commit.sha == TARGET_SHA` IS the ancestry statement — the merge base
+      # of an ancestor and its descendant is the ancestor itself.
+      #
+      # Unlike prepare's local test, this runs against main AS IT IS NOW rather than as
+      # it was at dispatch, so a target dropped from main's history between the two jobs
+      # is caught here.
+      # ------------------------------------------------------------------------------
+      - name: Re-certify target against current main (no checkout)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          MAIN_SHA="$(gh api "/repos/${GITHUB_REPOSITORY}/commits/main" --jq '.sha')"
+          if [[ ! "$MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve current main to a commit SHA." >&2
+            exit 1
+          fi
+          echo "current main: ${MAIN_SHA}"
+
+          gh api "/repos/${GITHUB_REPOSITORY}/compare/${TARGET_SHA}...${MAIN_SHA}" > compare.json
+          STATUS="$(jq -r '.status' compare.json)"
+          MERGE_BASE="$(jq -r '.merge_base_commit.sha' compare.json)"
+          rm -f compare.json
+          case "$STATUS" in
+            ahead|identical) ;;
+            *) echo "::error::${TARGET_SHA} is not in current main's history (compare status: ${STATUS})." >&2; exit 1 ;;
+          esac
+          if [ "$MERGE_BASE" != "$TARGET_SHA" ]; then
+            echo "::error::Merge base of ${TARGET_SHA} and current main is ${MERGE_BASE}, so the target is not an ancestor of main." >&2
+            exit 1
+          fi
+          echo "Ancestry re-confirmed against current main."
+
+          gh api \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${TARGET_SHA}&branch=main&status=success&per_page=100" \
+            > ci-runs.json
+          GREEN="$(jq --arg sha "$TARGET_SHA" \
+            '[.workflow_runs[] | select(.head_branch == "main" and .head_sha == $sha and .conclusion == "success")] | length' \
+            ci-runs.json)"
+          rm -f ci-runs.json
+          if [ "${GREEN:-0}" -lt 1 ]; then
+            echo "::error::Refusing ${TARGET_SHA}: no successful CI run on branch main exists for it." >&2
+            exit 1
+          fi
+          echo "CI re-certification: ${GREEN} successful CI run(s) on main."
+
+      - name: Download prepared release artifact
+        if: inputs.mode == 'deploy'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: incoming
+
+      # ------------------------------------------------------------------------------
+      # The artifact is inspected AS DATA and never extracted here. Its members are
+      # validated — absolute paths, traversal, symlinks, hardlinks, devices, FIFOs and
+      # sockets are rejected rather than filtered — and release.txt is read out of the
+      # archive in memory and required to attest exactly the SHA this job revalidated.
+      # That is what makes a tampered or swapped artifact fail BEFORE AWS is touched.
+      #
+      # THE AUTHORITATIVE DIGEST IS COMPUTED HERE, on the bytes that actually arrived,
+      # and the S3 key is derived from this job's own validated SHA and that digest.
+      # Nothing about the key or the digest is carried over from the build job.
+      # ------------------------------------------------------------------------------
+      - name: Validate artifact and derive authoritative digest
+        id: artifact
+        if: inputs.mode == 'deploy'
+        shell: bash
+        env:
+          TARGET_SHA: ${{ needs.prepare.outputs.sha }}
+          BUILD_DIGEST: ${{ needs.prepare.outputs.build_digest }}
+        run: |
+          set -euo pipefail
+          COUNT="$(find incoming -type f | wc -l)"
+          if [ "$COUNT" -ne 1 ]; then
+            echo "::error::Expected exactly one downloaded file, found ${COUNT}." >&2
+            find incoming -mindepth 1 >&2 || true
+            exit 1
+          fi
+          if [ ! -f "incoming/${ARTIFACT_FILE}" ]; then
+            echo "::error::Downloaded artifact is not incoming/${ARTIFACT_FILE}." >&2
+            exit 1
+          fi
+          if [ ! -s "incoming/${ARTIFACT_FILE}" ]; then
+            echo "::error::Downloaded artifact is empty." >&2
+            exit 1
+          fi
+          if find incoming -type l -print -quit | grep -q .; then
+            echo "::error::Downloaded payload contains a symlink." >&2
+            exit 1
+          fi
+
+          python3 - "incoming/${ARTIFACT_FILE}" "$TARGET_SHA" <<'PYVALIDATE'
+          import os
+          import sys
+          import tarfile
+
+          src, target_sha = sys.argv[1], sys.argv[2]
+
+          def norm(name):
+              name = name.replace("\\", "/")
+              while name.startswith("./"):
+                  name = name[2:]
+              return name
+
+          with tarfile.open(src, "r:gz") as tf:
+              members = tf.getmembers()
+              if not members:
+                  sys.exit("archive contains no members")
+              entries = {}
+              for m in members:
+                  if not (m.isfile() or m.isdir()):
+                      sys.exit("rejected non-regular archive member: %s" % m.name)
+                  raw = m.name
+                  if raw.startswith("/") or os.path.isabs(raw):
+                      sys.exit("rejected absolute path in archive: %s" % raw)
+                  name = norm(raw)
+                  if ".." in name.split("/"):
+                      sys.exit("rejected path traversal in archive: %s" % raw)
+                  if name:
+                      entries[name] = m
+
+              index = entries.get("index.html")
+              if index is None or not index.isfile():
+                  sys.exit("archive has no index.html at its root")
+              if index.size <= 0:
+                  sys.exit("index.html in archive is empty")
+
+              release = entries.get("release.txt")
+              if release is None or not release.isfile():
+                  sys.exit("archive has no release.txt at its root")
+              handle = tf.extractfile(release)
+              if handle is None:
+                  sys.exit("cannot read release.txt from archive")
+              attested = handle.read().decode("utf-8", "replace").strip()
+              if attested != target_sha:
+                  sys.exit("release.txt attests '%s', expected '%s'" % (attested, target_sha))
+
+          print("ARCHIVE-OK: %d members, release.txt attests %s" % (len(members), attested))
+          PYVALIDATE
+
+          ARTIFACT_SHA256="$(sha256sum "incoming/${ARTIFACT_FILE}" | cut -d' ' -f1)"
           if [[ ! "$ARTIFACT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
             echo "::error::Computed artifact digest is not 64 lowercase hex." >&2
             exit 1
           fi
-          # The digest is IN THE KEY so a rebuild that produces different bytes for the
-          # same source SHA can never silently overwrite the artifact already installed.
-          echo "ARTIFACT_SHA256=${ARTIFACT_SHA256}" >> "$GITHUB_ENV"
-          echo "S3_KEY=admin/${TARGET_SHA}/${ARTIFACT_SHA256}.tar.gz" >> "$GITHUB_ENV"
-          echo "artifact bytes : $(stat -c%s artifact.tar.gz)"
-          echo "artifact sha256: ${ARTIFACT_SHA256}"
+          # Divergence is not fatal on its own — the digest computed HERE is the
+          # authority — but it should never happen, so say so loudly.
+          if [ -n "${BUILD_DIGEST:-}" ] && [ "$BUILD_DIGEST" != "$ARTIFACT_SHA256" ]; then
+            echo "::warning::Artifact digest changed across the job boundary (build ${BUILD_DIGEST}, received ${ARTIFACT_SHA256}). Proceeding with the received digest."
+          fi
+          echo "artifact_sha256=${ARTIFACT_SHA256}" >> "$GITHUB_OUTPUT"
+          echo "s3_key=admin/${TARGET_SHA}/${ARTIFACT_SHA256}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "authoritative artifact sha256: ${ARTIFACT_SHA256}"
 
       # ------------------------------------------------------------------------------
       # The role ARN lives in a repository VARIABLE so it is visible and auditable — an
@@ -295,6 +616,7 @@ jobs:
           fi
           echo "Deploy role ARN validated."
 
+      # Everything above this line is validation. AWS credentials exist only from here.
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
@@ -304,9 +626,11 @@ jobs:
       - name: Upload artifact to private S3 prefix
         if: inputs.mode == 'deploy'
         shell: bash
+        env:
+          S3_KEY: ${{ steps.artifact.outputs.s3_key }}
         run: |
           set -euo pipefail
-          aws s3 cp artifact.tar.gz "s3://${ARTIFACT_BUCKET}/${S3_KEY}" --only-show-errors
+          aws s3 cp "incoming/${ARTIFACT_FILE}" "s3://${ARTIFACT_BUCKET}/${S3_KEY}" --only-show-errors
           echo "Uploaded s3://${ARTIFACT_BUCKET}/${S3_KEY}"
 
       # ------------------------------------------------------------------------------
@@ -318,7 +642,7 @@ jobs:
       # from main, so an embedded script is always main's script; a separate committed
       # file checked out at TARGET_SHA would mean a rollback executed an OLD commit's
       # deployment mechanism against the CURRENT box — precisely the mismatch that must
-      # not happen. Keep it here.
+      # not happen. Keep it here. (It is also why this job needs no checkout at all.)
       #
       # The heredoc is QUOTED, so nothing expands at write time. The four values are
       # substituted afterwards, and only after being re-validated immediately above the
@@ -326,6 +650,11 @@ jobs:
       # ------------------------------------------------------------------------------
       - name: Write remote deploy script
         shell: bash
+        env:
+          TARGET_SHA: ${{ needs.prepare.outputs.sha }}
+          MODE: ${{ needs.prepare.outputs.mode }}
+          ARTIFACT_SHA256: ${{ steps.artifact.outputs.artifact_sha256 }}
+          S3_KEY: ${{ steps.artifact.outputs.s3_key }}
         run: |
           set -euo pipefail
           cat > deploy.sh <<'DEPLOY_SCRIPT'
@@ -345,6 +674,9 @@ jobs:
           PY_BIN=/usr/bin/python3
           BUCKET=dinify-deploy-artifacts-767397669083-eu-west-2
           PUBLIC_HOST=admin.dinifyapp.com
+          # Floor for INSTALLING a new release. Deliberately generous against a ~500 KB
+          # artifact, because the failure it prevents is a half-written release.
+          MIN_FREE_KB=524288
 
           fail() { echo "DEPLOY-FAILED: $*" >&2; exit 1; }
 
@@ -375,9 +707,11 @@ jobs:
           esac
           echo "PREVIOUS-TARGET: ${PREV_TARGET}"
 
-          AVAIL_KB="$(df -Pk "$RELEASE_ROOT_REAL" | awk 'NR==2 {print $4}')"
-          [ -n "${AVAIL_KB:-}" ] || fail "cannot determine free space on ${RELEASE_ROOT_REAL}"
-          [ "$AVAIL_KB" -ge 524288 ] || fail "insufficient free space: ${AVAIL_KB} KiB available, need at least 524288 KiB"
+          # NOTE: the free-space precondition is deliberately NOT here. It belongs only
+          # to the one path that writes bytes — installing a NEW release. A rollback
+          # downloads nothing, extracts nothing and installs nothing; gating it on free
+          # space would withhold emergency recovery in exactly the degraded situation
+          # that most needs it. Re-promoting an already-installed release is the same.
 
           # ---- release validators (used for staged trees AND existing releases) ----
           validate_release() {
@@ -422,21 +756,27 @@ jobs:
           # destination before creating the replacement, leaving a window in which
           # CURRENT does not exist and Apache serves nothing. Creating a temporary
           # symlink beside it and rename(2)-ing it over the destination has no such
-          # window. The temporary link is created in CURRENT's own directory so the
-          # rename is guaranteed same-filesystem.
+          # window.
+          #
+          # The temporary link is created inside a directory made by `mktemp -d`, never
+          # at a name from `mktemp -u`: -u only PREDICTS a free name and returns without
+          # claiming it, so anything between the prediction and the `ln` could take it.
+          # `mktemp -d` creates the directory atomically with 0700, so the name inside it
+          # cannot be raced. The directory sits beside CURRENT, keeping the rename
+          # same-filesystem.
           atomic_symlink() {
-            local target="$1" linkpath="$2" dir tmp
+            local target="$1" linkpath="$2" dir tmpdir tmplink rc
             dir="$(dirname "$linkpath")"
-            tmp="$(mktemp -u "${dir}/.dinify-admin-link.XXXXXXXX")"
-            if ! ln -s "$target" "$tmp"; then
-              rm -f "$tmp" 2>/dev/null || true
-              return 1
+            tmpdir="$(mktemp -d "${dir}/.dinify-admin-link.XXXXXXXX")" || return 1
+            tmplink="${tmpdir}/link"
+            rc=0
+            if ! ln -s "$target" "$tmplink"; then
+              rc=1
+            elif ! mv -Tf "$tmplink" "$linkpath"; then
+              rc=1
             fi
-            if ! mv -Tf "$tmp" "$linkpath"; then
-              rm -f "$tmp" 2>/dev/null || true
-              return 1
-            fi
-            return 0
+            rm -rf "$tmpdir" 2>/dev/null || true
+            return "$rc"
           }
 
           # ---- install (deploy) or locate (rollback) the target release ----
@@ -444,16 +784,22 @@ jobs:
             [[ "$ARTIFACT_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail "ARTIFACT_SHA256 is not 64 lowercase hex"
             EXPECTED_KEY="admin/${TARGET_SHA}/${ARTIFACT_SHA256}.tar.gz"
             [ "$S3_KEY" = "$EXPECTED_KEY" ] || fail "S3 key '${S3_KEY}' does not match the expected structure '${EXPECTED_KEY}'"
-            [ -x "$AWS_BIN" ] || fail "AWS CLI not found at ${AWS_BIN}"
 
             if [ -e "$FINAL_RELEASE" ]; then
               # An immutable release is never repaired, overwritten or extracted over.
               # It either validates and becomes eligible for re-promotion, or the deploy
-              # fails and a human looks at it.
+              # fails and a human looks at it. Nothing is written, so no space is needed.
               validate_release "$FINAL_RELEASE" "existing release"
               validate_permissions "$FINAL_RELEASE" "existing release"
               echo "RELEASE-EXISTS: ${FINAL_RELEASE} already installed and valid; skipping download and extraction"
             else
+              # This is the ONLY path that writes a new release, so this is where the
+              # free-space floor belongs.
+              AVAIL_KB="$(df -Pk "$RELEASE_ROOT_REAL" | awk 'NR==2 {print $4}')"
+              [ -n "${AVAIL_KB:-}" ] || fail "cannot determine free space on ${RELEASE_ROOT_REAL}"
+              [ "$AVAIL_KB" -ge "$MIN_FREE_KB" ] || fail "insufficient free space to install a new release: ${AVAIL_KB} KiB available, need at least ${MIN_FREE_KB} KiB"
+
+              [ -x "$AWS_BIN" ] || fail "AWS CLI not found at ${AWS_BIN}"
               STAGE="$(mktemp -d "${RELEASE_ROOT}/.staging-${TARGET_SHA}.XXXXXXXX")" || fail "cannot create staging directory"
               trap 'rm -rf "$STAGE"' EXIT
               mkdir "${STAGE}/tree"
@@ -518,7 +864,8 @@ jobs:
             fi
           else
             # Rollback never downloads, builds, extracts, repairs or rewrites anything.
-            # It is a symlink operation against a release that must already be present.
+            # It is a symlink operation against a release that must already be present,
+            # and it therefore needs no free space at all.
             [ -e "$FINAL_RELEASE" ] || fail "rollback target ${FINAL_RELEASE} is not installed on this box; rollback never reconstructs a release"
             validate_release "$FINAL_RELEASE" "rollback target"
             validate_permissions "$FINAL_RELEASE" "rollback target"
@@ -668,6 +1015,9 @@ jobs:
       # ------------------------------------------------------------------------------
       - name: Deploy via SSM and verify the box's own attestation
         shell: bash
+        env:
+          TARGET_SHA: ${{ needs.prepare.outputs.sha }}
+          MODE: ${{ needs.prepare.outputs.mode }}
         run: |
           set -euo pipefail
           # --rawfile embeds the script as one JSON string, sidestepping every quoting
@@ -729,11 +1079,13 @@ jobs:
       # ------------------------------------------------------------------------------
       # INDEPENDENT PUBLIC VERIFICATION. Everything above this point is the box talking
       # about itself. This step leaves the runner, crosses the public internet and reads
-      # what the origin actually serves. The job is green only if that is the exact
+      # what the origin actually serves. The run is green only if that is the exact
       # commit that was requested.
       # ------------------------------------------------------------------------------
       - name: Assert the public origin serves the requested commit
         shell: bash
+        env:
+          TARGET_SHA: ${{ needs.prepare.outputs.sha }}
         run: |
           set -euo pipefail
           CB="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -791,6 +1143,10 @@ jobs:
         shell: bash
         env:
           JOB_STATUS: ${{ job.status }}
+          TARGET_SHA: ${{ needs.prepare.outputs.sha }}
+          MODE: ${{ needs.prepare.outputs.mode }}
+          ARTIFACT_SHA256: ${{ steps.artifact.outputs.artifact_sha256 }}
+          S3_KEY: ${{ steps.artifact.outputs.s3_key }}
         run: |
           set -euo pipefail
           {
@@ -800,9 +1156,10 @@ jobs:
             echo "- Instance: \`${ADMIN_INSTANCE_ID}\`"
             if [ -n "${S3_KEY:-}" ]; then
               echo "- Artifact: \`s3://${ARTIFACT_BUCKET}/${S3_KEY}\`"
-              echo "- Artifact SHA-256: \`${ARTIFACT_SHA256:-}\`"
+              echo "- Artifact SHA-256 (computed in the privileged job): \`${ARTIFACT_SHA256:-}\`"
             else
               echo "- Artifact: none (rollback re-points to an already-installed release)"
             fi
+            echo "- Build ran in the unprivileged \`prepare\` job; this job never executed application or npm code."
             echo "- Releases are retained, never pruned, throughout 0C.1."
           } >> "$GITHUB_STEP_SUMMARY"

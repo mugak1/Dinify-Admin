@@ -39,7 +39,12 @@ conventions change.
   owner invitation, delegated drill-in, support triage, receivables, activity feed:
   ❌ NOT BUILT.** Every destination is a placeholder with a real written empty state.
   These are spec §15 steps 1–10.
-- **Deployment: ❌ NONE.** See "Deployment" below.
+- **Deployment mechanism (0C.1): ✅ built, ❌ never yet run.**
+  `.github/workflows/deploy.yml` is a MANUAL exact-SHA deploy/rollback pipeline over
+  GitHub OIDC → private S3 → AWS SSM. The first real deployment is a separate
+  acceptance gate and has not happened — nothing has ever been published to
+  `admin.dinifyapp.com`, which still serves the host-side placeholder. See
+  "Deployment" below.
 
 ## Tech Stack
 - Angular **21.2.x**, esbuild `@angular/build` application builder
@@ -220,8 +225,12 @@ and a parameter at its default is OMITTED (`?attention=false` never appears).
 ### Deep links need the server's help
 Under `ng serve` the dev server rewrites unknown paths to `index.html`, so refreshing
 `/restaurants/abc/readiness` works. **In production this requires an Apache SPA
-fallback that serves `index.html` for unmatched paths while EXCLUDING `/api`** — that
-is 0C's job. Until 0C ships, deep links work under `ng serve` only.
+fallback that serves `index.html` for unmatched paths while EXCLUDING `/api`.** That
+fallback is configured and live on `admin.dinifyapp.com`: a deep route answers the SPA
+document, `/api/...` reaches Django instead, and an asset-shaped path that does not
+exist returns a real 404 rather than HTML. `deploy.yml` re-asserts all of that after
+every promotion — on the box and again from the public origin — so a regression in the
+fallback fails the deploy instead of shipping a portal whose deep links are broken.
 
 ## The Backend Auth Contract
 
@@ -600,22 +609,94 @@ Before raising a PR:
 5. `npm run build:prod` — zero errors
 6. `npm run check:mock-isolation` — **after** the build; it scans `dist/`
 
-`.github/workflows/ci.yml` (job `validate`, on `pull_request` to `main`) runs all six
-on Node 20 with plain `npm ci`. `.github/workflows/audit.yml` runs a weekly
-`npm audit --audit-level=high` — scheduled and manual only, never a PR check.
+`.github/workflows/ci.yml` (job `validate`, on `pull_request` to `main` **and on push
+to `main`**) runs all six on Node 20 with plain `npm ci`. `.github/workflows/audit.yml`
+runs a weekly `npm audit --audit-level=high` — scheduled and manual only, never a PR
+check.
 
-## Deployment — THERE IS NONE YET
+**The push-to-`main` trigger is load-bearing for deployment, not redundant with the PR
+one.** A PR's CI runs against a merge preview of the branch with main as it was then;
+the commit that actually lands on main was never itself tested. `deploy.yml` certifies
+its target against a successful `ci.yml` run whose `head_branch` is `main`, so it is
+gating on the commit it is actually shipping. Do not remove that trigger.
 
-**Deployment is 0C and does not exist in this repo.** When it lands it is:
-build in CI → artefact to a private S3 prefix → GitHub OIDC → `aws ssm send-command`
-syncing into `/var/www/dinify-admin`, with an Apache SPA fallback that **excludes
-`/api`**.
+`deploy.yml` is NOT part of CI and is never a PR check — it is `workflow_dispatch` only.
 
-**Do NOT add** `firebase.json`, `.firebaserc`, rsync, `appleboy/ssh-action`, or any
-stored SSH secret. That transport was deliberately retired by backend PR #281: the UAT
-instance's security group does not admit GitHub-hosted runners, which is why the old
-SSH path died at connect timeout. The backend's `UAT_SSH_*` secrets were deleted
-2026-08-18.
+## Deployment — 0C.1, MANUAL ONLY, NOT YET RUN
+
+`.github/workflows/deploy.yml` is the deploy mechanism: **build in CI → tar.gz artefact
+to a private S3 prefix → GitHub OIDC → `aws ssm send-command` → immutable release
+directory → symlink promotion.** It exists and is verified as far as it can be without
+touching the box; **no deployment has been executed yet**, and the first one is a
+separate acceptance gate. Until then `admin.dinifyapp.com` serves the host-side
+placeholder.
+
+**TRANSPORT IS SSM OVER OIDC, NEVER SSH. Do NOT add** `firebase.json`, `.firebaserc`,
+rsync, `appleboy/ssh-action`, or any stored SSH secret. That transport was deliberately
+retired by backend PR #281: the instance's security group does not admit GitHub-hosted
+runners, which is why the old SSH path died at connect timeout. The backend's
+`UAT_SSH_*` secrets were deleted 2026-08-18. **No workflow in this repo references
+`secrets.` at all** — OIDC needs no stored credential, and the role ARN lives in the
+`AWS_DEPLOY_ROLE_ARN` repository *variable* (an ARN is not a secret) which the workflow
+compares byte-for-byte against the ARN pinned in the file before authenticating.
+
+### The release layout on the box
+```
+/var/www/dinify-admin                      → SYMLINK to the live release
+/var/www/dinify-admin-releases/<sha>/      → immutable, root:root, dirs 0755 / files 0644
+/var/www/dinify-admin-releases/placeholder/→ the pre-0C.1 holding page
+```
+A release is never edited in place, never synced into, and never extracted over. A new
+one is staged in a temporary directory INSIDE the release root (same filesystem), fully
+validated, then `mv`-renamed into its final path — so it either appears complete or not
+at all. **`release.txt` at the release root is the served-commit attestation**: it holds
+exactly the deployed 40-char SHA. Apache serves both `release.txt` and `index.html`
+`no-store` (one-year immutable caching applies only to `js css woff woff2 svg png jpg
+jpeg webp map` — deliberately not `txt`/`json`), which is what makes reading it back a
+real check rather than a cached echo.
+
+### Dispatch inputs
+Run the workflow from `refs/heads/main` — it refuses any other ref, because the OIDC
+role's trust is pinned there.
+
+| input | value |
+|---|---|
+| `sha` | full 40-character lowercase commit SHA |
+| `mode` | `deploy` (default) or `rollback` |
+
+Both modes require the SHA to be **an ancestor of current `origin/main` AND to have a
+successful `ci.yml` run on branch `main`**. Neither alone is enough: ancestry alone
+admits an untested commit, and CI-green alone admits a PR-branch run (CI runs on
+`pull_request` too, where it tests a merge preview rather than the commit that landed)
+or a commit since dropped from main.
+
+**`mode=rollback` re-points the symlink at an already-installed release and does
+nothing else** — no build, no `npm ci`, no S3 upload, no extraction, no repair. If the
+release directory is not already on the box it fails; rollback never reconstructs one.
+That makes reverting a seconds-scale operation rather than a rebuild of old code.
+
+### What makes the job green
+Nothing the workflow believes about itself. The box asserts `DEPLOYED-HEAD: <sha>` only
+after its own local checks pass through Apache (release.txt, admin health, root, a deep
+SPA route); if any fail it atomically restores the previous symlink target and **still
+exits non-zero** — a successful restoration is not a successful deployment. The runner
+then independently re-reads `https://admin.dinifyapp.com/release.txt` over the public
+internet and requires it to equal the requested SHA and to be `no-store`. A missing or
+mismatched marker, or an SSM status other than `Success`, fails loudly. This is the
+defect class backend PR #283 closed after a deploy reported success while the box stayed
+39 hours behind.
+
+### Deliberately deferred
+- **Automatic deployment is 0C.2.** There is no `push`, `workflow_run` or `schedule`
+  trigger here, and none should be added until a real 0C.1 deployment has been observed
+  and accepted.
+- **The forward-only guard is 0C.2's problem**, and it does not port directly: the
+  backend compares `git merge-base --is-ancestor` on the box, and there is no Git
+  checkout on the admin box to compare against. Manual rollback is an explicitly
+  authorised backwards move, so 0C.1 needs no such guard.
+- **No release pruning.** Every deployed SHA and the placeholder are retained, which
+  maximises recovery options until installation, re-promotion, rollback and both
+  served-SHA verifications have been proven in the real world.
 
 ## Backend Facts Step 1 Onward Should Not Rediscover
 

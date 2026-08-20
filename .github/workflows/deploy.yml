@@ -1,0 +1,808 @@
+name: Deploy Admin
+
+# ADMIN 0C.1 — MANUAL EXACT-SHA DEPLOYMENT.
+#
+# This workflow installs a built Angular release of the admin control plane onto the
+# EC2 box that serves https://admin.dinifyapp.com, and it re-points the live symlink
+# at it. It is deliberately MANUAL ONLY: there is no `push`, no `workflow_run` and no
+# `schedule` trigger here. Automatic deployment after a green CI on main is 0C.2, and
+# it is gated on a real 0C.1 deployment having been observed and accepted first.
+#
+# TRANSPORT IS SSM OVER GITHUB OIDC, NEVER SSH. The instance's security group does not
+# admit GitHub-hosted runners — backend PR #281 retired the `appleboy/ssh-action` path
+# after it died at connect timeout, and the UAT_SSH_* secrets were deleted 2026-08-18.
+# No workflow in this repository references `secrets.` at all: OIDC needs no stored
+# credential. Do not reintroduce SSH, rsync, or Firebase Hosting here.
+#
+# THE INVARIANT THIS WORKFLOW EXISTS TO PROTECT: the job is green only when the PUBLIC
+# origin is actually serving the commit that was requested. A deploy that reports
+# success while the box stays on an older release is the exact defect class the backend
+# closed on 2026-08-08 (a green deploy that did not deploy, undetected for 39 hours).
+# So the box asserts what it promoted (DEPLOYED-HEAD), and the runner then independently
+# re-reads https://admin.dinifyapp.com/release.txt over the public internet. The
+# workflow's intention is never the evidence.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Full 40-character lowercase commit SHA on main that has passed CI"
+        required: true
+        type: string
+      mode:
+        description: "deploy = build, upload, install, promote · rollback = re-point to an already-installed release"
+        required: true
+        type: choice
+        options:
+          - deploy
+          - rollback
+        default: deploy
+
+# Serialise rather than cancel. A cancelled run whose SSM invocation is already mutating
+# the box would abandon the remote operation mid-flight with nothing watching it.
+concurrency:
+  group: deploy-admin
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-west-2
+  EXPECTED_ROLE_ARN: arn:aws:iam::767397669083:role/dinify-admin-github-deploy-role
+  ADMIN_INSTANCE_ID: i-0eeb7c0c3a36d3667
+  ARTIFACT_BUCKET: dinify-deploy-artifacts-767397669083-eu-west-2
+  PUBLIC_HOST: admin.dinifyapp.com
+  NODE_VERSION: "20"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # Minimum viable set, and every entry is load-bearing:
+    #   id-token: write  — mint the OIDC token AWS trusts for the deploy role
+    #   contents: read   — check out the repository to build the target commit
+    #   actions: read    — let the certification step LIST CI runs, which is the only
+    #                      thing standing between a dispatch box and an untested commit
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+
+    steps:
+      # ------------------------------------------------------------------------------
+      # The admin OIDC role's trust policy is pinned to refs/heads/main. Running from
+      # any other ref could not assume the role anyway — but failing here, before AWS is
+      # touched, produces a comprehensible error instead of an opaque STS denial.
+      # ------------------------------------------------------------------------------
+      - name: Refuse to run outside refs/heads/main
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_FULL: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" != "workflow_dispatch" ]; then
+            echo "::error::This workflow is manual-only; refusing event '${EVENT_NAME}'." >&2
+            exit 1
+          fi
+          if [ "$REF_FULL" != "refs/heads/main" ]; then
+            echo "::error::Refusing to run from '${REF_FULL}'. Dispatch this workflow from refs/heads/main — the deploy role's OIDC trust is pinned to main." >&2
+            exit 1
+          fi
+          echo "Running from refs/heads/main."
+
+      # ------------------------------------------------------------------------------
+      # INJECTION HYGIENE. `inputs.sha` is operator-typed free text and this workflow
+      # ultimately runs a script as root on the box, so no event-derived value is ever
+      # textually interpolated into a run: script with raw ${{ }} — GitHub expands those
+      # into the script body before the shell sees them, and no amount of quoting helps.
+      # Everything arrives through env: and is read as a quoted shell variable, and only
+      # the VALIDATED forms are handed onward through $GITHUB_ENV.
+      # ------------------------------------------------------------------------------
+      - name: Validate dispatch inputs
+        shell: bash
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+          INPUT_MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$INPUT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Rejected target: expected a full 40-character lowercase hex commit SHA. Short SHAs, branch names and tags are not accepted." >&2
+            exit 1
+          fi
+          case "$INPUT_MODE" in
+            deploy|rollback) ;;
+            *) echo "::error::Rejected mode '${INPUT_MODE}': must be exactly 'deploy' or 'rollback'." >&2; exit 1 ;;
+          esac
+          echo "TARGET_SHA=${INPUT_SHA}" >> "$GITHUB_ENV"
+          echo "MODE=${INPUT_MODE}" >> "$GITHUB_ENV"
+          echo "Target ${INPUT_SHA}, mode ${INPUT_MODE}."
+
+      - name: Check out repository (full history for ancestry proof)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # ------------------------------------------------------------------------------
+      # EXACT TARGET CERTIFICATION — BOTH CONDITIONS, FOR BOTH MODES, BEFORE AWS AUTH.
+      #
+      #   (a) the SHA is an ancestor of CURRENT origin/main, and
+      #   (b) the SHA has a successful run of .github/workflows/ci.yml on branch main.
+      #
+      # Neither alone is sufficient. Ancestry alone admits a commit that never passed
+      # CI. CI-green alone admits a commit later dropped from main's history — and,
+      # because Admin CI runs on pull_request as well as push, it would also admit a
+      # commit that was only ever green on a PR branch, where CI tested a merge preview
+      # rather than the commit that landed.
+      #
+      # The workflow is queried BY FILE PATH (ci.yml), not by display name: the display
+      # name is literally "CI", and coupling a deploy gate to mutable display text is
+      # how a rename silently disables it.
+      # ------------------------------------------------------------------------------
+      - name: Certify target commit (ancestry + successful CI on main)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --prune origin +refs/heads/main:refs/remotes/origin/main
+          MAIN_SHA="$(git rev-parse refs/remotes/origin/main)"
+          echo "Current origin/main: ${MAIN_SHA}"
+
+          if ! git cat-file -e "${TARGET_SHA}^{commit}" 2>/dev/null; then
+            echo "::error::${TARGET_SHA} is not a commit object in this repository." >&2
+            exit 1
+          fi
+
+          if ! git merge-base --is-ancestor "$TARGET_SHA" "$MAIN_SHA"; then
+            echo "::error::${TARGET_SHA} is not an ancestor of current origin/main (${MAIN_SHA}). Only commits still in main's history may be deployed." >&2
+            exit 1
+          fi
+          echo "Ancestry: ${TARGET_SHA} is in main's history."
+
+          gh api \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${TARGET_SHA}&branch=main&status=success&per_page=100" \
+            > ci-runs.json
+          GREEN="$(jq --arg sha "$TARGET_SHA" \
+            '[.workflow_runs[] | select(.head_branch == "main" and .head_sha == $sha and .conclusion == "success")] | length' \
+            ci-runs.json)"
+          if [ "${GREEN:-0}" -lt 1 ]; then
+            echo "::error::Refusing ${TARGET_SHA}: no successful CI run on branch main exists for it. A PR-branch green run is not sufficient." >&2
+            exit 1
+          fi
+          echo "CI certification: ${GREEN} successful CI run(s) on main for ${TARGET_SHA}."
+
+      # ------------------------------------------------------------------------------
+      # BUILD HAPPENS BEFORE AWS AUTHENTICATION, DELIBERATELY. `npm ci` executes
+      # third-party install scripts; there is no reason for live AWS credentials to be
+      # sitting in the environment while it does. A build failure therefore also never
+      # reaches AWS at all.
+      #
+      # The full type/lint/test suite is NOT re-run here — CI already proved this exact
+      # SHA green on main, which is the precondition enforced above. What DOES re-run is
+      # the mock-isolation gate, because it must scan the exact dist/ that ships: a mock
+      # authentication transport reaching the control plane is an authentication bypass
+      # with a friendly name.
+      # ------------------------------------------------------------------------------
+      - name: Check out the exact target commit
+        if: inputs.mode == 'deploy'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout --detach "$TARGET_SHA"
+          HEAD_NOW="$(git rev-parse HEAD)"
+          if [ "$HEAD_NOW" != "$TARGET_SHA" ]; then
+            echo "::error::HEAD is ${HEAD_NOW}, expected ${TARGET_SHA}." >&2
+            exit 1
+          fi
+          echo "Building from detached HEAD ${HEAD_NOW}."
+
+      - name: Set up Node.js
+        if: inputs.mode == 'deploy'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        if: inputs.mode == 'deploy'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          npm --version
+          npm ci
+
+      - name: Build (production)
+        if: inputs.mode == 'deploy'
+        shell: bash
+        run: npm run build:prod
+
+      - name: Mock-isolation gate
+        if: inputs.mode == 'deploy'
+        shell: bash
+        run: npm run check:mock-isolation
+
+      # ------------------------------------------------------------------------------
+      # release.txt is the SERVED-COMMIT ATTESTATION. It is written only after the build
+      # and the mock-isolation gate have passed, it travels inside the artifact, and it
+      # is what both the box and the public assertion later read back. Apache serves it
+      # no-store, so the assertion cannot be satisfied by a cached copy.
+      # ------------------------------------------------------------------------------
+      - name: Validate dist/ and stamp release.txt
+        if: inputs.mode == 'deploy'
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -d dist ] || { echo "::error::dist/ does not exist after build." >&2; exit 1; }
+          [ -f dist/index.html ] && [ -s dist/index.html ] || { echo "::error::dist/index.html is missing or empty." >&2; exit 1; }
+          if [ "$(find dist -type f | wc -l)" -lt 1 ]; then
+            echo "::error::dist/ contains no files." >&2
+            exit 1
+          fi
+          if find dist -type l -print -quit | grep -q .; then
+            echo "::error::dist/ contains symlinks; refusing to package." >&2
+            exit 1
+          fi
+          printf '%s\n' "$TARGET_SHA" > dist/release.txt
+          echo "dist/ file count: $(find dist -type f | wc -l)"
+          find dist -type f -printf '%P\n' | sort
+
+      # ------------------------------------------------------------------------------
+      # ONE tar.gz of the CONTENTS of dist/ — no wrapper directory, so index.html and
+      # release.txt land at the release root on extraction. Archive metadata is
+      # normalised and gzip runs with -n so an identical tree produces an identical
+      # artifact; the digest is then what the box independently re-derives.
+      # ------------------------------------------------------------------------------
+      - name: Package artifact and compute digest
+        if: inputs.mode == 'deploy'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime='UTC 2020-01-01' --format=gnu \
+              -C dist -cf - . | gzip -n > artifact.tar.gz
+          ARTIFACT_SHA256="$(sha256sum artifact.tar.gz | cut -d' ' -f1)"
+          if [[ ! "$ARTIFACT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Computed artifact digest is not 64 lowercase hex." >&2
+            exit 1
+          fi
+          # The digest is IN THE KEY so a rebuild that produces different bytes for the
+          # same source SHA can never silently overwrite the artifact already installed.
+          echo "ARTIFACT_SHA256=${ARTIFACT_SHA256}" >> "$GITHUB_ENV"
+          echo "S3_KEY=admin/${TARGET_SHA}/${ARTIFACT_SHA256}.tar.gz" >> "$GITHUB_ENV"
+          echo "artifact bytes : $(stat -c%s artifact.tar.gz)"
+          echo "artifact sha256: ${ARTIFACT_SHA256}"
+
+      # ------------------------------------------------------------------------------
+      # The role ARN lives in a repository VARIABLE so it is visible and auditable — an
+      # IAM role ARN is not a secret and must not be masked into one. But a repository
+      # variable is mutable by anyone with repo admin, so it is not trusted on its own:
+      # it is compared byte-for-byte with the ARN pinned in this file before it is used.
+      # ------------------------------------------------------------------------------
+      - name: Validate deploy role ARN
+        shell: bash
+        env:
+          ROLE_ARN_VAR: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ROLE_ARN_VAR:-}" ]; then
+            echo "::error::Repository variable AWS_DEPLOY_ROLE_ARN is unset or empty. Set it to ${EXPECTED_ROLE_ARN}." >&2
+            exit 1
+          fi
+          if [ "$ROLE_ARN_VAR" != "$EXPECTED_ROLE_ARN" ]; then
+            echo "::error::AWS_DEPLOY_ROLE_ARN does not match the ARN pinned in this workflow. Expected ${EXPECTED_ROLE_ARN}; refusing to authenticate." >&2
+            exit 1
+          fi
+          echo "Deploy role ARN validated."
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload artifact to private S3 prefix
+        if: inputs.mode == 'deploy'
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws s3 cp artifact.tar.gz "s3://${ARTIFACT_BUCKET}/${S3_KEY}" --only-show-errors
+          echo "Uploaded s3://${ARTIFACT_BUCKET}/${S3_KEY}"
+
+      # ------------------------------------------------------------------------------
+      # THE REMOTE SCRIPT.
+      #
+      # It is embedded here rather than committed as scripts/deploy-admin-release.sh on
+      # purpose. Its contract is with the BOX's current filesystem layout, not with the
+      # application version being installed. A workflow_dispatch always runs the YAML
+      # from main, so an embedded script is always main's script; a separate committed
+      # file checked out at TARGET_SHA would mean a rollback executed an OLD commit's
+      # deployment mechanism against the CURRENT box — precisely the mismatch that must
+      # not happen. Keep it here.
+      #
+      # The heredoc is QUOTED, so nothing expands at write time. The four values are
+      # substituted afterwards, and only after being re-validated immediately above the
+      # substitution: the injection control sits beside the injection site.
+      # ------------------------------------------------------------------------------
+      - name: Write remote deploy script
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > deploy.sh <<'DEPLOY_SCRIPT'
+          #!/bin/bash
+          # The shebang is load-bearing: AWS-RunShellScript otherwise executes this with
+          # /bin/sh (dash on Ubuntu), which cannot parse the [[ ]] regex tests below.
+          set -euo pipefail
+
+          TARGET_SHA="__TARGET_SHA__"
+          MODE="__MODE__"
+          ARTIFACT_SHA256="__ARTIFACT_SHA256__"
+          S3_KEY="__S3_KEY__"
+
+          CURRENT=/var/www/dinify-admin
+          RELEASE_ROOT=/var/www/dinify-admin-releases
+          AWS_BIN=/usr/local/bin/aws
+          PY_BIN=/usr/bin/python3
+          BUCKET=dinify-deploy-artifacts-767397669083-eu-west-2
+          PUBLIC_HOST=admin.dinifyapp.com
+
+          fail() { echo "DEPLOY-FAILED: $*" >&2; exit 1; }
+
+          # ---- re-validate everything the workflow handed over ----
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "TARGET_SHA is not 40 lowercase hex"
+          case "$MODE" in
+            deploy|rollback) ;;
+            *) fail "MODE must be deploy or rollback" ;;
+          esac
+
+          FINAL_RELEASE="${RELEASE_ROOT}/${TARGET_SHA}"
+          echo "ADMIN-DEPLOY: mode=${MODE} target=${TARGET_SHA}"
+
+          # ---- preconditions, before any mutation ----
+          [ -x "$PY_BIN" ] || fail "python3 not found at ${PY_BIN}"
+          [ -d "$RELEASE_ROOT" ] || fail "release root ${RELEASE_ROOT} is not a directory"
+          RELEASE_ROOT_REAL="$(readlink -f "$RELEASE_ROOT")" || fail "cannot resolve ${RELEASE_ROOT}"
+          [ -L "$CURRENT" ] || fail "${CURRENT} is not a symlink; refusing to touch it"
+          PREV_TARGET="$(readlink -f "$CURRENT")" || fail "cannot resolve ${CURRENT}"
+          [ -n "$PREV_TARGET" ] || fail "${CURRENT} resolves to nothing"
+
+          # Boundary-safe containment: requires a real path separator after the root, so
+          # a sibling such as /var/www/dinify-admin-releases-evil cannot pass as a
+          # textual prefix match.
+          case "$PREV_TARGET" in
+            "${RELEASE_ROOT_REAL}"/*) ;;
+            *) fail "current symlink target ${PREV_TARGET} is outside ${RELEASE_ROOT_REAL}" ;;
+          esac
+          echo "PREVIOUS-TARGET: ${PREV_TARGET}"
+
+          AVAIL_KB="$(df -Pk "$RELEASE_ROOT_REAL" | awk 'NR==2 {print $4}')"
+          [ -n "${AVAIL_KB:-}" ] || fail "cannot determine free space on ${RELEASE_ROOT_REAL}"
+          [ "$AVAIL_KB" -ge 524288 ] || fail "insufficient free space: ${AVAIL_KB} KiB available, need at least 524288 KiB"
+
+          # ---- release validators (used for staged trees AND existing releases) ----
+          validate_release() {
+            local dir="$1" ctx="$2" got
+            [ ! -L "$dir" ] || fail "${ctx}: ${dir} is a symlink"
+            [ -d "$dir" ] || fail "${ctx}: ${dir} is not a directory"
+            [ -f "$dir/index.html" ] || fail "${ctx}: index.html is missing or not a regular file"
+            [ -s "$dir/index.html" ] || fail "${ctx}: index.html is empty"
+            [ -f "$dir/release.txt" ] || fail "${ctx}: release.txt is missing or not a regular file"
+            got="$(cat "$dir/release.txt")"
+            [ "$got" = "$TARGET_SHA" ] || fail "${ctx}: release.txt attests '${got}', expected '${TARGET_SHA}'"
+            [ "$(find "$dir" -type f | wc -l)" -ge 1 ] || fail "${ctx}: contains no regular files"
+            if find "$dir" -mindepth 1 -type l -print -quit | grep -q .; then
+              fail "${ctx}: contains symlinks"
+            fi
+            if find "$dir" -mindepth 1 ! -type f ! -type d -print -quit | grep -q .; then
+              fail "${ctx}: contains entries that are neither regular files nor directories"
+            fi
+          }
+
+          # Apache (www-data) must be able to READ the tree and must not be able to
+          # WRITE any of it. Owner root plus no group-write and no other-write is what
+          # delivers that; world-read/execute is how www-data is granted access at all.
+          validate_permissions() {
+            local dir="$1" ctx="$2"
+            if find "$dir" ! -user root -print -quit | grep -q .; then
+              fail "${ctx}: contains entries not owned by root"
+            fi
+            if find "$dir" -perm /022 -print -quit | grep -q .; then
+              fail "${ctx}: contains group- or other-writable entries"
+            fi
+            if find "$dir" -type d ! -perm -005 -print -quit | grep -q .; then
+              fail "${ctx}: contains a directory Apache cannot traverse"
+            fi
+            if find "$dir" -type f ! -perm -004 -print -quit | grep -q .; then
+              fail "${ctx}: contains a file Apache cannot read"
+            fi
+          }
+
+          # ---- truly atomic symlink replacement ----
+          # `ln -sfnT` is NOT sufficient on its own: a forced ln may unlink the old
+          # destination before creating the replacement, leaving a window in which
+          # CURRENT does not exist and Apache serves nothing. Creating a temporary
+          # symlink beside it and rename(2)-ing it over the destination has no such
+          # window. The temporary link is created in CURRENT's own directory so the
+          # rename is guaranteed same-filesystem.
+          atomic_symlink() {
+            local target="$1" linkpath="$2" dir tmp
+            dir="$(dirname "$linkpath")"
+            tmp="$(mktemp -u "${dir}/.dinify-admin-link.XXXXXXXX")"
+            if ! ln -s "$target" "$tmp"; then
+              rm -f "$tmp" 2>/dev/null || true
+              return 1
+            fi
+            if ! mv -Tf "$tmp" "$linkpath"; then
+              rm -f "$tmp" 2>/dev/null || true
+              return 1
+            fi
+            return 0
+          }
+
+          # ---- install (deploy) or locate (rollback) the target release ----
+          if [ "$MODE" = "deploy" ]; then
+            [[ "$ARTIFACT_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail "ARTIFACT_SHA256 is not 64 lowercase hex"
+            EXPECTED_KEY="admin/${TARGET_SHA}/${ARTIFACT_SHA256}.tar.gz"
+            [ "$S3_KEY" = "$EXPECTED_KEY" ] || fail "S3 key '${S3_KEY}' does not match the expected structure '${EXPECTED_KEY}'"
+            [ -x "$AWS_BIN" ] || fail "AWS CLI not found at ${AWS_BIN}"
+
+            if [ -e "$FINAL_RELEASE" ]; then
+              # An immutable release is never repaired, overwritten or extracted over.
+              # It either validates and becomes eligible for re-promotion, or the deploy
+              # fails and a human looks at it.
+              validate_release "$FINAL_RELEASE" "existing release"
+              validate_permissions "$FINAL_RELEASE" "existing release"
+              echo "RELEASE-EXISTS: ${FINAL_RELEASE} already installed and valid; skipping download and extraction"
+            else
+              STAGE="$(mktemp -d "${RELEASE_ROOT}/.staging-${TARGET_SHA}.XXXXXXXX")" || fail "cannot create staging directory"
+              trap 'rm -rf "$STAGE"' EXIT
+              mkdir "${STAGE}/tree"
+
+              "$AWS_BIN" s3 cp "s3://${BUCKET}/${S3_KEY}" "${STAGE}/artifact.tar.gz" --only-show-errors \
+                || fail "could not download s3://${BUCKET}/${S3_KEY}"
+
+              GOT_SHA="$(sha256sum "${STAGE}/artifact.tar.gz" | cut -d' ' -f1)"
+              [ "$GOT_SHA" = "$ARTIFACT_SHA256" ] \
+                || fail "artifact digest mismatch: downloaded ${GOT_SHA}, expected ${ARTIFACT_SHA256}"
+              echo "ARTIFACT-VERIFIED: ${GOT_SHA}"
+
+              # Archive members are validated BEFORE anything is written to disk. tar is
+              # never pointed at an unvalidated archive: absolute paths, traversal,
+              # symlinks, hardlinks, devices, FIFOs and sockets are all rejected outright
+              # rather than filtered, so a malformed artifact fails loudly.
+              "$PY_BIN" - "${STAGE}/artifact.tar.gz" "${STAGE}/tree" <<'PYEXTRACT'
+          import os
+          import sys
+          import tarfile
+
+          src, dest = sys.argv[1], sys.argv[2]
+          dest = os.path.realpath(dest)
+
+          with tarfile.open(src, "r:gz") as tf:
+              members = tf.getmembers()
+              if not members:
+                  sys.exit("archive contains no members")
+              for m in members:
+                  if not (m.isfile() or m.isdir()):
+                      sys.exit("rejected non-regular archive member: %s" % m.name)
+                  name = m.name
+                  if name.startswith("/") or os.path.isabs(name):
+                      sys.exit("rejected absolute path in archive: %s" % name)
+                  if ".." in name.replace("\\", "/").split("/"):
+                      sys.exit("rejected path traversal in archive: %s" % name)
+                  resolved = os.path.realpath(os.path.join(dest, name))
+                  if resolved != dest and not resolved.startswith(dest + os.sep):
+                      sys.exit("rejected archive member escaping destination: %s" % name)
+              try:
+                  tf.extractall(dest, members=members, filter="data")
+              except TypeError:
+                  tf.extractall(dest, members=members)
+          print("ARCHIVE-MEMBERS: %d" % len(members))
+          PYEXTRACT
+
+              chown -R root:root "${STAGE}/tree"
+              find "${STAGE}/tree" -type d -exec chmod 0755 {} +
+              find "${STAGE}/tree" -type f -exec chmod 0644 {} +
+
+              validate_release "${STAGE}/tree" "staged release"
+              validate_permissions "${STAGE}/tree" "staged release"
+
+              # Same-filesystem rename: the release appears complete and valid, or it
+              # does not appear at all. Never a copy or a sync into the final path.
+              [ ! -e "$FINAL_RELEASE" ] || fail "${FINAL_RELEASE} appeared while staging; refusing to overwrite"
+              mv -T "${STAGE}/tree" "$FINAL_RELEASE" || fail "could not install release into ${FINAL_RELEASE}"
+
+              validate_release "$FINAL_RELEASE" "installed release"
+              validate_permissions "$FINAL_RELEASE" "installed release"
+              echo "RELEASE-INSTALLED: ${FINAL_RELEASE}"
+            fi
+          else
+            # Rollback never downloads, builds, extracts, repairs or rewrites anything.
+            # It is a symlink operation against a release that must already be present.
+            [ -e "$FINAL_RELEASE" ] || fail "rollback target ${FINAL_RELEASE} is not installed on this box; rollback never reconstructs a release"
+            validate_release "$FINAL_RELEASE" "rollback target"
+            validate_permissions "$FINAL_RELEASE" "rollback target"
+            echo "ROLLBACK-TARGET-VALID: ${FINAL_RELEASE}"
+          fi
+
+          FINAL_REAL="$(readlink -f "$FINAL_RELEASE")" || fail "cannot resolve ${FINAL_RELEASE}"
+
+          # ---- promote ----
+          atomic_symlink "$FINAL_REAL" "$CURRENT" || fail "could not atomically re-point ${CURRENT}"
+          PROMOTED="$(readlink -f "$CURRENT")" || fail "cannot resolve ${CURRENT} after promotion"
+          [ "$PROMOTED" = "$FINAL_REAL" ] || fail "after promotion ${CURRENT} resolves to ${PROMOTED}, expected ${FINAL_REAL}"
+          echo "PROMOTED: ${CURRENT} -> ${FINAL_REAL}"
+          # Apache resolves the symlink per request; it is deliberately NOT reloaded.
+
+          # ---- post-switch assertions through LOCAL Apache ----
+          # These return non-zero rather than calling fail(), because their caller must
+          # stay alive long enough to restore the previous release.
+          http_probe() {
+            local path="$1" outvar_code="$2" outvar_body="$3" raw
+            raw="$(curl -sS --max-time 15 \
+                    --resolve "${PUBLIC_HOST}:443:127.0.0.1" \
+                    -H 'Cache-Control: no-cache' \
+                    -w '\n%{http_code}' \
+                    "https://${PUBLIC_HOST}${path}" 2>/dev/null || true)"
+            printf -v "$outvar_code" '%s' "$(printf '%s' "$raw" | tail -n 1)"
+            printf -v "$outvar_body" '%s' "$(printf '%s' "$raw" | sed '$d')"
+          }
+
+          post_switch_checks() {
+            local code body status attempt
+
+            for attempt in 1 2 3; do
+              http_probe "/release.txt" code body
+              if [ "$code" = "200" ] && [ "$body" = "$TARGET_SHA" ]; then
+                break
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                sleep 2
+              fi
+            done
+            if [ "$code" != "200" ] || [ "$body" != "$TARGET_SHA" ]; then
+              echo "CHECK-FAILED: /release.txt returned HTTP ${code} body '${body}', expected 200 and '${TARGET_SHA}'" >&2
+              return 1
+            fi
+
+            http_probe "/api/admin/v1/health/" code body
+            if [ "$code" != "200" ]; then
+              echo "CHECK-FAILED: /api/admin/v1/health/ returned HTTP ${code}, expected 200" >&2
+              return 1
+            fi
+            status="$(printf '%s' "$body" | "$PY_BIN" -c 'import json,sys; print(json.load(sys.stdin).get("status",""))' 2>/dev/null || echo "")"
+            if [ "$status" != "ok" ]; then
+              echo "CHECK-FAILED: /api/admin/v1/health/ parsed status '${status}', expected 'ok'" >&2
+              return 1
+            fi
+
+            http_probe "/" code body
+            if [ "$code" != "200" ]; then
+              echo "CHECK-FAILED: / returned HTTP ${code}, expected 200" >&2
+              return 1
+            fi
+            case "$body" in
+              *"<html"*|*"<!doctype"*|*"<!DOCTYPE"*) ;;
+              *) echo "CHECK-FAILED: / did not return an HTML document" >&2; return 1 ;;
+            esac
+
+            http_probe "/restaurants/00000000-0000-0000-0000-000000000000/readiness" code body
+            if [ "$code" != "200" ]; then
+              echo "CHECK-FAILED: deep SPA route returned HTTP ${code}, expected 200" >&2
+              return 1
+            fi
+            case "$body" in
+              *"<html"*|*"<!doctype"*|*"<!DOCTYPE"*) ;;
+              *) echo "CHECK-FAILED: deep SPA route did not return an HTML document" >&2; return 1 ;;
+            esac
+
+            return 0
+          }
+
+          if ! post_switch_checks; then
+            echo "POST-SWITCH-FAILED: restoring ${PREV_TARGET}" >&2
+            if atomic_symlink "$PREV_TARGET" "$CURRENT"; then
+              RESTORED="$(readlink -f "$CURRENT" || echo '')"
+              if [ "$RESTORED" = "$PREV_TARGET" ]; then
+                echo "RESTORED-PREVIOUS: ${CURRENT} -> ${PREV_TARGET}" >&2
+              else
+                echo "RESTORE-VERIFY-FAILED: ${CURRENT} resolves to '${RESTORED}', expected '${PREV_TARGET}'" >&2
+              fi
+            else
+              echo "RESTORE-FAILED: could not re-point ${CURRENT} to ${PREV_TARGET} — MANUAL INTERVENTION REQUIRED" >&2
+            fi
+            # A successful automatic restoration is NOT a successful deployment.
+            exit 1
+          fi
+
+          # Emitted ONLY after every local served-state assertion has passed. This is the
+          # box's own attestation of what it promoted, and it is the only thing the
+          # workflow will accept as proof.
+          echo "DEPLOYED-HEAD: ${TARGET_SHA}"
+          DEPLOY_SCRIPT
+
+          # Re-validate immediately before substitution — beside the injection site, not
+          # merely somewhere earlier in the file.
+          if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::TARGET_SHA failed re-validation before substitution." >&2
+            exit 1
+          fi
+          case "$MODE" in
+            deploy|rollback) ;;
+            *) echo "::error::MODE failed re-validation before substitution." >&2; exit 1 ;;
+          esac
+          if [ "$MODE" = "deploy" ]; then
+            if [[ ! "${ARTIFACT_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::ARTIFACT_SHA256 failed re-validation before substitution." >&2
+              exit 1
+            fi
+            if [ "${S3_KEY:-}" != "admin/${TARGET_SHA}/${ARTIFACT_SHA256}.tar.gz" ]; then
+              echo "::error::S3_KEY failed re-validation before substitution." >&2
+              exit 1
+            fi
+          else
+            # Rollback consumes neither value; substituting empty keeps the placeholder
+            # assertion below meaningful without smuggling an unused S3 path to the box.
+            ARTIFACT_SHA256=""
+            S3_KEY=""
+          fi
+
+          sed -i \
+            -e "s|__TARGET_SHA__|${TARGET_SHA}|g" \
+            -e "s|__MODE__|${MODE}|g" \
+            -e "s|__ARTIFACT_SHA256__|${ARTIFACT_SHA256}|g" \
+            -e "s|__S3_KEY__|${S3_KEY}|g" \
+            deploy.sh
+
+          if grep -Eq '__TARGET_SHA__|__MODE__|__ARTIFACT_SHA256__|__S3_KEY__' deploy.sh; then
+            echo "::error::deploy.sh still carries an unsubstituted placeholder." >&2
+            exit 1
+          fi
+          bash -n deploy.sh
+          echo "Remote script prepared ($(wc -l < deploy.sh) lines)."
+
+      # ------------------------------------------------------------------------------
+      # SSM dispatch. send-command returns when AWS ACCEPTS the command, not when it
+      # finishes — the remote `set -e` cannot fail this job on its own, so the
+      # invocation is polled to a terminal state and the job is gated on Success.
+      # ------------------------------------------------------------------------------
+      - name: Deploy via SSM and verify the box's own attestation
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --rawfile embeds the script as one JSON string, sidestepping every quoting
+          # hazard in it (the nested Python heredoc, single quotes, $-expansions).
+          jq -n --rawfile script deploy.sh \
+            '{commands: [$script], executionTimeout: ["1800"]}' > params.json
+
+          CMD_ID="$(aws ssm send-command \
+            --instance-ids "$ADMIN_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Admin ${MODE} ${TARGET_SHA:0:12} (run ${GITHUB_RUN_ID})" \
+            --parameters file://params.json \
+            --query 'Command.CommandId' --output text)"
+          echo "SSM command dispatched: ${CMD_ID}"
+
+          STATUS="Pending"
+          while :; do
+            # `|| echo Pending` absorbs the InvocationDoesNotExist race immediately
+            # after dispatch; the job timeout bounds this loop.
+            STATUS="$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" --instance-id "$ADMIN_INSTANCE_ID" \
+              --query 'Status' --output text 2>/dev/null || echo Pending)"
+            case "$STATUS" in
+              Pending|InProgress|Delayed|Cancelling) sleep 10 ;;
+              *) break ;;
+            esac
+          done
+          echo "SSM invocation finished: ${STATUS}"
+
+          # Captured, not merely streamed: the DEPLOYED-HEAD marker is read back out of
+          # the box's own stdout below.
+          REMOTE_STDOUT="$(aws ssm get-command-invocation \
+            --command-id "$CMD_ID" --instance-id "$ADMIN_INSTANCE_ID" \
+            --query 'StandardOutputContent' --output text)"
+          echo "---- remote stdout (SSM truncates beyond 24,000 chars) ----"
+          printf '%s\n' "$REMOTE_STDOUT"
+          echo "---- remote stderr ----"
+          aws ssm get-command-invocation \
+            --command-id "$CMD_ID" --instance-id "$ADMIN_INSTANCE_ID" \
+            --query 'StandardErrorContent' --output text >&2
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::Admin ${MODE} failed on the box (SSM status: ${STATUS}). See remote output above." >&2
+            exit 1
+          fi
+
+          MARKERS="$(printf '%s\n' "$REMOTE_STDOUT" | grep -cE '^DEPLOYED-HEAD: [0-9a-f]{40}$' || true)"
+          if [ "${MARKERS:-0}" -ne 1 ]; then
+            echo "::error::SSM reported Success but the remote output carries ${MARKERS:-0} DEPLOYED-HEAD markers (expected exactly 1) — refusing to report an unproven deploy as green." >&2
+            exit 1
+          fi
+          DEPLOYED_HEAD="$(printf '%s\n' "$REMOTE_STDOUT" | grep -oE '^DEPLOYED-HEAD: [0-9a-f]{40}$' | head -n 1 | awk '{print $2}')"
+          if [ "$DEPLOYED_HEAD" != "$TARGET_SHA" ]; then
+            echo "::error::Box-asserted DEPLOYED-HEAD ${DEPLOYED_HEAD} does not match the requested target ${TARGET_SHA}." >&2
+            exit 1
+          fi
+          echo "Box attests DEPLOYED-HEAD: ${DEPLOYED_HEAD}"
+
+      # ------------------------------------------------------------------------------
+      # INDEPENDENT PUBLIC VERIFICATION. Everything above this point is the box talking
+      # about itself. This step leaves the runner, crosses the public internet and reads
+      # what the origin actually serves. The job is green only if that is the exact
+      # commit that was requested.
+      # ------------------------------------------------------------------------------
+      - name: Assert the public origin serves the requested commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          CB="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          # release.txt — exact SHA, and it must be uncacheable.
+          HDRS="$(mktemp)"
+          BODY="$(curl -sS --max-time 20 -D "$HDRS" \
+            -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+            -w '\n%{http_code}' \
+            "https://${PUBLIC_HOST}/release.txt?cb=${CB}")"
+          CODE="$(printf '%s' "$BODY" | tail -n 1)"
+          SERVED="$(printf '%s' "$BODY" | sed '$d')"
+          if [ "$CODE" != "200" ]; then
+            echo "::error::Public /release.txt returned HTTP ${CODE}, expected 200." >&2
+            exit 1
+          fi
+          if [ "$SERVED" != "$TARGET_SHA" ]; then
+            echo "::error::Public origin serves '${SERVED}' but ${TARGET_SHA} was requested." >&2
+            exit 1
+          fi
+          if ! grep -iE '^cache-control:.*no-store' "$HDRS" >/dev/null; then
+            echo "::error::Public /release.txt is not served no-store; the served-commit attestation could be satisfied by a cached copy." >&2
+            grep -i '^cache-control:' "$HDRS" >&2 || echo "(no Cache-Control header present)" >&2
+            exit 1
+          fi
+          echo "Public /release.txt: ${SERVED} (no-store)"
+
+          # Admin API still answering on the same origin.
+          HEALTH="$(curl -sS --max-time 20 -w '\n%{http_code}' \
+            "https://${PUBLIC_HOST}/api/admin/v1/health/?cb=${CB}")"
+          CODE="$(printf '%s' "$HEALTH" | tail -n 1)"
+          HBODY="$(printf '%s' "$HEALTH" | sed '$d')"
+          if [ "$CODE" != "200" ]; then
+            echo "::error::Public /api/admin/v1/health/ returned HTTP ${CODE}, expected 200." >&2
+            exit 1
+          fi
+          HSTATUS="$(printf '%s' "$HBODY" | jq -r '.status // ""' 2>/dev/null || echo "")"
+          if [ "$HSTATUS" != "ok" ]; then
+            echo "::error::Public admin health parsed status '${HSTATUS}', expected 'ok'." >&2
+            exit 1
+          fi
+          echo "Public admin health: ok"
+
+          # Root document.
+          CODE="$(curl -sS -o /dev/null --max-time 20 -w '%{http_code}' \
+            -H 'Cache-Control: no-cache' "https://${PUBLIC_HOST}/?cb=${CB}")"
+          if [ "$CODE" != "200" ]; then
+            echo "::error::Public / returned HTTP ${CODE}, expected 200." >&2
+            exit 1
+          fi
+          echo "Public /: 200"
+
+      - name: Record outcome
+        if: always()
+        shell: bash
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Admin ${MODE:-unknown}: ${JOB_STATUS}"
+            echo "- Target SHA: \`${TARGET_SHA:-unknown}\`"
+            echo "- Mode: \`${MODE:-unknown}\`"
+            echo "- Instance: \`${ADMIN_INSTANCE_ID}\`"
+            if [ -n "${S3_KEY:-}" ]; then
+              echo "- Artifact: \`s3://${ARTIFACT_BUCKET}/${S3_KEY}\`"
+              echo "- Artifact SHA-256: \`${ARTIFACT_SHA256:-}\`"
+            else
+              echo "- Artifact: none (rollback re-points to an already-installed release)"
+            fi
+            echo "- Releases are retained, never pruned, throughout 0C.1."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -74,7 +74,16 @@ const FOCUSABLE =
         >
           <h2 id="elevation-title" class="text-admin-section text-ink">Confirm it is you</h2>
           <p id="elevation-description" class="mt-1 text-admin-body text-ink-muted">
-            This action needs a second factor from the last few minutes.
+            <!-- ONE SENTENCE, TWO TRUTHS. Telling an operator who just chose
+                 Re-authenticate that "this action needs a second factor" describes an
+                 action they have not taken yet — and the whole point of the
+                 deliberate path is to clear the window BEFORE starting one. -->
+            @if (elevation.reason() === 'deliberate') {
+              Confirming now opens the re-authentication window, so the next
+              consequential action will not stop to ask.
+            } @else {
+              This action needs a second factor from the last few minutes.
+            }
             @if (elevation.waiting() > 1) {
               {{ elevation.waiting() }} requests are waiting.
             }

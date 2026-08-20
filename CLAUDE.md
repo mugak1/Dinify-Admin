@@ -25,9 +25,12 @@ conventions change.
 - Shell, navigation and routing: ✅ the five §9 destinations, the §9.2 URL scheme,
   URL-backed filters
 - Authentication against `/api/admin/v1/auth/*`: ✅ all five routes, both login
-  states, the break-glass branch, bootstrap ordering
-- HTTP layer: ✅ CSRF interceptor, four-case error classifier, elevation queue,
-  defect reporting
+  states, the break-glass branch, bootstrap ordering, three bootstrap outcomes
+- HTTP layer: ✅ CSRF interceptor, transport precondition, four-case error
+  classifier, elevation queue, defect reporting, service-status signal
+- Operator-visible auth observability: ✅ the service-unavailable view, the
+  mid-session outage banner, the notice channel (low recovery codes, cleared
+  lockout), and Re-authenticate in the operator menu
 - Design tokens + the guard that enforces them: ✅
 - Primitives (status pill, table, button): ✅
 - Formatting (UGX, EAT time, server-anchored relative time): ✅
@@ -182,14 +185,17 @@ the case study for why `--self-test` exists.
 /restaurants/:id/readiness        /receivables/:invoiceId
 /restaurants/:id/billing          /activity
 /restaurants/:id/support          /login
-/restaurants/:id/activity
+/restaurants/:id/activity         /unavailable
 ```
 
 Plus a `**` → `/` fallback, which is not a destination — it stops a mistyped URL
 rendering a blank frame. `app.routes.spec.ts` pins the exact set.
 
-- `/login` sits **outside** the shell. Everything else is behind `authGuard` on the
-  shell parent — one guard, not twelve that can drift apart.
+- `/login` and `/unavailable` sit **outside** the shell. Everything else is behind
+  `authGuard` on the shell parent — one guard, not twelve that can drift apart.
+- **`/unavailable` is not a destination and not navigable** — it is the third bootstrap
+  outcome (below), guarded by `serviceUnavailableGuard` so a bookmarked URL cannot claim
+  an outage that is not happening.
 - The restaurant tabs are **children** of `/restaurants/:id`, so the §9.1 persistent
   header is genuinely persistent and cannot drift between tabs.
 - `withComponentInputBinding()` binds `:id` / `:issueId` / `:invoiceId` straight to
@@ -263,16 +269,75 @@ prefix, so Django's `admin/v1/...` routes are reached with it.
   cleanly, rather than stranding the operator on a dead challenge.
 
 ### BOOTSTRAP ORDERING IS LOAD-BEARING
-`provideAppInitializer` runs `GET /auth/session/` before the shell renders. 200 →
-authenticated; 401 → the guard routes to `/login`. **This is also what guarantees the
-CSRF cookie exists before any write can be attempted**, because `session/` is one of
-only two places the server issues it. Do not move it.
+`provideAppInitializer` runs `GET /auth/session/` before the shell renders. **This is
+also what guarantees the CSRF cookie exists before any write can be attempted**,
+because `session/` is one of only two places the server issues it. Do not move it.
+`bootstrap()` must never reject — a rejection in an app initializer is a blank page
+rather than a diagnosis.
+
+### THE BOOTSTRAP READ HAS THREE OUTCOMES, AND THEY ARE GENUINELY THREE
+
+| | Store | `AdminServiceStatus` | The guard sends them to |
+|---|---|---|---|
+| **200** | adopt | reachable | the shell |
+| **401** | **cleared** | reachable | `/login` |
+| **no usable answer** | **UNTOUCHED** | unavailable + request id | `/unavailable` |
+
+The third case is status 0, any 5xx, or a 2xx whose body is not a session — see
+`classifyTransportFailure` below.
+
+**It was two, and collapsing them cost the operator the diagnosis.** A bare `catch`
+cleared the store for all three, so a dead backend routed to the login form, and the
+sign-in attempt that followed answered a correct password with **"Invalid
+credentials."** — the uniform failure message (a deliberate disclosure control) firing
+about a situation it knows nothing about, because `extractErrorMessage` finds nothing
+readable in a `ProgressEvent` or an Apache error page and falls back. The operator then
+spends the afternoon doubting their password.
+
+So:
+
+- **Never clear a session the server did not deny.** A signed-out state is a claim
+  about the operator's credentials; an outage supports no such claim. `isAuthenticated()`
+  therefore stays true through a MID-SESSION outage, the shell stays up, and the outage
+  shows as a banner inside it — only the cold-start case gets the whole view.
+- **The unavailable view must not offer a login form.** A warning beside one still
+  invites credentials that cannot work. It states the fact, shows the request id when
+  there is one, and offers a MANUAL retry that re-runs `bootstrap()`. No auto-retry and
+  no full-screen spinner: the operator needs to KNOW the plane is unreachable, and a
+  screen that quietly re-attempts hides exactly that.
+- **`SUPPRESS_DEFECT_REPORT` does not apply to unavailability.** Suppressing a 401 on
+  an auth route is right — the login form renders it. Suppressing a 502 is how an
+  afternoon disappears.
 
 ### Logout does NOT clear the CSRF cookie
 Deliberate. It is inert without a session, and `verify/` rotates it on the next
 sign-in — clearing it would only add a second place that touches CSRF state. Client
 state is cleared regardless of the logout response: a failed revoke must not leave the
 operator looking at a portal they believe they have left.
+
+### TRANSPORT vs RESPONSE — `core/api/transport-failure.ts`
+**"Did we get a usable response at all" is PRIOR to "what did the server say."**
+`classifyTransportFailure(error)` answers the first question and returns
+`'unavailable'` (status 0, any 5xx, a 2xx whose body fails to parse or fails to adopt),
+`'denied'` (401) or `'other'`.
+
+It is called from **three** places, and the reason there is more than one is the same
+each time — **the caller must work when no interceptor runs**:
+
+1. `error.interceptor.ts`, as a **precondition ABOVE the four cases, not a fifth case**.
+   None of 401 / elevation / CSRF can apply when the answer is "no response".
+2. `AdminAuthService.bootstrap()` (and the post-verify read), **because mock mode never
+   touches `HttpClient`** — a branch only the interceptor could reach would be dead code
+   in the only mode this work is reviewed in.
+3. `ElevationService.submit()`, for the same reason: in mock mode nothing else would
+   raise the banner that explains why the dialog just closed.
+
+**IT DUCK-TYPES `status`, AND MUST — never `instanceof HttpErrorResponse`.** See the
+mock-mode rule under Mock Mode below.
+
+One consequence worth knowing: **5xx and status 0 no longer reach the classifier's
+defect tail**, because the precondition claims them first. What remains there is the
+unexpected 4xx.
 
 ## The Error Classifier — one place, four cases
 
@@ -358,10 +423,58 @@ something consequential. The reasoning is in a comment on `SessionStore` so nobo
 adds one later. If a warning is genuinely wanted, the fix is a backend PR exposing the
 idle deadline.
 
+## The Notice Channel — `core/notices/notice.service.ts`
+
+`verify/` and `elevate/` report two things **no other surface ever mentions again**:
+that a sign-in cleared an account lockout, and how many recovery codes are left. Both
+used to reach `console.warn` — which is to say nobody — and `elevate/`'s copy was
+dropped on the floor entirely, even though **a re-elevation spends a recovery code
+exactly as a sign-in does**. Running out with a lost authenticator means
+`manage.py reset_platform_admin_totp` on the box.
+
+**THE BOUNDARY, because this is how toast systems get born:**
+
+- **ONE notice visible at a time.** No stacking, no queue, no auto-dismiss, no timers.
+- **Two conditions COMPOSE into one notice**, one line per fact — never joined into a
+  sentence. "Something was fixed" and "a resource is running out" are different facts,
+  and `lockout_cleared` is kept apart from the low-code warning for exactly that reason.
+- **It persists and it returns.** Dismissal is remembered; a fresh statement of the
+  facts undismisses, so the warning comes back on the next sign-in while the condition
+  holds. A routine re-elevation with codes to spare does not resurrect it.
+- Rendered by `ui/notice-banner.component.ts` in `--admin-warning` — "careful", not
+  "something is wrong". **Do not introduce a toast library.**
+
+### The recovery-code reload gap, and its queued fix
+`GET /auth/session/` returns **exactly six fields** and `recovery_codes_remaining` is
+NOT among them — only `verify/` and `elevate/` ever state it. So a mid-session page
+reload loses the count, and the service will not re-assert a warning it can no longer
+verify. The gap is **accepted**, not papered over with `sessionStorage`: persisting a
+security-adjacent count in the browser is a new surface for a marginal gain.
+
+**TODO(backend), queued rather than deferred: add `recovery_codes_remaining` to
+`GET /auth/session/`.** When it lands, wiring it is one `notices.record(...)` call in
+`AdminAuthService.bootstrap()` — the TODO marks the exact line. A source change, not a
+redesign.
+
 ## Navigation — spec §9
 
 **Exactly five destinations:** Home, Restaurants, Support, Receivables, Activity. Then
-the operator name and Sign out.
+the operator name, **Re-authenticate**, and Sign out.
+
+**Re-authenticate is an ACTION on the current session, not a sixth destination** — it
+lives in the operator block beside Sign out. It opens the EXISTING elevation dialog
+through the EXISTING queue (`ElevationService.request('deliberate')`, which swaps one
+sentence via the `reason` signal); there is no second prompt anywhere in this repo, and
+there must not be.
+
+**IT IS ALSO THE WRITE-PATH SMOKE TEST, and that is why it shipped before step 4.**
+`POST /auth/elevate/` is the only unsafe request this scaffold can make, so this button
+is the only thing that exercises the CSRF cookie read, the `X-CSRFToken` header and the
+server's double-submit check in a browser. **After 0C ships the deploy, it is what
+proves that path works against real Apache** — until step 4 puts a lifecycle transition
+behind it. It is a real affordance either way: an operator about to do something
+consequential would rather clear the window deliberately than be interrupted
+mid-action.
 
 **Onboarding, Readiness, Lifecycle, QR, Delegation and Payments MUST NOT appear in
 global navigation.** They are things done TO a restaurant and live inside it.
@@ -390,6 +503,12 @@ count and the labels.
 
 A page-header/empty-state helper is the obvious first addition in step 1; it was
 deliberately not pre-built, which is why the placeholder pages repeat a little markup.
+
+**The three banners are SHELL FURNITURE, not primitives, and the count is still three.**
+`defect-banner`, `notice-banner` and `service-unavailable-banner` are each mounted
+exactly once in `ShellComponent` and are never composed into a screen — three global
+channels holding at most one message each (a live outage state, one defect, one composed
+notice). A primitive is something screens reach for; these are things the frame owns.
 
 ### `Restaurant.is_test` does not exist yet
 Confirmed against `restaurants_app/models.py`. What exists is **`Order.is_test`**
@@ -431,6 +550,28 @@ reviewed is the real flow.
 Levers for the unhappy paths (documented in the mock itself): a username containing
 `locked` → the break-glass branch; containing `low` → the low-recovery-codes warning;
 code `000000` → the uniform verification failure; empty credentials → the uniform 401.
+And the outage lever, set in the console:
+
+```js
+sessionStorage.setItem('dinify-admin.mock-unavailable', '1')     // no answer at all
+sessionStorage.setItem('dinify-admin.mock-unavailable', '502')   // answers badly, WITH a request id
+sessionStorage.removeItem('dinify-admin.mock-unavailable')       // back to normal
+```
+
+### MOCK-MODE ERRORS ARE NOT `HttpErrorResponse` — DUCK-TYPE OR IT IS DEAD CODE
+`MockAdminAuthApi` throws `MockHttpError`, an `Error` subclass carrying `status` (and,
+for the 502 lever, a `headers.get()` stand-in so the request-id path is reviewable). It
+never goes near `HttpClient`, **so no interceptor runs in mock mode**.
+
+Two rules follow, and they will trap someone otherwise:
+
+1. **Anything branching on the SHAPE of an error must duck-type.** An
+   `instanceof HttpErrorResponse` check makes the branch dead in the one mode this work
+   is reviewed in before a deploy exists. `classifyTransportFailure` is the shared
+   implementation — use it rather than writing a second one.
+2. **A failure path that only the interceptor handles is invisible in mock mode.** That
+   is why `bootstrap()` and `ElevationService.submit()` classify directly rather than
+   leaning on the interceptor alone.
 
 `ng serve --configuration=live` uses the real transport against `/api/admin/v1`.
 

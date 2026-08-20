@@ -1,13 +1,14 @@
 import {
   HttpErrorResponse,
   HttpEvent,
+  HttpEventType,
   HttpHandlerFn,
   HttpInterceptorFn,
   HttpRequest,
 } from '@angular/common/http';
 import { inject } from '@angular/core';
 import { Router } from '@angular/router';
-import { Observable, catchError, switchMap, tap, throwError } from 'rxjs';
+import { MonoTypeOperatorFunction, Observable, catchError, switchMap, tap, throwError } from 'rxjs';
 
 import { ADMIN_AUTH } from '../auth/admin-auth.api';
 import { ElevationService } from '../auth/elevation.service';
@@ -17,11 +18,12 @@ import {
   AUTH_ROUTES,
   CSRF_FAILURE_DETAIL_PREFIX,
   ELEVATION_REQUIRED_DETAIL,
-  REQUEST_ID_HEADER,
 } from './api.constants';
 import { DefectService } from './defect.service';
 import { extractDetail, extractErrorMessage } from './error-message';
 import { CSRF_RETRIED, ELEVATION_REPLAYED, SUPPRESS_DEFECT_REPORT } from './http-context';
+import { AdminServiceStatus } from './service-status';
+import { classifyTransportFailure, extractRequestId } from './transport-failure';
 
 /**
  * Statuses that are an application OUTCOME rather than a defect. The screen that made
@@ -51,6 +53,24 @@ const EXPECTED_CLIENT_STATUSES = new Set([400, 401, 403, 404, 409, 422, 429]);
  *      inside the modal by `ElevationService`; never treated as "needs elevation".
  *
  * Everything else surfaces.
+ *
+ * ── THE PRECONDITION ABOVE ALL FOUR ───────────────────────────────────────────────
+ *
+ * "Did we get a usable response at all" is PRIOR to "what did the server say", so it
+ * is not a fifth case — it is a precondition, and it runs first. None of the four can
+ * apply when the answer is no response: a request that never reached the server did
+ * not fail authentication, was not refused for a stale CSRF token, and did not need
+ * re-elevation. Reading a 5xx or a dead socket as one of those would be inventing a
+ * server statement that was never made.
+ *
+ * It reports through `AdminServiceStatus` rather than `DefectService`, and
+ * `SUPPRESS_DEFECT_REPORT` DELIBERATELY DOES NOT APPLY TO IT. Suppressing a 401 on an
+ * auth route is right — the login form renders it. Suppressing a 502 is how an
+ * afternoon disappears: the operator is told they are signed out by an application
+ * that never got an answer.
+ *
+ * One consequence worth stating: 5xx and status 0 no longer reach the defect tail
+ * below, because this claims them first. What remains there is the unexpected 4xx.
  *
  * ── HOW CASES 2, 3 AND 4 ARE KEPT APART ───────────────────────────────────────────
  *
@@ -83,6 +103,7 @@ export const errorClassifierInterceptor: HttpInterceptorFn = (req, next) => {
   const store = inject(SessionStore);
   const elevation = inject(ElevationService);
   const defects = inject(DefectService);
+  const status = inject(AdminServiceStatus);
   const auth = inject(ADMIN_AUTH);
 
   const classify = (
@@ -92,7 +113,14 @@ export const errorClassifierInterceptor: HttpInterceptorFn = (req, next) => {
     if (!(error instanceof HttpErrorResponse)) return throwError(() => error);
 
     const detail = extractDetail(error);
-    const requestId = error.headers?.get(REQUEST_ID_HEADER) ?? null;
+    const requestId = extractRequestId(error);
+
+    // --- PRECONDITION: DID WE GET A USABLE RESPONSE AT ALL? ------------------------
+    // Above the four cases, not among them. See the class comment.
+    if (classifyTransportFailure(error) === 'unavailable') {
+      status.reportUnavailable(requestId);
+      return throwError(() => error);
+    }
 
     // --- CASE 1 --------------------------------------------------------------------
     if (error.status === 401) {
@@ -133,7 +161,7 @@ export const errorClassifierInterceptor: HttpInterceptorFn = (req, next) => {
       const retried = request.clone({ context: request.context.set(CSRF_RETRIED, true) });
       return auth.readSession().pipe(
         tap((session) => store.adopt(session)),
-        switchMap(() => replay(retried, next, classify)),
+        switchMap(() => replay(retried, next, classify, status)),
       );
     }
 
@@ -159,7 +187,7 @@ export const errorClassifierInterceptor: HttpInterceptorFn = (req, next) => {
       const replayed = request.clone({
         context: request.context.set(ELEVATION_REPLAYED, true),
       });
-      return elevation.request().pipe(switchMap(() => replay(replayed, next, classify)));
+      return elevation.request().pipe(switchMap(() => replay(replayed, next, classify, status)));
     }
 
     // --- CASE 4 --------------------------------------------------------------------
@@ -176,7 +204,10 @@ export const errorClassifierInterceptor: HttpInterceptorFn = (req, next) => {
     return throwError(() => error);
   };
 
-  return next(req).pipe(catchError((error: unknown) => classify(req, error)));
+  return next(req).pipe(
+    reachableOnResponse(status),
+    catchError((error: unknown) => classify(req, error)),
+  );
 };
 
 /** Re-issue a request and classify ITS failure too, so every recovery stays bounded. */
@@ -184,8 +215,26 @@ function replay(
   request: HttpRequest<unknown>,
   next: HttpHandlerFn,
   classify: (request: HttpRequest<unknown>, error: unknown) => Observable<HttpEvent<unknown>>,
+  status: AdminServiceStatus,
 ): Observable<HttpEvent<unknown>> {
-  return next(request).pipe(catchError((error: unknown) => classify(request, error)));
+  return next(request).pipe(
+    reachableOnResponse(status),
+    catchError((error: unknown) => classify(request, error)),
+  );
+}
+
+/**
+ * Any response at all clears an unavailable state — which is what makes the shell's
+ * outage banner self-healing rather than something the operator has to dismiss and
+ * then wonder about. Setting a signal to the value it already holds notifies nothing,
+ * so this costs nothing on the ordinary path.
+ */
+function reachableOnResponse(
+  status: AdminServiceStatus,
+): MonoTypeOperatorFunction<HttpEvent<unknown>> {
+  return tap((event) => {
+    if (event.type === HttpEventType.Response) status.markReachable();
+  });
 }
 
 /** Compare a request URL to a known auth route, ignoring any query string. */
@@ -195,6 +244,12 @@ function isRoute(request: HttpRequest<unknown>, route: string): boolean {
 }
 
 function isDefect(status: number): boolean {
+  // A dead network is a defect by any measure, and returning false for it was a real
+  // hole: nothing reported it whether or not suppression was lifted. The transport
+  // precondition now claims status 0 before it can reach here, so this is a backstop
+  // — if that precondition is ever narrowed, a dead network must not quietly become a
+  // non-defect a second time.
+  if (status === 0) return true;
   if (status >= 500) return true;
   if (status >= 400) return !EXPECTED_CLIENT_STATUSES.has(status);
   return false;

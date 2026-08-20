@@ -1,10 +1,11 @@
+import { NgTemplateOutlet } from '@angular/common';
 import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { ActivatedRoute, Router } from '@angular/router';
 
 import { extractErrorMessage } from '../core/api/error-message';
-import { LOW_RECOVERY_CODES_THRESHOLD } from '../core/api/api.constants';
-import { AdminAuthService } from '../core/auth/admin-auth.service';
+import { classifyTransportFailure, extractRequestId } from '../core/api/transport-failure';
+import { AdminAuthService, PostVerifyReadError } from '../core/auth/admin-auth.service';
 import { sanitiseReturnUrl } from '../core/auth/return-url';
 import { SecondFactorMethod } from '../core/auth/session.model';
 import { AdminButtonComponent } from '../ui/button.component';
@@ -33,6 +34,19 @@ type Step = 'credentials' | 'second-factor';
  * elaborate on it, add client-side hints, or offer "did you mean" help. Doing any of
  * those would hand back exactly the distinction the backend spent effort removing.
  *
+ * ── A DEAD BACKEND IS NOT A WRONG PASSWORD ────────────────────────────────────────
+ *
+ * The uniform message has one failure mode, and it is this: when the service does not
+ * answer at all, `extractErrorMessage` finds nothing to read (a `ProgressEvent` has no
+ * `detail`, and an Apache error page is discarded as markup) and falls back to
+ * "Invalid credentials." — the disclosure control answering confidently about a
+ * situation it knows nothing about, while the operator retypes a password that was
+ * never wrong.
+ *
+ * So every failure here is classified for TRANSPORT first. An unreachable service says
+ * so, in its own words, and it does NOT count toward the retry budget or clear what
+ * was typed: nothing was rejected, so nothing should behave as though it was.
+ *
  * ── BREAK-GLASS ───────────────────────────────────────────────────────────────────
  *
  * `login/` answers 200 with `recovery_code_required: true` when the account is LOCKED
@@ -46,7 +60,7 @@ type Step = 'credentials' | 'second-factor';
 @Component({
   selector: 'app-login-page',
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [FormsModule, AdminButtonComponent],
+  imports: [FormsModule, NgTemplateOutlet, AdminButtonComponent],
   template: `
     <div class="flex min-h-screen items-center justify-center bg-chrome p-4">
       <main class="w-full max-w-sm rounded-lg bg-surface p-6 shadow-admin-lg">
@@ -88,6 +102,9 @@ type Step = 'credentials' | 'second-factor';
 
             @if (message(); as text) {
               <p role="alert" class="mt-3 text-admin-meta text-admin-danger">{{ text }}</p>
+            }
+            @if (unreachable(); as outage) {
+              <ng-container [ngTemplateOutlet]="outageNotice" [ngTemplateOutletContext]="{ $implicit: outage }" />
             }
 
             <div class="mt-5">
@@ -146,6 +163,9 @@ type Step = 'credentials' | 'second-factor';
             @if (message(); as text) {
               <p role="alert" class="mt-3 text-admin-meta text-admin-danger">{{ text }}</p>
             }
+            @if (unreachable(); as outage) {
+              <ng-container [ngTemplateOutlet]="outageNotice" [ngTemplateOutletContext]="{ $implicit: outage }" />
+            }
 
             <div class="mt-5">
               <app-admin-button variant="primary" type="submit" [block]="true" [pending]="pending()"
@@ -156,6 +176,22 @@ type Step = 'credentials' | 'second-factor';
         }
       </main>
     </div>
+
+    <!-- AMBER, NOT RED. §16 separates "careful" from "something was refused", and
+         nothing was refused here. Shared by both steps so the two cannot drift. -->
+    <ng-template #outageNotice let-outage>
+      <div role="alert" class="mt-3 rounded bg-admin-warning-soft px-3 py-2">
+        <p class="text-admin-meta text-ink">
+          The admin control plane is not answering. Nothing was rejected — this is not a
+          sign-in failure, and your credentials have not been tried.
+        </p>
+        @if (outage.requestId) {
+          <p class="mt-1 text-admin-meta text-ink-muted">
+            Request <span class="tabular-figures select-all">{{ outage.requestId }}</span>
+          </p>
+        }
+      </div>
+    </ng-template>
   `,
 })
 export class LoginPage {
@@ -174,6 +210,12 @@ export class LoginPage {
   protected readonly step = signal<Step>('credentials');
   protected readonly pending = signal(false);
   protected readonly message = signal<string | null>(null);
+  /**
+   * Set when the last attempt got no usable answer. Separate from `message` because it
+   * is a statement about the SERVICE, not about what the operator typed — and because
+   * the two must never be shown as the same kind of thing.
+   */
+  protected readonly unreachable = signal<{ requestId: string | null } | null>(null);
   /** True when the server said this challenge takes a recovery code and nothing else. */
   protected readonly recoveryOnly = signal(false);
   private readonly chosenMethod = signal<SecondFactorMethod>('totp');
@@ -196,13 +238,13 @@ export class LoginPage {
   protected toggleMethod(): void {
     if (this.pending() || this.recoveryOnly()) return;
     this.chosenMethod.update((current) => (current === 'totp' ? 'recovery' : 'totp'));
-    this.message.set(null);
+    this.clearFeedback();
   }
 
   protected async submitCredentials(): Promise<void> {
     if (this.pending()) return;
     this.pending.set(true);
-    this.message.set(null);
+    this.clearFeedback();
 
     try {
       const result = await this.auth.login(this.username.trim(), this.password);
@@ -212,6 +254,12 @@ export class LoginPage {
       this.failures.set(0);
       this.step.set('second-factor');
     } catch (error) {
+      // TRANSPORT FIRST. Without this the fallback below answers a 502 with
+      // "Invalid credentials." — see the class comment.
+      if (classifyTransportFailure(error) === 'unavailable') {
+        this.reportUnreachable(error);
+        return;
+      }
       // Verbatim. See the class comment.
       this.message.set(extractErrorMessage(error, 'Invalid credentials.'));
     } finally {
@@ -222,19 +270,15 @@ export class LoginPage {
   protected async submitSecondFactor(): Promise<void> {
     if (this.pending()) return;
     this.pending.set(true);
-    this.message.set(null);
+    this.clearFeedback();
 
     try {
-      const result = await this.auth.verify(this.method(), this.code.trim());
+      await this.auth.verify(this.method(), this.code.trim());
 
-      const notes: string[] = [];
-      if (result.lockout_cleared) notes.push('The account lockout has been cleared.');
-      if (result.recovery_codes_remaining <= LOW_RECOVERY_CODES_THRESHOLD) {
-        notes.push(
-          `${result.recovery_codes_remaining} recovery code(s) remaining — regenerate them soon.`,
-        );
-      }
-      if (notes.length) console.warn(`[dinify-admin] ${notes.join(' ')}`);
+      // The recovery-code and lockout facts are recorded by `AdminAuthService` into
+      // the notice channel, which OUTLIVES this component — the navigation below
+      // destroys it within the tick, so anything rendered here would never be read.
+      // They used to go to `console.warn`, which is the same outcome with extra steps.
 
       // VALIDATED ON THE WAY OUT. `returnUrl` can arrive from a hand-crafted link, so
       // anything with a scheme, anything protocol-relative and anything that is not a
@@ -244,6 +288,20 @@ export class LoginPage {
       const target = sanitiseReturnUrl(this.route.snapshot.queryParamMap.get('returnUrl'));
       await this.router.navigateByUrl(target, { replaceUrl: true });
     } catch (error) {
+      // THE FACTOR WAS ACCEPTED AND THE SESSION COOKIE IS LIVE FOR EIGHT HOURS. The
+      // one thing this must not do is tell the operator their code was rejected.
+      if (error instanceof PostVerifyReadError) {
+        await this.handlePostVerifyReadFailure(error);
+        return;
+      }
+
+      // Nothing was rejected, so nothing is spent: no failure counted, no code
+      // cleared, no return to step 1 for a challenge that is still perfectly alive.
+      if (classifyTransportFailure(error) === 'unavailable') {
+        this.reportUnreachable(error);
+        return;
+      }
+
       this.failures.update((count) => count + 1);
       const text = extractErrorMessage(error, 'Invalid or expired verification.');
 
@@ -260,6 +318,41 @@ export class LoginPage {
     }
   }
 
+  /**
+   * The second factor cleared, the server minted a session — and the read back failed
+   * twice (`AdminAuthService.verify` already retried it once).
+   *
+   * Neither branch returns the operator to step 2. The challenge cookie was cleared by
+   * the successful verify, so a "retry" there can only fail, which is exactly how the
+   * old behaviour walked them to step 1 with a message about a code that was fine.
+   */
+  private async handlePostVerifyReadFailure(error: PostVerifyReadError): Promise<void> {
+    if (error.failure === 'unavailable') {
+      // A live session and an unreachable service: signing in again is not what they
+      // need. The unavailable view's retry re-runs the same read, and when the service
+      // returns it adopts THIS session and lands them in the shell.
+      await this.router.navigate(['/unavailable'], { replaceUrl: true });
+      return;
+    }
+
+    // The service answered but would not hand back the session — rare, and not
+    // something a second factor can fix. Signing in again is the honest instruction,
+    // and it works: `login/` mints a fresh challenge regardless of the live cookie.
+    this.resetToCredentials(
+      'Signed in, but the session could not be read back. Please sign in again.',
+    );
+  }
+
+  /** A statement about the SERVICE. Never touches what the operator typed. */
+  private reportUnreachable(error: unknown): void {
+    this.unreachable.set({ requestId: extractRequestId(error) });
+  }
+
+  private clearFeedback(): void {
+    this.message.set(null);
+    this.unreachable.set(null);
+  }
+
   private resetToCredentials(text: string): void {
     this.step.set('credentials');
     this.recoveryOnly.set(false);
@@ -267,6 +360,7 @@ export class LoginPage {
     this.code = '';
     this.password = '';
     this.failures.set(0);
+    this.unreachable.set(null);
     this.message.set(text);
   }
 }

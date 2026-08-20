@@ -1,12 +1,25 @@
 name: Deploy Admin
 
-# ADMIN 0C.1 — MANUAL EXACT-SHA DEPLOYMENT.
+# ADMIN 0C.2 — AUTOMATIC FORWARD-ONLY DEPLOYMENT, PLUS THE MANUAL EXACT-SHA INTERFACE.
 #
 # This workflow installs a built Angular release of the admin control plane onto the
 # EC2 box that serves https://admin.dinifyapp.com, and it re-points the live symlink
-# at it. It is deliberately MANUAL ONLY: there is no `push`, no `workflow_run` and no
-# `schedule` trigger here. Automatic deployment after a green CI on main is 0C.2, and
-# it is gated on a real 0C.1 deployment having been observed and accepted first.
+# at it. It runs two ways:
+#
+#   AUTOMATIC (`workflow_run`) — after the Admin CI workflow completes successfully for
+#     a PUSH to main, the exact SHA that CI certified is deployed. Never "whatever main
+#     is now": the target is the triggering run's head_sha and nothing else. Automatic
+#     runs are always mode=deploy and are FORWARD-ONLY (see the ordering guard below).
+#
+#   MANUAL (`workflow_dispatch`) — an operator supplies an exact 40-character SHA and
+#     `deploy` or `rollback`. This is the operations and emergency interface, and it is
+#     deliberately NOT subject to the forward-only policy: deliberate backward movement
+#     and re-promotion are proven capabilities and must stay available.
+#
+# 0C.1 (the manual mechanism) was empirically accepted on 2026-08-20: a real deploy, a
+# real rollback to an older installed release and a real re-promotion all succeeded
+# against the live host and public origin. 0C.2 adds the automatic path on top of that
+# proven mechanism without changing what made it trustworthy.
 #
 # TRANSPORT IS SSM OVER GITHUB OIDC, NEVER SSH. The instance's security group does not
 # admit GitHub-hosted runners — backend PR #281 retired the `appleboy/ssh-action` path
@@ -51,8 +64,35 @@ name: Deploy Admin
 # 39 hours). So the box asserts what it promoted (DEPLOYED-HEAD), and the runner then
 # independently re-reads https://admin.dinifyapp.com/release.txt over the public
 # internet. The workflow's intention is never the evidence.
+#
+# ══════════════════════════════════════════════════════════════════════════════════
+# FORWARD-ONLY, AND WHY IT IS A SERVED-STATE CHECK RATHER THAN A COMMIT-ORDER CHECK
+# ══════════════════════════════════════════════════════════════════════════════════
+#
+# Successful main CI runs do not finish in commit order. CI for commit A can complete
+# after B has already deployed, and a queued or re-run older automatic deployment can
+# execute later still. Without a guard, A would silently downgrade the live portal.
+#
+# The guard compares the target against WHAT THE PUBLIC ORIGIN IS ACTUALLY SERVING —
+# read back from release.txt — not against a commit ordering the workflow assumes. The
+# served SHA is the only statement of live state that is not the workflow's own
+# opinion, which is the same principle the DEPLOYED-HEAD and public assertions rest on.
+# It runs BEFORE the artifact is consumed, before the role is validated and before OIDC,
+# so a stale automatic run cannot authenticate to AWS at all, let alone mutate the host.
+# It applies to automatic runs ONLY.
 
 on:
+  # Automatic. `workflow_run.workflows` can only match on the workflow's DISPLAY NAME,
+  # which is mutable — so "CI" here is a coarse pre-filter that GitHub forces on us, and
+  # it is deliberately NOT the security proof. Both jobs independently re-fetch the
+  # triggering run from the API and require it to belong to the workflow ID resolved
+  # from `.github/workflows/ci.yml`, so a different workflow that merely happens to be
+  # named "CI" can never satisfy it.
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
   workflow_dispatch:
     inputs:
       sha:
@@ -94,75 +134,176 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
+    # A CI run that did not succeed, or that was not a push to main, produces a cleanly
+    # SKIPPED workflow rather than a red one. A failed CI is not a deployment incident,
+    # and turning every one of them into a failed deploy run would train the operator to
+    # ignore this workflow's red. `deploy` needs this job, so it skips with it.
+    #
+    # This is a coarse gate on the event payload; the authoritative verification of the
+    # triggering run happens against the API in "Resolve deployment identity" below.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
+
     # NO id-token: write. Read-only, and nothing more than certification and build need.
     #   contents: read — check out the repository to build the target commit
-    #   actions: read  — list CI runs, the only thing standing between a dispatch box
-    #                    and an untested commit
+    #   actions: read  — read CI runs, the only thing standing between a dispatch box
+    #                    and an untested commit, and the basis of automatic identity
     permissions:
       contents: read
       actions: read
 
     outputs:
-      sha: ${{ steps.validate.outputs.sha }}
-      mode: ${{ steps.validate.outputs.mode }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      mode: ${{ steps.resolve.outputs.mode }}
+      source: ${{ steps.resolve.outputs.source }}
+      ci_run_id: ${{ steps.resolve.outputs.ci_run_id }}
       main_sha: ${{ steps.certify.outputs.main_sha }}
       build_digest: ${{ steps.package.outputs.build_digest }}
 
     steps:
       # ------------------------------------------------------------------------------
-      # The admin OIDC role's trust policy is pinned to refs/heads/main. Running from
-      # any other ref could not assume the role anyway — but failing here, before any
-      # work happens, produces a comprehensible error instead of an opaque STS denial
-      # two jobs later.
+      # The admin OIDC role's trust is pinned to this repository and refs/heads/main.
+      # BOTH supported events run with `github.ref` = refs/heads/main: a dispatch is
+      # only permitted from main (enforced right here), and a `workflow_run` workflow is
+      # always taken from, and reported as running on, the DEFAULT branch regardless of
+      # what the triggering run was for. Failing here — before any work, and two jobs
+      # before AWS — produces a comprehensible error rather than an opaque STS denial.
+      #
+      # The observed event and ref are PRINTED deliberately, so the first automatic run
+      # puts GitHub's actual semantics in the log instead of leaving them assumed.
       # ------------------------------------------------------------------------------
-      - name: Refuse to run outside refs/heads/main
+      - name: Refuse to run from an unexpected event or ref
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF_FULL: ${{ github.ref }}
         run: |
           set -euo pipefail
-          if [ "$EVENT_NAME" != "workflow_dispatch" ]; then
-            echo "::error::This workflow is manual-only; refusing event '${EVENT_NAME}'." >&2
-            exit 1
-          fi
+          echo "observed event : ${EVENT_NAME}"
+          echo "observed ref   : ${REF_FULL}"
+          case "$EVENT_NAME" in
+            workflow_dispatch|workflow_run) ;;
+            *) echo "::error::Refusing event '${EVENT_NAME}'; this workflow supports workflow_dispatch and workflow_run only." >&2; exit 1 ;;
+          esac
           if [ "$REF_FULL" != "refs/heads/main" ]; then
-            echo "::error::Refusing to run from '${REF_FULL}'. Dispatch this workflow from refs/heads/main — the deploy role's OIDC trust is pinned to main." >&2
+            echo "::error::Refusing to run from '${REF_FULL}'. This workflow must run on refs/heads/main — the deploy role's OIDC trust is pinned there." >&2
             exit 1
           fi
-          echo "Running from refs/heads/main."
 
       # ------------------------------------------------------------------------------
-      # INJECTION HYGIENE. `inputs.sha` is operator-typed free text and this workflow
-      # ultimately runs a script as root on the box, so no event-derived value is ever
-      # textually interpolated into a run: script with raw ${{ }} — GitHub expands those
-      # into the script body before the shell sees them, and no amount of quoting helps.
-      # Everything arrives through env: and is read as a quoted shell variable.
+      # IDENTITY RESOLUTION. Everything downstream reads the RESOLVED values from this
+      # step; nothing downstream reads `inputs.*` again, because `inputs` does not exist
+      # on a workflow_run event and quietly evaluates to empty there.
       #
-      # IDENTITY LEAVES THIS STEP AS A STEP OUTPUT, NOT VIA $GITHUB_ENV. $GITHUB_ENV is
-      # mutable job-wide state, and the untrusted npm/build phase runs between here and
-      # the privileged job. A step output is written once and read by name, so the
-      # identity being deployed cannot be rewritten by anything that runs in between.
+      # INJECTION HYGIENE. `inputs.sha` is operator-typed free text, and the workflow_run
+      # payload is attacker-influenceable in principle (a branch name is user data), and
+      # this workflow ultimately runs a script as root on the box. So no event-derived
+      # value is ever textually interpolated into a run: script with raw ${{ }} — GitHub
+      # expands those into the script body before the shell sees them and no amount of
+      # quoting helps. Everything arrives through env: and is read as a quoted shell
+      # variable, and only validated forms leave this step.
+      #
+      # IDENTITY LEAVES AS STEP OUTPUTS, NOT VIA $GITHUB_ENV. $GITHUB_ENV is mutable
+      # job-wide state and the untrusted npm/build phase runs between here and the
+      # privileged job. A step output is written once and read by name, so the identity
+      # being deployed cannot be rewritten by anything that runs in between.
+      #
+      # For the AUTOMATIC path the payload is used ONLY to learn WHICH run to look up.
+      # Every value that decides anything is re-read from the API, and the run must
+      # belong to the workflow id resolved from `.github/workflows/ci.yml` — so the
+      # mutable display name "CI" in the trigger is a pre-filter, never the proof.
       # ------------------------------------------------------------------------------
-      - name: Validate dispatch inputs
-        id: validate
+      - name: Resolve deployment identity
+        id: resolve
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
           INPUT_SHA: ${{ inputs.sha }}
           INPUT_MODE: ${{ inputs.mode }}
+          RUN_ID_RAW: ${{ github.event.workflow_run.id }}
         run: |
           set -euo pipefail
-          if [[ ! "$INPUT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::Rejected target: expected a full 40-character lowercase hex commit SHA. Short SHAs, branch names and tags are not accepted." >&2
-            exit 1
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [[ ! "${INPUT_SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Rejected target: expected a full 40-character lowercase hex commit SHA. Short SHAs, branch names and tags are not accepted." >&2
+              exit 1
+            fi
+            case "${INPUT_MODE:-}" in
+              deploy|rollback) ;;
+              *) echo "::error::Rejected mode '${INPUT_MODE:-}': must be exactly 'deploy' or 'rollback'." >&2; exit 1 ;;
+            esac
+            RESOLVED_SHA="$INPUT_SHA"
+            RESOLVED_MODE="$INPUT_MODE"
+            SOURCE="manual"
+            CI_RUN_ID=""
+          else
+            if [[ ! "${RUN_ID_RAW:-}" =~ ^[0-9]+$ ]]; then
+              echo "::error::The workflow_run payload carries no usable run id." >&2
+              exit 1
+            fi
+            CI_WORKFLOW_ID="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml" --jq '.id')"
+            if [[ ! "$CI_WORKFLOW_ID" =~ ^[0-9]+$ ]]; then
+              echo "::error::Could not resolve the workflow id of .github/workflows/ci.yml." >&2
+              exit 1
+            fi
+            gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID_RAW}" > ci-run.json
+            R_STATUS="$(jq -r '.status' ci-run.json)"
+            R_CONCLUSION="$(jq -r '.conclusion' ci-run.json)"
+            R_EVENT="$(jq -r '.event' ci-run.json)"
+            R_BRANCH="$(jq -r '.head_branch' ci-run.json)"
+            R_SHA="$(jq -r '.head_sha' ci-run.json)"
+            R_WFID="$(jq -r '.workflow_id' ci-run.json)"
+            R_PATH="$(jq -r '.path' ci-run.json)"
+            rm -f ci-run.json
+
+            if [ "$R_WFID" != "$CI_WORKFLOW_ID" ]; then
+              echo "::error::Triggering run ${RUN_ID_RAW} belongs to workflow ${R_WFID}, not the CI workflow (${CI_WORKFLOW_ID}). A workflow that merely shares the display name is not accepted." >&2
+              exit 1
+            fi
+            if [ "$R_PATH" != ".github/workflows/ci.yml" ]; then
+              echo "::error::Triggering run path is '${R_PATH}', expected .github/workflows/ci.yml." >&2
+              exit 1
+            fi
+            if [ "$R_STATUS" != "completed" ]; then
+              echo "::error::Triggering run status is '${R_STATUS}', not completed." >&2
+              exit 1
+            fi
+            if [ "$R_CONCLUSION" != "success" ]; then
+              echo "::error::Triggering run concluded '${R_CONCLUSION}', not success." >&2
+              exit 1
+            fi
+            if [ "$R_EVENT" != "push" ]; then
+              echo "::error::Triggering run was raised by '${R_EVENT}', not push. Only a push to main deploys automatically." >&2
+              exit 1
+            fi
+            if [ "$R_BRANCH" != "main" ]; then
+              echo "::error::Triggering run head_branch is '${R_BRANCH}', not main." >&2
+              exit 1
+            fi
+            if [[ ! "$R_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Triggering run head_sha '${R_SHA}' is not a 40-character lowercase hex SHA." >&2
+              exit 1
+            fi
+            RESOLVED_SHA="$R_SHA"
+            RESOLVED_MODE="deploy"
+            SOURCE="automatic"
+            CI_RUN_ID="$RUN_ID_RAW"
+            echo "Verified triggering CI run ${CI_RUN_ID}: workflow ${R_WFID} (${R_PATH}), push to main, success."
           fi
-          case "$INPUT_MODE" in
-            deploy|rollback) ;;
-            *) echo "::error::Rejected mode '${INPUT_MODE}': must be exactly 'deploy' or 'rollback'." >&2; exit 1 ;;
-          esac
-          echo "sha=${INPUT_SHA}" >> "$GITHUB_OUTPUT"
-          echo "mode=${INPUT_MODE}" >> "$GITHUB_OUTPUT"
-          echo "Target ${INPUT_SHA}, mode ${INPUT_MODE}."
+
+          {
+            echo "sha=${RESOLVED_SHA}"
+            echo "mode=${RESOLVED_MODE}"
+            echo "source=${SOURCE}"
+            echo "ci_run_id=${CI_RUN_ID}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved: sha=${RESOLVED_SHA} mode=${RESOLVED_MODE} source=${SOURCE} ci_run_id=${CI_RUN_ID:-none}"
 
       # ------------------------------------------------------------------------------
       # `persist-credentials: false` is a SECURITY control, not a tidy-up: this job goes
@@ -211,35 +352,57 @@ jobs:
       # name is literally "CI", and coupling a deploy gate to mutable display text is
       # how a rename silently disables it.
       #
-      # `github.sha` is main's tip at dispatch, supplied by GitHub rather than by the
-      # operator. The ancestry test runs against local objects, so it needs no network
-      # and no credential. The privileged job repeats this against CURRENT main through
-      # the API, which also covers main having moved on since dispatch.
+      # MAIN IS RESOLVED DELIBERATELY, NOT TAKEN FROM `github.sha`. That context means
+      # different things on the two events — on workflow_dispatch it is the tip of the
+      # dispatched ref, while on workflow_run it is the default branch's tip at the time
+      # the triggered run starts — and a security check should not rest on a value whose
+      # meaning depends on how the run was raised. Asking the API for main's tip gives
+      # one unambiguous answer for both events.
+      #
+      # Ancestry is then proven through the compare API rather than local git, for the
+      # same reason: it is identical on both events and does not depend on what
+      # `actions/checkout` happened to materialise. `merge_base == TARGET` IS the
+      # ancestry statement — the merge base of an ancestor and its descendant is the
+      # ancestor itself. The local `cat-file` check that follows is a separate question:
+      # not "is it in main's history" but "can this job actually build it".
       # ------------------------------------------------------------------------------
       - name: Certify target commit (ancestry + successful CI on main)
         id: certify
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          TARGET_SHA: ${{ steps.validate.outputs.sha }}
-          MAIN_SHA: ${{ github.sha }}
+          TARGET_SHA: ${{ steps.resolve.outputs.sha }}
         run: |
           set -euo pipefail
+          MAIN_SHA="$(gh api "/repos/${GITHUB_REPOSITORY}/commits/main" --jq '.sha')"
           if [[ ! "$MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::github.sha is not a 40-character hex commit SHA." >&2
+            echo "::error::Could not resolve current main to a commit SHA." >&2
             exit 1
           fi
-          echo "main tip at dispatch: ${MAIN_SHA}"
+          echo "current main: ${MAIN_SHA}"
 
+          if [ "$TARGET_SHA" != "$MAIN_SHA" ]; then
+            gh api "/repos/${GITHUB_REPOSITORY}/compare/${TARGET_SHA}...${MAIN_SHA}" > compare.json
+            C_STATUS="$(jq -r '.status' compare.json)"
+            C_BASE="$(jq -r '.merge_base_commit.sha' compare.json)"
+            rm -f compare.json
+            case "$C_STATUS" in
+              ahead|identical) ;;
+              *) echo "::error::${TARGET_SHA} is not in current main's history (compare status: ${C_STATUS})." >&2; exit 1 ;;
+            esac
+            if [ "$C_BASE" != "$TARGET_SHA" ]; then
+              echo "::error::Merge base of ${TARGET_SHA} and current main is ${C_BASE}, so the target is not an ancestor of main." >&2
+              exit 1
+            fi
+          fi
+          echo "Ancestry: ${TARGET_SHA} is in current main's history."
+
+          # Separate question: is the object available to THIS checkout, so the build
+          # step below can detach onto it without another network fetch?
           if ! git cat-file -e "${TARGET_SHA}^{commit}" 2>/dev/null; then
-            echo "::error::${TARGET_SHA} is not a commit object in this repository." >&2
+            echo "::error::${TARGET_SHA} is in main's history but is not present in this checkout." >&2
             exit 1
           fi
-          if ! git merge-base --is-ancestor "$TARGET_SHA" "$MAIN_SHA"; then
-            echo "::error::${TARGET_SHA} is not an ancestor of main (${MAIN_SHA}). Only commits still in main's history may be deployed." >&2
-            exit 1
-          fi
-          echo "Ancestry: ${TARGET_SHA} is in main's history."
 
           gh api \
             "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${TARGET_SHA}&branch=main&status=success&per_page=100" \
@@ -266,10 +429,10 @@ jobs:
       # with a friendly name.
       # ------------------------------------------------------------------------------
       - name: Check out the exact target commit
-        if: inputs.mode == 'deploy'
+        if: steps.resolve.outputs.mode == 'deploy'
         shell: bash
         env:
-          TARGET_SHA: ${{ steps.validate.outputs.sha }}
+          TARGET_SHA: ${{ steps.resolve.outputs.sha }}
         run: |
           set -euo pipefail
           # Purely local: the object is already present from the full-depth fetch, so
@@ -283,14 +446,14 @@ jobs:
           echo "Building from detached HEAD ${HEAD_NOW}."
 
       - name: Set up Node.js
-        if: inputs.mode == 'deploy'
+        if: steps.resolve.outputs.mode == 'deploy'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
       - name: Install dependencies
-        if: inputs.mode == 'deploy'
+        if: steps.resolve.outputs.mode == 'deploy'
         shell: bash
         run: |
           set -euo pipefail
@@ -299,12 +462,12 @@ jobs:
           npm ci
 
       - name: Build (production)
-        if: inputs.mode == 'deploy'
+        if: steps.resolve.outputs.mode == 'deploy'
         shell: bash
         run: npm run build:prod
 
       - name: Mock-isolation gate
-        if: inputs.mode == 'deploy'
+        if: steps.resolve.outputs.mode == 'deploy'
         shell: bash
         run: npm run check:mock-isolation
 
@@ -315,10 +478,10 @@ jobs:
       # Apache serves it no-store, so the assertion cannot be satisfied by a cached copy.
       # ------------------------------------------------------------------------------
       - name: Validate dist/ and stamp release.txt
-        if: inputs.mode == 'deploy'
+        if: steps.resolve.outputs.mode == 'deploy'
         shell: bash
         env:
-          TARGET_SHA: ${{ steps.validate.outputs.sha }}
+          TARGET_SHA: ${{ steps.resolve.outputs.sha }}
         run: |
           set -euo pipefail
           if [ ! -d dist ]; then
@@ -354,7 +517,7 @@ jobs:
       # ------------------------------------------------------------------------------
       - name: Package artifact
         id: package
-        if: inputs.mode == 'deploy'
+        if: steps.resolve.outputs.mode == 'deploy'
         shell: bash
         run: |
           set -euo pipefail
@@ -367,7 +530,7 @@ jobs:
           echo "artifact sha256 (build): ${BUILD_DIGEST}"
 
       - name: Upload prepared release artifact
-        if: inputs.mode == 'deploy'
+        if: steps.resolve.outputs.mode == 'deploy'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ env.ARTIFACT_NAME }}
@@ -400,39 +563,107 @@ jobs:
 
     steps:
       # ------------------------------------------------------------------------------
-      # IDENTITY REVALIDATION AT THE BOUNDARY. The raw workflow inputs are re-read and
-      # re-validated here from scratch, then required to equal what `prepare` certified.
-      # Trusting `needs.prepare.outputs.*` alone would mean this job never independently
-      # checks what it is about to deploy; re-deriving from `inputs.*` and demanding
-      # exact agreement means a disagreement between the two is a hard failure rather
-      # than a silent preference for one of them.
+      # IDENTITY RE-DERIVATION AT THE BOUNDARY. This job derives the identity AGAIN from
+      # the raw event — the same work `prepare` did, from the same source, independently
+      # — and then requires exact agreement. Trusting `needs.prepare.outputs.*` alone
+      # would mean the privileged job never independently establishes what it is about
+      # to deploy; re-deriving and demanding equality makes a disagreement between the
+      # two a hard failure rather than a silent preference for one of them.
+      #
+      # Both events are handled here, and the source itself is part of the agreement: a
+      # run that claims to be automatic must have arrived on workflow_run, and one that
+      # claims to be manual must have arrived on workflow_dispatch.
       # ------------------------------------------------------------------------------
-      - name: Revalidate deploy identity and agree with prepare
+      - name: Re-derive deploy identity and agree with prepare
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
           INPUT_SHA: ${{ inputs.sha }}
           INPUT_MODE: ${{ inputs.mode }}
+          RUN_ID_RAW: ${{ github.event.workflow_run.id }}
           PREPARED_SHA: ${{ needs.prepare.outputs.sha }}
           PREPARED_MODE: ${{ needs.prepare.outputs.mode }}
+          PREPARED_SOURCE: ${{ needs.prepare.outputs.source }}
+          PREPARED_RUN_ID: ${{ needs.prepare.outputs.ci_run_id }}
         run: |
           set -euo pipefail
-          if [[ ! "$INPUT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::Workflow input sha is not a full 40-character lowercase hex SHA." >&2
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [[ ! "${INPUT_SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Workflow input sha is not a full 40-character lowercase hex SHA." >&2
+              exit 1
+            fi
+            case "${INPUT_MODE:-}" in
+              deploy|rollback) ;;
+              *) echo "::error::Workflow input mode '${INPUT_MODE:-}' is neither deploy nor rollback." >&2; exit 1 ;;
+            esac
+            DERIVED_SHA="$INPUT_SHA"
+            DERIVED_MODE="$INPUT_MODE"
+            DERIVED_SOURCE="manual"
+            DERIVED_RUN_ID=""
+          elif [ "$EVENT_NAME" = "workflow_run" ]; then
+            if [[ ! "${RUN_ID_RAW:-}" =~ ^[0-9]+$ ]]; then
+              echo "::error::The workflow_run payload carries no usable run id." >&2
+              exit 1
+            fi
+            CI_WORKFLOW_ID="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml" --jq '.id')"
+            if [[ ! "$CI_WORKFLOW_ID" =~ ^[0-9]+$ ]]; then
+              echo "::error::Could not resolve the workflow id of .github/workflows/ci.yml." >&2
+              exit 1
+            fi
+            gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID_RAW}" > ci-run.json
+            R_STATUS="$(jq -r '.status' ci-run.json)"
+            R_CONCLUSION="$(jq -r '.conclusion' ci-run.json)"
+            R_EVENT="$(jq -r '.event' ci-run.json)"
+            R_BRANCH="$(jq -r '.head_branch' ci-run.json)"
+            R_SHA="$(jq -r '.head_sha' ci-run.json)"
+            R_WFID="$(jq -r '.workflow_id' ci-run.json)"
+            R_PATH="$(jq -r '.path' ci-run.json)"
+            rm -f ci-run.json
+
+            if [ "$R_WFID" != "$CI_WORKFLOW_ID" ] || [ "$R_PATH" != ".github/workflows/ci.yml" ]; then
+              echo "::error::Triggering run ${RUN_ID_RAW} is workflow ${R_WFID} (${R_PATH}), not the CI workflow (${CI_WORKFLOW_ID}, .github/workflows/ci.yml)." >&2
+              exit 1
+            fi
+            if [ "$R_STATUS" != "completed" ] || [ "$R_CONCLUSION" != "success" ]; then
+              echo "::error::Triggering run is '${R_STATUS}'/'${R_CONCLUSION}', not completed/success." >&2
+              exit 1
+            fi
+            if [ "$R_EVENT" != "push" ] || [ "$R_BRANCH" != "main" ]; then
+              echo "::error::Triggering run was '${R_EVENT}' on '${R_BRANCH}', not push on main." >&2
+              exit 1
+            fi
+            if [[ ! "$R_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Triggering run head_sha '${R_SHA}' is not a 40-character lowercase hex SHA." >&2
+              exit 1
+            fi
+            DERIVED_SHA="$R_SHA"
+            DERIVED_MODE="deploy"
+            DERIVED_SOURCE="automatic"
+            DERIVED_RUN_ID="$RUN_ID_RAW"
+          else
+            echo "::error::Unsupported event '${EVENT_NAME}'." >&2
             exit 1
           fi
-          case "$INPUT_MODE" in
-            deploy|rollback) ;;
-            *) echo "::error::Workflow input mode '${INPUT_MODE}' is neither deploy nor rollback." >&2; exit 1 ;;
-          esac
-          if [ "$INPUT_SHA" != "$PREPARED_SHA" ]; then
-            echo "::error::Identity mismatch: workflow input sha '${INPUT_SHA}' does not equal the SHA prepare certified ('${PREPARED_SHA}')." >&2
+
+          if [ "$DERIVED_SHA" != "$PREPARED_SHA" ]; then
+            echo "::error::Identity mismatch: this job derived sha '${DERIVED_SHA}' but prepare certified '${PREPARED_SHA}'." >&2
             exit 1
           fi
-          if [ "$INPUT_MODE" != "$PREPARED_MODE" ]; then
-            echo "::error::Identity mismatch: workflow input mode '${INPUT_MODE}' does not equal prepare's mode ('${PREPARED_MODE}')." >&2
+          if [ "$DERIVED_MODE" != "$PREPARED_MODE" ]; then
+            echo "::error::Identity mismatch: this job derived mode '${DERIVED_MODE}' but prepare reported '${PREPARED_MODE}'." >&2
             exit 1
           fi
-          echo "Identity agreed with prepare: ${INPUT_SHA} / ${INPUT_MODE}."
+          if [ "$DERIVED_SOURCE" != "$PREPARED_SOURCE" ]; then
+            echo "::error::Identity mismatch: this job derived source '${DERIVED_SOURCE}' but prepare reported '${PREPARED_SOURCE}'." >&2
+            exit 1
+          fi
+          if [ "$DERIVED_RUN_ID" != "${PREPARED_RUN_ID:-}" ]; then
+            echo "::error::Identity mismatch: this job derived CI run id '${DERIVED_RUN_ID}' but prepare reported '${PREPARED_RUN_ID:-}'." >&2
+            exit 1
+          fi
+          echo "Identity agreed with prepare: sha=${DERIVED_SHA} mode=${DERIVED_MODE} source=${DERIVED_SOURCE} ci_run_id=${DERIVED_RUN_ID:-none}"
 
       # ------------------------------------------------------------------------------
       # Certification is repeated here, independently of `prepare`, and it is cheap
@@ -440,9 +671,10 @@ jobs:
       # `merge_base_commit.sha == TARGET_SHA` IS the ancestry statement — the merge base
       # of an ancestor and its descendant is the ancestor itself.
       #
-      # Unlike prepare's local test, this runs against main AS IT IS NOW rather than as
-      # it was at dispatch, so a target dropped from main's history between the two jobs
-      # is caught here.
+      # `prepare` asked the same questions of the same API; asking them again here is
+      # the point, not redundancy — the privileged job must not inherit its warrant to
+      # deploy from an unprivileged one. It also re-reads main at a later moment, so a
+      # target dropped from main's history between the two jobs is caught here.
       # ------------------------------------------------------------------------------
       - name: Re-certify target against current main (no checkout)
         shell: bash
@@ -485,8 +717,109 @@ jobs:
           fi
           echo "CI re-certification: ${GREEN} successful CI run(s) on main."
 
+      # ------------------------------------------------------------------------------
+      # FORWARD-ONLY ORDERING GUARD — AUTOMATIC RUNS ONLY.
+      #
+      # Successful main CI runs do not complete in commit order, and a queued or re-run
+      # older automatic deployment can execute after a newer one has already landed.
+      # Without this, that older run would silently downgrade the live portal.
+      #
+      # The comparison is against WHAT THE PUBLIC ORIGIN IS SERVING, read back from
+      # release.txt — not against an ordering the workflow assumes. The served SHA is
+      # the only statement of live state that is not this workflow's own opinion.
+      #
+      # It runs HERE, before the artifact is consumed, before the role is validated and
+      # before OIDC, so a stale automatic run never authenticates to AWS at all. Every
+      # privileged step below is gated on this step's `proceed` output.
+      #
+      # THE STEP ALWAYS RUNS, including for manual runs, where it immediately returns
+      # proceed=true. That is deliberate: a skipped step's outputs are empty, and every
+      # downstream `if:` would then have to encode "empty means yes", which is exactly
+      # the kind of condition that fails open when someone edits it later.
+      #
+      # Manual runs are NOT subject to this policy. Deliberate backward movement and
+      # re-promotion are proven operational capabilities and remain available.
+      #
+      # FAIL CLOSED on anything ambiguous: a non-200, a missing no-store, a body that is
+      # not exactly one 40-hex SHA, or histories that diverge. Manual deployment is the
+      # recovery path when served state cannot be trusted.
+      # ------------------------------------------------------------------------------
+      - name: Forward-only ordering guard (automatic runs only)
+        id: ordering
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ needs.prepare.outputs.sha }}
+          SOURCE: ${{ needs.prepare.outputs.source }}
+        run: |
+          set -euo pipefail
+
+          emit() {
+            {
+              echo "proceed=$1"
+              echo "decision=$2"
+              echo "served_sha=${3:-}"
+              echo "reason=$4"
+            } >> "$GITHUB_OUTPUT"
+            echo "$2: $4"
+          }
+
+          if [ "$SOURCE" != "automatic" ]; then
+            emit true MANUAL "" "manual run — the automatic forward-only ordering policy does not apply"
+            exit 0
+          fi
+
+          CB="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          HDRS="$(mktemp)"
+          RESP="$(curl -sS --max-time 20 -D "$HDRS" \
+            -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+            -w '\n%{http_code}' \
+            "https://${PUBLIC_HOST}/release.txt?cb=${CB}" || true)"
+          CODE="$(printf '%s' "$RESP" | tail -n 1)"
+          BODY="$(printf '%s' "$RESP" | sed '$d')"
+
+          if [ "$CODE" != "200" ]; then
+            echo "::error::Cannot read the public served SHA: /release.txt returned HTTP ${CODE:-000}. Failing closed rather than deploying blind; use a manual dispatch to recover." >&2
+            exit 1
+          fi
+          if ! grep -iE '^cache-control:.*no-store' "$HDRS" >/dev/null; then
+            echo "::error::Public /release.txt is not served no-store, so the served SHA may be a cached copy. Failing closed." >&2
+            exit 1
+          fi
+          # Exactly one non-empty line, and that line must be a bare 40-hex SHA.
+          NONEMPTY="$(printf '%s\n' "$BODY" | grep -c . || true)"
+          SERVED="$(printf '%s\n' "$BODY" | head -n 1 | tr -d '[:space:]')"
+          if [ "${NONEMPTY:-0}" -ne 1 ] || [[ ! "$SERVED" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Public /release.txt did not contain exactly one 40-character lowercase SHA. Failing closed." >&2
+            exit 1
+          fi
+          echo "public origin currently serves: ${SERVED}"
+          echo "automatic target              : ${TARGET_SHA}"
+
+          if [ "$SERVED" = "$TARGET_SHA" ]; then
+            emit false AUTO-SKIP-IDENTICAL "$SERVED" "the public origin already serves this exact commit; nothing to deploy"
+            exit 0
+          fi
+
+          if ! gh api "/repos/${GITHUB_REPOSITORY}/compare/${SERVED}...${TARGET_SHA}" > ordering.json 2>/dev/null; then
+            echo "::error::Could not compare the served SHA ${SERVED} with the target ${TARGET_SHA}. Failing closed." >&2
+            exit 1
+          fi
+          O_STATUS="$(jq -r '.status' ordering.json)"
+          O_BASE="$(jq -r '.merge_base_commit.sha' ordering.json)"
+          rm -f ordering.json
+
+          if [ "$O_STATUS" = "ahead" ] && [ "$O_BASE" = "$SERVED" ]; then
+            emit true AUTO-PROCEED "$SERVED" "target descends from the served commit — this is a forward move"
+          elif [ "$O_BASE" = "$TARGET_SHA" ]; then
+            emit false AUTO-SKIP-STALE "$SERVED" "target is an ancestor of the served commit (compare: ${O_STATUS}); a newer release is already live, so this stale automatic run will not downgrade it"
+          else
+            echo "::error::Served ${SERVED} and target ${TARGET_SHA} do not have a clean ancestor relationship (compare status: ${O_STATUS}, merge base: ${O_BASE}). Failing closed." >&2
+            exit 1
+          fi
+
       - name: Download prepared release artifact
-        if: inputs.mode == 'deploy'
+        if: needs.prepare.outputs.mode == 'deploy' && steps.ordering.outputs.proceed == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ env.ARTIFACT_NAME }}
@@ -505,7 +838,7 @@ jobs:
       # ------------------------------------------------------------------------------
       - name: Validate artifact and derive authoritative digest
         id: artifact
-        if: inputs.mode == 'deploy'
+        if: needs.prepare.outputs.mode == 'deploy' && steps.ordering.outputs.proceed == 'true'
         shell: bash
         env:
           TARGET_SHA: ${{ needs.prepare.outputs.sha }}
@@ -601,6 +934,7 @@ jobs:
       # it is compared byte-for-byte with the ARN pinned in this file before it is used.
       # ------------------------------------------------------------------------------
       - name: Validate deploy role ARN
+        if: steps.ordering.outputs.proceed == 'true'
         shell: bash
         env:
           ROLE_ARN_VAR: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
@@ -618,13 +952,14 @@ jobs:
 
       # Everything above this line is validation. AWS credentials exist only from here.
       - name: Configure AWS credentials (OIDC)
+        if: steps.ordering.outputs.proceed == 'true'
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Upload artifact to private S3 prefix
-        if: inputs.mode == 'deploy'
+        if: needs.prepare.outputs.mode == 'deploy' && steps.ordering.outputs.proceed == 'true'
         shell: bash
         env:
           S3_KEY: ${{ steps.artifact.outputs.s3_key }}
@@ -638,17 +973,20 @@ jobs:
       #
       # It is embedded here rather than committed as scripts/deploy-admin-release.sh on
       # purpose. Its contract is with the BOX's current filesystem layout, not with the
-      # application version being installed. A workflow_dispatch always runs the YAML
-      # from main, so an embedded script is always main's script; a separate committed
-      # file checked out at TARGET_SHA would mean a rollback executed an OLD commit's
-      # deployment mechanism against the CURRENT box — precisely the mismatch that must
-      # not happen. Keep it here. (It is also why this job needs no checkout at all.)
+      # application version being installed. BOTH triggers run this YAML from main — a
+      # dispatch because it is dispatched from main, a workflow_run because GitHub takes
+      # the workflow file from the default branch — so an embedded script is always
+      # main's script. A separate committed file checked out at TARGET_SHA would instead
+      # mean a rollback executed an OLD commit's deployment mechanism against the
+      # CURRENT box, precisely the mismatch that must not happen. Keep it here. (It is
+      # also why this job needs no checkout at all.)
       #
       # The heredoc is QUOTED, so nothing expands at write time. The four values are
       # substituted afterwards, and only after being re-validated immediately above the
       # substitution: the injection control sits beside the injection site.
       # ------------------------------------------------------------------------------
       - name: Write remote deploy script
+        if: steps.ordering.outputs.proceed == 'true'
         shell: bash
         env:
           TARGET_SHA: ${{ needs.prepare.outputs.sha }}
@@ -1014,6 +1352,7 @@ jobs:
       # invocation is polled to a terminal state and the job is gated on Success.
       # ------------------------------------------------------------------------------
       - name: Deploy via SSM and verify the box's own attestation
+        if: steps.ordering.outputs.proceed == 'true'
         shell: bash
         env:
           TARGET_SHA: ${{ needs.prepare.outputs.sha }}
@@ -1083,6 +1422,7 @@ jobs:
       # commit that was requested.
       # ------------------------------------------------------------------------------
       - name: Assert the public origin serves the requested commit
+        if: steps.ordering.outputs.proceed == 'true'
         shell: bash
         env:
           TARGET_SHA: ${{ needs.prepare.outputs.sha }}
@@ -1138,6 +1478,13 @@ jobs:
           fi
           echo "Public /: 200"
 
+      # ------------------------------------------------------------------------------
+      # THE SUMMARY MUST DESCRIBE WHAT ACTUALLY HAPPENED. An earlier revision printed
+      # "Build ran in the unprivileged prepare job" unconditionally, which was simply
+      # false for a rollback — rollback skips every build step. A summary that describes
+      # a path the run did not take is worse than no summary, because it is read as
+      # evidence. Each branch below is written from the run's own resolved state.
+      # ------------------------------------------------------------------------------
       - name: Record outcome
         if: always()
         shell: bash
@@ -1145,21 +1492,48 @@ jobs:
           JOB_STATUS: ${{ job.status }}
           TARGET_SHA: ${{ needs.prepare.outputs.sha }}
           MODE: ${{ needs.prepare.outputs.mode }}
+          SOURCE: ${{ needs.prepare.outputs.source }}
+          CI_RUN_ID: ${{ needs.prepare.outputs.ci_run_id }}
+          PROCEED: ${{ steps.ordering.outputs.proceed }}
+          DECISION: ${{ steps.ordering.outputs.decision }}
+          SERVED_SHA: ${{ steps.ordering.outputs.served_sha }}
+          ORDER_REASON: ${{ steps.ordering.outputs.reason }}
           ARTIFACT_SHA256: ${{ steps.artifact.outputs.artifact_sha256 }}
           S3_KEY: ${{ steps.artifact.outputs.s3_key }}
         run: |
           set -euo pipefail
           {
-            echo "## Admin ${MODE:-unknown}: ${JOB_STATUS}"
+            if [ "${SOURCE:-}" = "automatic" ] && [ "${PROCEED:-}" = "false" ]; then
+              echo "## Admin automatic deployment SKIPPED — ${DECISION:-unknown}"
+            else
+              echo "## Admin ${MODE:-unknown} (${SOURCE:-unknown}): ${JOB_STATUS}"
+            fi
             echo "- Target SHA: \`${TARGET_SHA:-unknown}\`"
             echo "- Mode: \`${MODE:-unknown}\`"
-            echo "- Instance: \`${ADMIN_INSTANCE_ID}\`"
-            if [ -n "${S3_KEY:-}" ]; then
-              echo "- Artifact: \`s3://${ARTIFACT_BUCKET}/${S3_KEY}\`"
-              echo "- Artifact SHA-256 (computed in the privileged job): \`${ARTIFACT_SHA256:-}\`"
-            else
-              echo "- Artifact: none (rollback re-points to an already-installed release)"
+            echo "- Source: \`${SOURCE:-unknown}\`"
+            if [ "${SOURCE:-}" = "automatic" ]; then
+              echo "- Triggering CI run: \`${CI_RUN_ID:-unknown}\`"
+              echo "- Ordering decision: \`${DECISION:-unknown}\` — ${ORDER_REASON:-no reason recorded}"
+              if [ -n "${SERVED_SHA:-}" ]; then
+                echo "- Public origin was serving: \`${SERVED_SHA}\`"
+              fi
             fi
-            echo "- Build ran in the unprivileged \`prepare\` job; this job never executed application or npm code."
-            echo "- Releases are retained, never pruned, throughout 0C.1."
+            echo "- Instance: \`${ADMIN_INSTANCE_ID}\`"
+
+            if [ "${SOURCE:-}" = "automatic" ] && [ "${PROCEED:-}" = "false" ]; then
+              echo "- **Nothing was deployed.** AWS authentication, S3 and SSM were never reached; the live symlink was not touched."
+              echo "- A build did run in the unprivileged \`prepare\` job, and its artifact was discarded unused."
+            elif [ "${MODE:-}" = "rollback" ]; then
+              echo "- **No build ran**: rollback skips Node, npm, the Angular build and the release artifact entirely."
+              echo "- No release artifact was produced, uploaded, downloaded or consumed."
+              echo "- The operation validated an already-installed immutable release and re-pointed the live symlink to it."
+            else
+              echo "- Build ran in the unprivileged \`prepare\` job; this job executed no application or npm code."
+              if [ -n "${S3_KEY:-}" ]; then
+                echo "- Artifact: \`s3://${ARTIFACT_BUCKET}/${S3_KEY}\`"
+                echo "- Artifact SHA-256 (computed in the privileged job): \`${ARTIFACT_SHA256:-}\`"
+              fi
+            fi
+
+            echo "- Immutable releases are retained; pruning remains out of scope."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -39,12 +39,15 @@ conventions change.
   owner invitation, delegated drill-in, support triage, receivables, activity feed:
   ❌ NOT BUILT.** Every destination is a placeholder with a real written empty state.
   These are spec §15 steps 1–10.
-- **Deployment mechanism (0C.1): ✅ built, ❌ never yet run.**
-  `.github/workflows/deploy.yml` is a MANUAL exact-SHA deploy/rollback pipeline over
-  GitHub OIDC → private S3 → AWS SSM. The first real deployment is a separate
-  acceptance gate and has not happened — nothing has ever been published to
-  `admin.dinifyapp.com`, which still serves the host-side placeholder. See
-  "Deployment" below.
+- **Deployment: 0C.1 ✅ EMPIRICALLY ACCEPTED (2026-08-20) · 0C.2 ✅ implemented,
+  acceptance pending.** `.github/workflows/deploy.yml` deploys over GitHub OIDC →
+  private S3 → AWS SSM. The real Angular application is live on
+  `admin.dinifyapp.com` — a real deploy, a real rollback to an older installed
+  release and a real re-promotion all succeeded against the live host, and the
+  platform-admin login (password + TOTP, session bootstrap, the CSRF-protected
+  `auth/elevate/` write) was exercised end to end. 0C.2 adds automatic
+  forward-only deployment after a successful main CI run; **it has not yet been
+  observed running**. See "Deployment" below.
 
 ## Tech Stack
 - Angular **21.2.x**, esbuild `@angular/build` application builder
@@ -622,14 +625,31 @@ gating on the commit it is actually shipping. Do not remove that trigger.
 
 `deploy.yml` is NOT part of CI and is never a PR check — it is `workflow_dispatch` only.
 
-## Deployment — 0C.1, MANUAL ONLY, NOT YET RUN
+## Deployment — 0C.1 ACCEPTED · 0C.2 AUTOMATIC, ACCEPTANCE PENDING
 
-`.github/workflows/deploy.yml` is the deploy mechanism: **build in CI → tar.gz artefact
-to a private S3 prefix → GitHub OIDC → `aws ssm send-command` → immutable release
-directory → symlink promotion.** It exists and is verified as far as it can be without
-touching the box; **no deployment has been executed yet**, and the first one is a
-separate acceptance gate. Until then `admin.dinifyapp.com` serves the host-side
-placeholder.
+`.github/workflows/deploy.yml` is the deploy mechanism: **build → tar.gz artefact to a
+private S3 prefix → GitHub OIDC → `aws ssm send-command` → immutable release directory
+→ symlink promotion.**
+
+**0C.1 (the manual exact-SHA path) was empirically accepted on 2026-08-20.** What was
+proven against the real host and public origin, not merely reviewed:
+
+- a real `deploy` succeeded and `https://admin.dinifyapp.com/release.txt` publicly
+  returned that exact SHA with `Cache-Control: no-store`;
+- the real Angular application replaced the host placeholder, and deep SPA routing
+  survived direct navigation and refresh;
+- platform-admin login worked end to end — password + TOTP, session bootstrap, and
+  **Re-authenticate** exercising the authenticated CSRF-protected `auth/elevate/` POST
+  against real Apache/Django (the write-path smoke test finally fired for real);
+- on-box inspection confirmed `/var/www/dinify-admin` is a symlink to the exact
+  immutable SHA release, directories `root:root 0755`, files `root:root 0644`, no
+  internal symlinks;
+- a manual `rollback` to a second installed release succeeded, `release.txt` followed
+  it, and re-promotion via `mode=rollback` returned the origin to the newer SHA.
+
+**0C.2 (automatic forward-only deployment after a successful main CI run) is
+IMPLEMENTED but NOT YET OBSERVED RUNNING.** Do not describe it as accepted until a real
+automatic deployment has completed; the first one is its own acceptance gate.
 
 **TRANSPORT IS SSM OVER OIDC, NEVER SSH. Do NOT add** `firebase.json`, `.firebaserc`,
 rsync, `appleboy/ssh-action`, or any stored SSH secret. That transport was deliberately
@@ -701,17 +721,38 @@ exactly the deployed 40-char SHA. Apache serves both `release.txt` and `index.ht
 jpeg webp map` — deliberately not `txt`/`json`), which is what makes reading it back a
 real check rather than a cached echo.
 
-### Dispatch inputs
-Run the workflow from `refs/heads/main` — it refuses any other ref, because the OIDC
-role's trust is pinned there.
+### The two ways it runs
+
+**AUTOMATIC (`workflow_run`)** — after the Admin CI workflow completes successfully for
+a **push to main**, the exact SHA that CI certified is deployed. Never "whatever main is
+now": the target is the triggering run's `head_sha` and nothing else. Automatic runs are
+always `deploy` — there is no automatic rollback — and they are **forward-only** (below).
+
+`workflow_run.workflows` can only match a workflow's mutable DISPLAY NAME, so `"CI"` in
+the trigger is a coarse pre-filter GitHub forces on us and is **deliberately not the
+security proof**. Both jobs independently re-fetch the triggering run from the API and
+require it to belong to the workflow id resolved from `.github/workflows/ci.yml`, to be
+`completed`/`success`, and to be a `push` on `main`. A different workflow that merely
+happens to be named "CI" can never satisfy that.
+
+A CI run that did not succeed produces a cleanly **skipped** deployment run, not a red
+one — a failed CI is not a deployment incident, and turning every one into a failed
+deploy would train the operator to ignore this workflow's red.
+
+**MANUAL (`workflow_dispatch`)** — the operations and emergency interface, unchanged:
 
 | input | value |
 |---|---|
 | `sha` | full 40-character lowercase commit SHA |
 | `mode` | `deploy` (default) or `rollback` |
 
-Both modes require the SHA to be **an ancestor of current `origin/main` AND to have a
-successful `ci.yml` run on branch `main`**. Neither alone is enough: ancestry alone
+Both paths run from `refs/heads/main` — the workflow refuses any other ref, because the
+OIDC role's trust is pinned there. That holds for `workflow_run` too: GitHub takes the
+workflow file from the default branch and reports the run against it.
+
+Every target, manual or automatic, requires the SHA to be **an ancestor of current
+`main` AND to have a successful `ci.yml` run on branch `main`**. Neither alone is
+enough: ancestry alone
 admits an untested commit, and CI-green alone admits a PR-branch run (CI runs on
 `pull_request` too, where it tests a merge preview rather than the commit that landed)
 or a commit since dropped from main.
@@ -729,6 +770,30 @@ so gating it on free space would withhold emergency recovery in exactly the degr
 situation that most needs it. Re-promoting an already-installed release is the same case
 and is likewise ungated.
 
+### Automatic runs are FORWARD-ONLY, and the guard reads served state
+Successful main CI runs do not finish in commit order. CI for commit A can complete
+after B has already deployed, and a queued or re-run older automatic deployment can
+execute later still. Without a guard, A would silently downgrade the live portal.
+
+The guard compares the target against **what the public origin is actually serving**,
+read back from `release.txt` — not against a commit ordering the workflow assumes. The
+served SHA is the only statement of live state that is not the workflow's own opinion,
+which is the same principle `DEPLOYED-HEAD` and the public assertion rest on. It runs
+**before the artifact is consumed, before the role is validated and before OIDC**, so a
+stale automatic run never authenticates to AWS at all.
+
+| situation | decision | effect |
+|---|---|---|
+| target descends from served SHA | `AUTO-PROCEED` | deploy normally |
+| target == served SHA | `AUTO-SKIP-IDENTICAL` | green no-op; no AWS, S3 or SSM |
+| target is an ancestor of served SHA | `AUTO-SKIP-STALE` | green skip; no AWS, S3 or SSM |
+| histories diverge, or served state is unreadable/not `no-store`/not one 40-hex SHA | **fail closed** | no AWS; recover with a manual dispatch |
+
+**It applies to automatic runs only.** Manual deploy and manual rollback are never
+blocked by it — deliberate backward movement and re-promotion are proven operational
+capabilities and must stay available. A skip is reported honestly in the job summary
+with the target, the served SHA and the reason; it is never dressed up as a deployment.
+
 ### What makes the run green
 Nothing the workflow believes about itself. The box asserts `DEPLOYED-HEAD: <sha>` only
 after its own local checks pass through Apache (release.txt, admin health, root, a deep
@@ -740,17 +805,17 @@ mismatched marker, or an SSM status other than `Success`, fails loudly. This is 
 defect class backend PR #283 closed after a deploy reported success while the box stayed
 39 hours behind.
 
-### Deliberately deferred
-- **Automatic deployment is 0C.2.** There is no `push`, `workflow_run` or `schedule`
-  trigger here, and none should be added until a real 0C.1 deployment has been observed
-  and accepted.
-- **The forward-only guard is 0C.2's problem**, and it does not port directly: the
-  backend compares `git merge-base --is-ancestor` on the box, and there is no Git
-  checkout on the admin box to compare against. Manual rollback is an explicitly
-  authorised backwards move, so 0C.1 needs no such guard.
-- **No release pruning.** Every deployed SHA and the placeholder are retained, which
-  maximises recovery options until installation, re-promotion, rollback and both
-  served-SHA verifications have been proven in the real world.
+### Still deliberately out of scope
+- **No `push` or `schedule` trigger.** Automatic deployment hangs off `workflow_run`
+  after CI, so the deployed commit is always one CI actually certified. A `push`
+  trigger would deploy commits whose CI had not finished — or had failed.
+- **No release pruning.** Every deployed SHA and the original placeholder are retained.
+  Retention is what keeps recovery cheap, and rollback is now a proven, exercised path;
+  pruning would trade that away for disk that is not scarce.
+- **The backend's forward-only mechanism was NOT ported.** It compares
+  `git merge-base --is-ancestor` against a Git checkout on the box, and the admin box
+  has no checkout. The served-state guard above solves the same problem with the
+  evidence this plane actually has.
 
 ## Backend Facts Step 1 Onward Should Not Rediscover
 

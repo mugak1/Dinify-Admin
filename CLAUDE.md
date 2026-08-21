@@ -49,15 +49,14 @@ workspace).** Steps 2–10 are not built.
 - **Restaurant creation, owner invitation, the readiness ENGINE, lifecycle controls,
   delegated drill-in, support triage, receivables, the Activity screen, Home
   needs-attention and portfolio metrics: ❌ NOT BUILT.** Spec §15 steps 2–10.
-- **Deployment: 0C.1 ✅ EMPIRICALLY ACCEPTED (2026-08-20) · 0C.2 ✅ implemented,
-  acceptance pending.** `.github/workflows/deploy.yml` deploys over GitHub OIDC →
+- **Deployment: 0C.1 ✅ EMPIRICALLY ACCEPTED (2026-08-20) · 0C.2 ✅ EMPIRICALLY
+  ACCEPTED (2026-08-21).** `.github/workflows/deploy.yml` deploys over GitHub OIDC →
   private S3 → AWS SSM. The real Angular application is live on
   `admin.dinifyapp.com` — a real deploy, a real rollback to an older installed
   release and a real re-promotion all succeeded against the live host, and the
   platform-admin login (password + TOTP, session bootstrap, the CSRF-protected
-  `auth/elevate/` write) was exercised end to end. 0C.2 adds automatic
-  forward-only deployment after a successful main CI run; **it has not yet been
-  observed running**. See "Deployment" below.
+  `auth/elevate/` write) was exercised end to end. 0C.2's first real automatic
+  deployment ran on the Step-1 merge and succeeded — see "Deployment" below.
 
 ### What Step 1 deliberately does NOT claim
 The backend reports several concepts as unconfigured because the models behind them do
@@ -437,18 +436,37 @@ tidy: `load()` reads the store's own signals to decide whether the id really cha
 then writes them, so inside a reactive context the write re-triggers the effect that made
 it — an unbounded loop that presents as a hung tab, not as an error.
 
-### LOADING, EMPTY and FAILED are three different answers
+### LOADING, EMPTY, BEYOND-THE-END and FAILED are four different answers
 "No restaurants match these filters" is a real answer an operator will act on. A failed
 read is not an answer at all. Rendering the second as the first is the same class of
 defect as a dead backend presenting as "Invalid credentials." — so a failure clears the
 rows, renders a failure state with the request id and a retry, and **never** produces an
 empty table.
 
+**ZERO ROWS WITH A NON-ZERO `count` IS ITS OWN STATE**, and missing it was a real defect
+(found in review of the Step-1 PR, fixed in the follow-up). The endpoint answers a page
+number past the end of the portfolio with an empty `results` and honest metadata rather
+than a 404 — deliberately, so the client can see `count` and `pages` and say something
+true. Read as "empty" it produced **"No restaurants yet" on a platform with 34
+restaurants**, reachable from a stale bookmark, a hand-edited `?page=`, or a last page
+whose rows have since been filtered away. The directory now names the case, states how
+many restaurants and pages there really are, and offers the last page that holds rows.
+`rangeLabel` is guarded for the same case — the naive arithmetic runs backwards with no
+rows and renders "24951–34 of 34".
+
 `toLoadFailure()` also reports through `AdminServiceStatus` itself. The interceptor
 already does that on the real transport, but **mock mode never touches `HttpClient`**, so
 a branch only the interceptor could reach would be invisible in the one mode this work is
 reviewed in. Same reasoning as `bootstrap()` and `ElevationService.submit()`; it uses the
 shared `classifyTransportFailure` rather than a second implementation.
+
+**THE REPORT IS SYMMETRIC, AND BOTH HALVES ARE REQUIRED.** A read that fails raises the
+outage state; a read that SUCCEEDS must clear it, which is what `reportReadReachable()`
+is for. Writing only the failure half is easy and invisible on the real transport — the
+interceptor's `reachableOnResponse` covers it there — but in mock mode nothing else
+clears the flag, so the shell banner kept claiming the control plane was down long after
+a retry had succeeded. That was a real defect too, fixed alongside the one above; both
+readers now call it on their success path.
 
 ### Race safety is `switchMap`, not a sequence counter
 Both the directory and the workspace run every read through one `switchMap`, so an older
@@ -797,7 +815,7 @@ gating on the commit it is actually shipping. Do not remove that trigger.
 
 `deploy.yml` is NOT part of CI and is never a PR check — it is `workflow_dispatch` only.
 
-## Deployment — 0C.1 ACCEPTED · 0C.2 AUTOMATIC, ACCEPTANCE PENDING
+## Deployment — 0C.1 AND 0C.2 BOTH ACCEPTED
 
 `.github/workflows/deploy.yml` is the deploy mechanism: **build → tar.gz artefact to a
 private S3 prefix → GitHub OIDC → `aws ssm send-command` → immutable release directory
@@ -819,9 +837,22 @@ proven against the real host and public origin, not merely reviewed:
 - a manual `rollback` to a second installed release succeeded, `release.txt` followed
   it, and re-promotion via `mode=rollback` returned the origin to the newer SHA.
 
-**0C.2 (automatic forward-only deployment after a successful main CI run) is
-IMPLEMENTED but NOT YET OBSERVED RUNNING.** Do not describe it as accepted until a real
-automatic deployment has completed; the first one is its own acceptance gate.
+**0C.2 (automatic forward-only deployment after a successful main CI run) was
+EMPIRICALLY ACCEPTED on 2026-08-21.** Its first real automatic run was its own
+acceptance gate, and it passed on the Phase-1 Step-1 merge:
+
+- merging PR #8 put `cfd4ba7` on `main`; `ci.yml` ran on the **push** and succeeded
+  (run #13, 12:38→12:39 UTC);
+- `deploy.yml` then started on its own through **`workflow_run`** — not a dispatch —
+  targeting that exact `head_sha` (run #14, 12:39→12:40 UTC), and succeeded;
+- `https://admin.dinifyapp.com/release.txt` was read back over the public internet and
+  returned exactly `cfd4ba7e7067a946cd696af3058bb0dee0874a82` with
+  `Cache-Control: no-store`.
+
+So the whole chain — merge → CI on main → automatic exact-SHA deploy → served-state
+attestation — is now proven end to end rather than reviewed. The forward-only guard has
+still never had to REFUSE a stale automatic run; that path remains reasoned but
+unexercised.
 
 **TRANSPORT IS SSM OVER OIDC, NEVER SSH. Do NOT add** `firebase.json`, `.firebaserc`,
 rsync, `appleboy/ssh-action`, or any stored SSH secret. That transport was deliberately

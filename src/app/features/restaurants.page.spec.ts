@@ -502,6 +502,58 @@ describe('RestaurantsPage', () => {
     tab?.click();
   }
 
+  it('drops a pending search when a quick view supersedes it', fakeAsync(async () => {
+    await open();
+    settle();
+    flush();
+
+    const input = el().querySelector<HTMLInputElement>('#restaurant-search');
+    input!.value = 'nile';
+    input!.dispatchEvent(new Event('input'));
+    tick(SEARCH_DEBOUNCE_MS / 2);
+
+    // Inside the debounce window, the operator picks a quick view instead.
+    clickView('Onboarding');
+    tick();
+    settle();
+    flush();
+
+    // Let the superseded timer's deadline pass.
+    tick(SEARCH_DEBOUNCE_MS * 2);
+    settle();
+    flush();
+
+    expect(TestBed.inject(Router).url).not.toContain('search=');
+    expect(api.queries.at(-1)?.search).toBeNull();
+    expect(api.queries.at(-1)?.status).toBe('onboarding');
+    // The chosen view must still be the chosen view.
+    expect(selectedView()).toBe('Onboarding');
+    flush();
+  }));
+
+  it('drops a pending search when Clear filters supersedes it', fakeAsync(async () => {
+    await open('/restaurants?status=live');
+    settle();
+    flush();
+
+    const input = el().querySelector<HTMLInputElement>('#restaurant-search');
+    input!.value = 'nile';
+    input!.dispatchEvent(new Event('input'));
+    tick(SEARCH_DEBOUNCE_MS / 2);
+
+    clearFilters();
+    tick();
+    settle();
+    flush();
+    tick(SEARCH_DEBOUNCE_MS * 2);
+    settle();
+    flush();
+
+    expect(TestBed.inject(Router).url).toBe('/restaurants');
+    expect(api.queries.at(-1)?.search).toBeNull();
+    flush();
+  }));
+
   // --- pagination -----------------------------------------------------------------
 
   it('reports the range and page from the server metadata', fakeAsync(async () => {
@@ -579,6 +631,76 @@ describe('RestaurantsPage', () => {
     flush();
   }));
 
+  /**
+   * A page past the end is NOT an empty portfolio. The server answers a well-formed
+   * page number it cannot reach with an empty `results` and an honest `count`, so
+   * reading that as "No restaurants yet" would tell the operator something false
+   * about the whole platform — the same defect class as a dead backend reading
+   * "Invalid credentials.".
+   */
+  it('does not call a page past the end an empty portfolio', fakeAsync(async () => {
+    api.answer = () => of(pageOf([], { page: 999, count: 34, pages: 2 }));
+    await open('/restaurants?page=999');
+    settle();
+    flush();
+    settle();
+
+    expect(text()).not.toContain('No restaurants yet.');
+    expect(text()).not.toContain('No restaurants match these filters.');
+    expect(text()).toContain('past the end');
+    expect(text()).toContain('34 restaurants');
+    expect(text()).toContain('2 pages');
+    flush();
+  }));
+
+  it('offers a way back to the last page that holds rows', fakeAsync(async () => {
+    api.answer = () => of(pageOf([], { page: 999, count: 34, pages: 2 }));
+    await open('/restaurants?page=999');
+    settle();
+    flush();
+    settle();
+
+    api.answer = () => of(pageOf([row()], { page: 2, count: 34, pages: 2 }));
+    Array.from(el().querySelectorAll<HTMLButtonElement>('button'))
+      .find((button) => button.textContent?.trim() === 'Go to the last page')
+      ?.click();
+    tick();
+    settle();
+    flush();
+    settle();
+
+    expect(api.queries.at(-1)?.page).toBe(2);
+    expect(TestBed.inject(Router).url).toContain('page=2');
+    expect(rows().length).toBe(1);
+    flush();
+  }));
+
+  it('still calls a genuinely empty page empty, filtered or not', fakeAsync(async () => {
+    // count === 0 is the real "nothing here" — it must not be swallowed by the
+    // beyond-the-end branch.
+    api.answer = () => of(pageOf([], { page: 1, count: 0, pages: 1 }));
+    await open();
+    settle();
+    flush();
+    settle();
+
+    expect(text()).toContain('No restaurants yet.');
+    expect(text()).not.toContain('past the end');
+    flush();
+  }));
+
+  it('never renders a reversed range for a page with no rows', fakeAsync(async () => {
+    api.answer = () => of(pageOf([], { page: 999, count: 34, pages: 2 }));
+    await open('/restaurants?page=999');
+    settle();
+    flush();
+    settle();
+
+    // The naive arithmetic gives "24951–34 of 34".
+    expect(text()).not.toContain('24951');
+    flush();
+  }));
+
   it('renders a FAILURE as a failure, never as an empty directory', fakeAsync(async () => {
     api.answer = () => throwError(() => new WireError(500, { status: 500, message: 'boom' }));
     await open();
@@ -629,6 +751,32 @@ describe('RestaurantsPage', () => {
     expect(api.queries.length).toBe(attempts + 1);
     expect(rows().length).toBe(1);
     expect(text()).not.toContain('could not be loaded');
+    flush();
+  }));
+
+  it('clears the outage state once a retry succeeds', fakeAsync(async () => {
+    let failing = true;
+    api.answer = () =>
+      failing ? throwError(() => new WireError(500, null)) : of(pageOf([row()]));
+
+    await open();
+    settle();
+    flush();
+    settle();
+    expect(status.unavailable()).toBeTrue();
+
+    failing = false;
+    retry();
+    tick();
+    settle();
+    flush();
+    settle();
+
+    // No interceptor runs in mock mode, so the page owns BOTH halves of the report.
+    // Without the success half the shell banner keeps claiming the control plane is
+    // down long after it answered.
+    expect(status.unavailable()).withContext('the banner must come down').toBeFalse();
+    expect(status.requestId()).toBeNull();
     flush();
   }));
 

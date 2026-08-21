@@ -7,6 +7,7 @@ import {
 import { RouterTestingHarness } from '@angular/router/testing';
 import { Observable, Subject, of, throwError } from 'rxjs';
 
+import { AdminServiceStatus } from '../core/api/service-status';
 import {
   RESTAURANT_API,
   RestaurantApi,
@@ -340,6 +341,27 @@ describe('RestaurantDetailPage', () => {
     settle();
 
     expect(text()).toContain('Ankole Grill House');
+    flush();
+  }));
+
+  it('clears the outage state once the workspace read succeeds', fakeAsync(async () => {
+    const status = TestBed.inject(AdminServiceStatus);
+    let failing = true;
+    api.answer = () => (failing ? throwError(() => new WireError(500, null)) : of(detail()));
+
+    await loaded();
+    expect(status.unavailable()).toBeTrue();
+
+    failing = false;
+    Array.from(el().querySelectorAll<HTMLButtonElement>('button'))
+      .find((button) => button.textContent?.trim() === 'Try again')
+      ?.click();
+    tick();
+    settle();
+
+    // The store owns both halves of the outage report, because no interceptor runs in
+    // mock mode to clear it on the way back up.
+    expect(status.unavailable()).withContext('the banner must come down').toBeFalse();
     flush();
   }));
 

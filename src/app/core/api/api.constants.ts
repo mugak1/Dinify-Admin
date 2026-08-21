@@ -32,6 +32,24 @@ export const AUTH_ROUTES = {
 } as const;
 
 /**
+ * The restaurant read routes (Phase 1, Step 1) — `platform_admin_app/urls.py`.
+ *
+ * Spelled HERE and nowhere else, for the same reason `AUTH_ROUTES` is: a path
+ * concatenated inside a component is a path nobody can grep for when the server
+ * renames it. `detail` is a function because the id is part of the path rather than a
+ * query parameter, and it encodes so a malformed id cannot escape the segment.
+ *
+ * BOTH ARE SAFE METHODS. `GET` needs no `X-CSRFToken` and neither route is
+ * elevation-gated — reading the portfolio is ordinary authenticated work, and
+ * demanding a second factor to look at a list is what trains an operator to elevate
+ * reflexively.
+ */
+export const RESTAURANT_ROUTES = {
+  list: '/restaurants/',
+  detail: (id: string): string => `/restaurants/${encodeURIComponent(id)}/`,
+} as const;
+
+/**
  * CSRF cookie name — `platform_admin_app` carries its OWN, NOT Django's default
  * `csrftoken` (which belongs to the customer plane). Declared in
  * `dinify_backend/settings_admin.py`; the `__Host-` prefix is a browser contract

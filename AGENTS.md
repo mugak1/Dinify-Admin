@@ -14,7 +14,7 @@ Before making changes:
 5. Do not make broad refactors unless explicitly requested.
 6. Run `./scripts/verify.sh` before preparing a PR and paste the output.
 
-Four rules that are easy to break by habit:
+Seven rules that are easy to break by habit:
 - Global navigation is FIVE destinations. New capability becomes a restaurant-detail
   tab or a needs-attention condition, never a sixth sidebar item.
 - Filters go in the URL via `core/url/query-param.ts`, never in component state.
@@ -25,6 +25,13 @@ Four rules that are easy to break by habit:
 - An unreachable service is NOT a signed-out operator. Never clear the session store
   for a failure the server did not answer — see the three bootstrap outcomes in
   `CLAUDE.md`.
+- LOADING, EMPTY and FAILED are three different answers and must never look alike. A
+  failed read never renders as an empty list.
+- A mock is chosen at BUILD TIME, never reached for when a request fails. Real failure
+  is not mock data, and a control plane showing fixtures for an unreachable server is
+  showing a portfolio that does not exist.
+- Templates are inline, so a BACKTICK inside one terminates the TypeScript template
+  literal — including inside an HTML comment. Write prose, or single quotes.
 
 For Codex Desktop work:
 - Use Worktree mode by default.

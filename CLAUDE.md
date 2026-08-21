@@ -20,7 +20,8 @@ conventions change.
 
 ## Current Implementation Status
 
-**Step 0 (scaffold) only.** This repo currently contains the system, not the screens.
+**Step 0 (scaffold) complete, plus spec §15 STEP 1 (restaurant directory + detail
+workspace).** Steps 2–10 are not built.
 
 - Shell, navigation and routing: ✅ the five §9 destinations, the §9.2 URL scheme,
   URL-backed filters
@@ -32,13 +33,22 @@ conventions change.
   mid-session outage banner, the notice channel (low recovery codes, cleared
   lockout), and Re-authenticate in the operator menu
 - Design tokens + the guard that enforces them: ✅
-- Primitives (status pill, table, button): ✅
+- Primitives (status pill, table, button): ✅ — the table now also takes
+  page-projected cell templates, see "Primitives"
 - Formatting (UGX, EAT time, server-anchored relative time): ✅
-- Mock mode + primitives gallery: ✅ `npm start` renders everything with no backend
-- **Restaurant directory, detail workspace, readiness engine, lifecycle controls,
-  owner invitation, delegated drill-in, support triage, receivables, activity feed:
-  ❌ NOT BUILT.** Every destination is a placeholder with a real written empty state.
-  These are spec §15 steps 1–10.
+- Mock mode + primitives gallery: ✅ `npm start` renders everything with no backend,
+  now including the directory and the workspace
+- **Restaurant directory (`/restaurants`): ✅ BUILT.** Real reads against
+  `GET /api/admin/v1/restaurants/`, the seven §15 columns, the three quick views plus
+  a lifecycle filter and search, URL-backed filtering/paging, keyboard-first rows, and
+  loading / rows / empty / failed as four distinct states.
+- **Restaurant detail workspace: ✅ BUILT.** The §9.1 persistent header and a
+  populated Overview tab, both from ONE `GET /api/admin/v1/restaurants/<id>/`.
+- **Readiness, Billing, Support and Activity tabs: ❌ still placeholders** with
+  written empty states (spec §15 steps 3, 7, 6 and 8).
+- **Restaurant creation, owner invitation, the readiness ENGINE, lifecycle controls,
+  delegated drill-in, support triage, receivables, the Activity screen, Home
+  needs-attention and portfolio metrics: ❌ NOT BUILT.** Spec §15 steps 2–10.
 - **Deployment: 0C.1 ✅ EMPIRICALLY ACCEPTED (2026-08-20) · 0C.2 ✅ implemented,
   acceptance pending.** `.github/workflows/deploy.yml` deploys over GitHub OIDC →
   private S3 → AWS SSM. The real Angular application is live on
@@ -48,6 +58,24 @@ conventions change.
   `auth/elevate/` write) was exercised end to end. 0C.2 adds automatic
   forward-only deployment after a successful main CI run; **it has not yet been
   observed running**. See "Deployment" below.
+
+### What Step 1 deliberately does NOT claim
+The backend reports several concepts as unconfigured because the models behind them do
+not exist, and this repo renders that truth rather than filling the column:
+
+- **Readiness** is the fail-closed `check_go_live_readiness` seam. `not_ready` +
+  `readiness_not_configured` is a statement about the CHECKLIST not being built, and
+  the portal says so — it never reads as this restaurant having failed one. Step 3
+  fills the seam; `readinessLabel` already renders "3 blockers" when it does.
+- **Payment mode** is `Not configured`, never inferred. `require_order_prepayments` is
+  a diner-checkout toggle and is deliberately absent from the contract.
+- **Subscription** is `Not configured`. The legacy `Restaurant` columns are shown in a
+  fenced-off block LABELLED legacy; `legacy_validity_flag` is never rendered as
+  Active, Paid, Current, Trial or In good standing.
+- **Owner claim** is `Not tracked yet`. An account existing is not a claim, and Step 2
+  builds the difference.
+- **TEST tenants now come from the real `Restaurant.is_test`** (backend migration
+  `restaurants_app/0057`), not from mock data. See "Primitives".
 
 ## Tech Stack
 - Angular **21.2.x**, esbuild `@angular/build` application builder
@@ -205,7 +233,9 @@ rendering a blank frame. `app.routes.spec.ts` pins the exact set.
   outcome (below), guarded by `serviceUnavailableGuard` so a bookmarked URL cannot claim
   an outage that is not happening.
 - The restaurant tabs are **children** of `/restaurants/:id`, so the §9.1 persistent
-  header is genuinely persistent and cannot drift between tabs.
+  header is genuinely persistent and cannot drift between tabs. That route also carries
+  `providers: [RestaurantWorkspaceStore]`, which is what makes the detail read happen
+  ONCE for the whole workspace — see "The Restaurant Read Contract".
 - `withComponentInputBinding()` binds `:id` / `:issueId` / `:invoiceId` straight to
   component `input()`s.
 
@@ -215,11 +245,19 @@ rendering a blank frame. `app.routes.spec.ts` pins the exact set.
 `replaceUrl: true` + `queryParamsHandling: 'merge'`, batched to one navigation per
 microtask.
 
-**Step 1 must inherit this, not reinvent it.** Home's needs-attention items link INTO
-a filtered directory ("3 restaurants have outstanding go-live blockers" → the filtered
-list); if the filter lives in a component field those links cannot exist, and the
-inbox §11 builds the product around does not work. `/restaurants` already binds
-`?status=` and `?attention=` as the working proof, and the round trip is spec-pinned.
+**Step 1 inherited this rather than reinventing it.** Home's needs-attention items link
+INTO a filtered directory ("3 restaurants have outstanding go-live blockers" → the
+filtered list); if the filter lived in a component field those links could not exist, and
+the inbox §11 builds the product around would not work. `/restaurants` now binds
+**`?search=` `?status=` `?attention=` `?page=`** — exactly the parameters
+`parse_directory_params` accepts and nothing speculative, because that query string is
+DENY-BY-DEFAULT and an unknown key is a 400.
+
+`integerParam` is the fourth codec, and it fails soft like the others: `?page=abc`,
+`?page=0` and `?page=1.9` all read as 1 rather than throwing, and since the default is
+then omitted the request the client actually emits is still well-formed. **The server
+stays the authority on what it will accept** — a filter is not a security boundary and
+must never break a page before a request is made.
 
 Three properties worth not undoing: writes REPLACE rather than push (Back leaves the
 screen, it does not undo a keystroke); writes MERGE (one filter cannot drop another);
@@ -350,6 +388,82 @@ mock-mode rule under Mock Mode below.
 One consequence worth knowing: **5xx and status 0 no longer reach the classifier's
 defect tail**, because the precondition claims them first. What remains there is the
 unexpected 4xx.
+
+## The Restaurant Read Contract — `core/restaurants/`
+
+Two routes, both `GET`, both session-gated, **neither elevation-gated and neither
+audited** — reading the portfolio is ordinary authenticated work, and demanding a second
+factor to look at a list is what trains an operator to elevate reflexively.
+
+```
+GET /api/admin/v1/restaurants/            -> {status, data: {results[], pagination}}
+GET /api/admin/v1/restaurants/<uuid>/     -> {status, data: {...detail}}
+```
+
+Shaped like the auth seam and for the same reason — a PORT (`RESTAURANT_API`) plus a
+typed transport, so `npm start` renders both screens with no backend and everything above
+the port is identical in both modes:
+
+| file | what it is |
+|---|---|
+| `restaurant.model.ts` | the wire types, mirroring `platform_admin_app/restaurant_reads.py` |
+| `restaurant.api.ts` | the `RestaurantApi` port + `RESTAURANT_API` token |
+| `restaurant.http.ts` | the real transport, through the ordinary `HttpClient` stack |
+| `restaurant.labels.ts` | backend machine values → operator English, in ONE place |
+| `load-failure.ts` | classify a failed read, and raise the shared outage state |
+| `restaurant-workspace.store.ts` | the detail read, scoped to the `/restaurants/:id` route |
+
+**CLOSED UNIONS WHERE THE SERVER HAS ONE, `string` WHERE IT DOES NOT.** Lifecycle state,
+readiness state, audit result and order status are enumerated on the server and are
+enumerated here. `payment_mode` and `readiness.blockers` are `string`, because there is
+no field and no vocabulary yet — a union invented here would be wrong the day one lands.
+
+**THE TRANSPORT NORMALISES NOTHING.** A null `location`, `last_activity_at`,
+`latest_order` and `payment_mode` each say something different from `''` or `0`, and a
+helpful `?? ''` in the transport would destroy the distinction the screens render.
+
+**ROUTE STRINGS LIVE IN `api.constants.ts`** beside `AUTH_ROUTES`, never concatenated in
+a component. `RESTAURANT_ROUTES.detail(id)` encodes the segment.
+
+### One read for the whole workspace
+`RestaurantWorkspaceStore` is provided **on the `/restaurants/:id` route**, so exactly
+one instance exists per open restaurant and it dies with the route. The PARENT calls
+`load()`; the tabs inject and READ. Overview therefore issues no request of its own — the
+§9.1 header and Overview are one screen, and two reads can disagree about the same
+tenant. A test asserts a single `detail()` call across a tab change.
+
+The load effect wraps `load()` in `untracked()`, and that is load-bearing rather than
+tidy: `load()` reads the store's own signals to decide whether the id really changed and
+then writes them, so inside a reactive context the write re-triggers the effect that made
+it — an unbounded loop that presents as a hung tab, not as an error.
+
+### LOADING, EMPTY and FAILED are three different answers
+"No restaurants match these filters" is a real answer an operator will act on. A failed
+read is not an answer at all. Rendering the second as the first is the same class of
+defect as a dead backend presenting as "Invalid credentials." — so a failure clears the
+rows, renders a failure state with the request id and a retry, and **never** produces an
+empty table.
+
+`toLoadFailure()` also reports through `AdminServiceStatus` itself. The interceptor
+already does that on the real transport, but **mock mode never touches `HttpClient`**, so
+a branch only the interceptor could reach would be invisible in the one mode this work is
+reviewed in. Same reasoning as `bootstrap()` and `ElevationService.submit()`; it uses the
+shared `classifyTransportFailure` rather than a second implementation.
+
+### Race safety is `switchMap`, not a sequence counter
+Both the directory and the workspace run every read through one `switchMap`, so an older
+in-flight response is CANCELLED rather than allowed to land on top of a newer one. Typing
+"Kam" then "Kampala" must not leave the wider result under the narrower query: rows that
+do not match what the controls say are how an operator opens the wrong tenant.
+
+### The labels are where truthfulness is enforced
+`restaurant.labels.ts` is the single place a machine value becomes operator English,
+which makes it the single place the portal could start asserting something the database
+cannot support. **The rule is: translate, never upgrade.** `legacy_validity_flag` never
+becomes "Paid"; `not_applicable` never becomes "Ready"; `readiness_not_configured` is
+translated to a sentence about the CHECKLIST, never about the restaurant; an unknown
+blocker or audit action is humanised rather than shown raw or dropped.
+`restaurant.labels.spec.ts` pins each of those directly.
 
 ## The Error Classifier — one place, four cases
 
@@ -507,14 +621,30 @@ count and the labels.
 2. **`app-admin-table`** — dense rows, 44px interactive rows, tabular numerals on
    numeric columns, roving tabindex with Arrow/Home/End/Enter, visible focus, and a
    REQUIRED written empty state. Tables, not card grids.
+
+   **A column is EITHER text OR page-drawn, and the type says which.** `AdminTextColumn`
+   carries `value: (row) => string`; `AdminTemplateColumn` carries `cell: true` and the
+   page projects `<ng-template [appAdminTableCell]="'<key>'" ...>` matched by column
+   key. That is what let the directory grow a lifecycle pill and a two-line restaurant
+   cell WITHOUT a second table primitive and without the table learning any domain — there
+   is no `if (column.key === 'lifecycle')` and no `row.is_test` in `table.component.ts`,
+   and there must not be. The directive's second input (`appAdminTableCellOf`, bound to
+   the same rows) is never read at runtime: it exists so `T` is inferred and `let-row`
+   is typed, the same trick `*ngFor="let x of items"` uses.
+
+   It deliberately has NO loading mode. A page that owns a real distinction between
+   loading, failed and empty renders those itself; a spinner in the empty slot would let
+   all three collapse back into one.
 3. **`app-admin-button`** — `primary` (accent) / `secondary` / `destructive` (danger) /
    `ghost`, plus a `pending` state. **`pending` is the mechanism that enforces §16's
    ban on optimistic UI for consequential writes**, not decoration: a lifecycle
    transition is only real once its `AdminAuditLog` row commits, and a button that
    springs back before that has told the operator something that may not be true.
 
-A page-header/empty-state helper is the obvious first addition in step 1; it was
-deliberately not pre-built, which is why the placeholder pages repeat a little markup.
+A page-header/empty-state helper is still not built. Step 1 did not need one: the
+directory owns four distinct states whose copy is specific to it, and the remaining
+placeholder tabs share one `PANEL` constant. Extract it when a THIRD screen wants the
+same shape, not before.
 
 **The three banners are SHELL FURNITURE, not primitives, and the count is still three.**
 `defect-banner`, `notice-banner` and `service-unavailable-banner` are each mounted
@@ -522,13 +652,21 @@ exactly once in `ShellComponent` and are never composed into a screen — three 
 channels holding at most one message each (a live outage state, one defect, one composed
 notice). A primitive is something screens reach for; these are things the frame owns.
 
-### `Restaurant.is_test` does not exist yet
-Confirmed against `restaurants_app/models.py`. What exists is **`Order.is_test`**
-(migration `orders_app/0035`), and it means something different: an order placed while
-the restaurant was still `onboarding` — a pre-go-live REHEARSAL order, operationally
-real and commercially invisible. **The `test` pill variant is mock-driven until the
-step-1 backend PR adds a restaurant-level flag.** Do not derive it from order data;
-those are different facts.
+### `Restaurant.is_test` NOW EXISTS, and is what drives the TEST pill
+Migration `restaurants_app/0057` (backend PR #290) added it: **platform-owned** metadata
+marking a tenant that is not a real commercial customer. It is absent from BOTH
+`EDIT_INFORMATION['restaurants']` and `SerializerPutRestaurant`, so no restaurant user
+can set it, and the migration backfills **nothing** — whether an existing restaurant is a
+test tenant is an explicit operator decision, never inferred from its name. The admin
+directory and detail reads surface it, and the directory row and detail header both mark
+it with the solid TEST pill.
+
+**It is NOT `Order.is_test`** (migration `orders_app/0035`), which is a different fact
+about a different object: ONE order that is operationally real and commercially
+invisible, either because its tenant is a test tenant or because it was placed
+pre-go-live as a rehearsal. A real restaurant can have test orders. **Neither flag may
+be derived from the other.** Overview marks a test LATEST ORDER with the same pill, for
+the same reason: "a rehearsal happened" and "a sale happened" are different statements.
 
 ## Formatting
 
@@ -548,32 +686,61 @@ reinvents them.
 
 ## Mock Mode — how the founder reviews this work
 
-The auth transport sits behind the `ADMIN_AUTH` injection token. `npm start` (the
-default `development` serve configuration) resolves it to `MockAdminAuthApi`, so **the
-complete shell, all five destinations and the dev-only primitives gallery
-(`/__gallery`) render with NO backend running.** This is the only way the visual
-direction gets reviewed before 0C ships a deploy, and it is how the §16 brand-red
-decision will actually be made.
+**TWO PORTS, TWO MOCKS.** The auth transport sits behind `ADMIN_AUTH` and the restaurant
+reads behind `RESTAURANT_API`. `npm start` (the default `development` serve
+configuration) resolves both to their mocks, so **the complete shell, all five
+destinations, the real restaurant directory, the restaurant workspace and the dev-only
+primitives gallery (`/__gallery`) render with NO backend running.** This is how the
+visual direction gets reviewed, and it is how the §16 brand-red decision will actually be
+made.
 
-Only the five-route TRANSPORT is mocked. `AdminAuthService`, the login component, both
-interceptors and the elevation queue are the same code in both modes, so what gets
-reviewed is the real flow.
+Only the TRANSPORTS are mocked. `AdminAuthService`, the login component, both
+interceptors, the elevation queue, the directory page, the workspace store, the labels
+and the formatting are the same code in both modes, so what gets reviewed is the real
+flow.
 
-Levers for the unhappy paths (documented in the mock itself): a username containing
+**A MOCK IS NEVER A FALLBACK.** It is chosen at build time by `DEV_PROVIDERS`, never
+reached for when a request fails. A control plane that quietly substitutes fixtures for
+an unreachable server shows an operator a portfolio that does not exist, and the
+decisions they take from it are taken against fiction. REAL FAILURE ≠ MOCK DATA.
+
+**THE FIXTURES ARE NOT RICHER THAN THE BACKEND.** `mock-restaurants.fixtures.ts` DERIVES
+readiness, `needs_attention`, payment mode, subscription and owner claim from the same
+rules `restaurant_reads.py` applies, rather than writing pleasant values per row — a
+fixture that cannot disagree with the rule. The corpus covers onboarding-with-attention,
+an ordinary live tenant, a live TEST tenant, suspended, offboarded, open issues and none,
+no admin activity, a null location, a missing owner, a rehearsal (TEST) latest order, no
+orders at all, and enough rows to page at the default 25. The mock also FILTERS and PAGES
+server-side, mirroring `apply_directory_filters` and the endpoint's slicing — otherwise
+`npm start` would review a directory that works differently from the deployed one, and
+the pagination arithmetic would never be exercised.
+
+Levers for the unhappy paths (documented in the mocks themselves): a username containing
 `locked` → the break-glass branch; containing `low` → the low-recovery-codes warning;
 code `000000` → the uniform verification failure; empty credentials → the uniform 401.
-And the outage lever, set in the console:
+And the two console levers:
 
 ```js
+// AUTH — the third bootstrap outcome
 sessionStorage.setItem('dinify-admin.mock-unavailable', '1')     // no answer at all
 sessionStorage.setItem('dinify-admin.mock-unavailable', '502')   // answers badly, WITH a request id
 sessionStorage.removeItem('dinify-admin.mock-unavailable')       // back to normal
+
+// RESTAURANTS — the directory's failure and empty states
+sessionStorage.setItem('dinify-admin.mock-restaurants', 'error')  // 500, WITH a request id
+sessionStorage.setItem('dinify-admin.mock-restaurants', 'empty')  // a well-formed empty page
+sessionStorage.removeItem('dinify-admin.mock-restaurants')        // back to normal
 ```
 
+The detail 404 needs no lever: navigate to `/restaurants/<any-other-uuid>`. `error` and
+`empty` are separate levers on purpose — telling "the read failed" apart from "there is
+nothing here" is the whole point of keeping those states distinct.
+
 ### MOCK-MODE ERRORS ARE NOT `HttpErrorResponse` — DUCK-TYPE OR IT IS DEAD CODE
-`MockAdminAuthApi` throws `MockHttpError`, an `Error` subclass carrying `status` (and,
-for the 502 lever, a `headers.get()` stand-in so the request-id path is reviewable). It
-never goes near `HttpClient`, **so no interceptor runs in mock mode**.
+Both mocks throw `MockHttpError` (`src/app/dev/mock-http-error.ts` — one shape, one
+place), an `Error` subclass carrying `status` and, where the failure reached a server, a
+`headers.get()` stand-in so the request-id path is reviewable. Neither goes near
+`HttpClient`, **so no interceptor runs in mock mode**.
 
 Two rules follow, and they will trap someone otherwise:
 
@@ -594,10 +761,15 @@ with `dev-tools.prod.ts`, whose exports are empty and which imports nothing from
 module graph at all, rather than depending on the bundler eliminating dead code.
 
 `scripts/check-mock-isolation.mjs` CHECKS that against the built output by scanning
-for two build markers (emitted through `console.warn` and a rendered `data-` attribute
-so a minifier cannot drop them). It fails loudly when `dist/` is missing, so a green
-result can never mean "there was nothing to look at". It has been verified to fail
-when a marker is deliberately reintroduced.
+for **three** build markers — the mock auth transport, the mock restaurant transport and
+the gallery — each emitted in a way a minifier cannot drop (`console.warn`, or a rendered
+`data-` attribute). It fails loudly when `dist/` is missing, so a green result can never
+mean "there was nothing to look at". Adding a development-only module means adding its
+marker HERE and to the `--self-test` cases; the self-test is what proves the matcher
+still fires.
+
+Verified both ways at step 1: all three markers are present in a `development` build and
+absent from `dist/` after `build:prod`, so the gate has something real to catch.
 
 ## Verification
 
@@ -829,9 +1001,20 @@ defect class backend PR #283 closed after a deploy reported success while the bo
   temporarily unavailable), while `offboarded` is a flat 404.
 - **THE LIFECYCLE CONTROL READS ITS OPTIONS OFF THE SERVER.** `POST
   admin/v1/restaurants/<id>/transition/` already serialises `allowed_transitions` in
-  its response (from `lifecycle.allowed_targets`). **Never hardcode the transition
-  matrix in this repo** — one authority, on the server, where the row lock and the
-  audit entry are.
+  its response (from `lifecycle.allowed_targets`), and so does the Step-1 DETAIL read —
+  `RestaurantDetail.allowed_transitions` is already typed and already arriving, unused
+  until step 4. **Never hardcode the transition matrix in this repo** — one authority,
+  on the server, where the row lock and the audit entry are.
+- **`GET admin/v1/restaurants/` and `GET .../<id>/` are DEPLOYED** (backend PR #290) and
+  are what step 1 consumes. Query parameters are `search` / `status` / `attention` /
+  `page` / `page_size`, and the query string is DENY-BY-DEFAULT: an unknown key is a 400
+  with a field-keyed `errors` map, never a cheerfully unfiltered 200. Add a filter and
+  you must add it to `KNOWN_PARAMS` too. There is **no ordering parameter**, so a sort
+  header would be a control with nothing behind it; ordering is `name` then `id`.
+- **There is no human-readable restaurant reference.** No `REST-0018`. The backend has
+  no such column, and minting a sequential business key in a read endpoint would create
+  a persistent identifier nothing else writes. The `Restaurant` UUID is the identity,
+  and the workspace header shows it subdued.
 - In-flight orders are **frozen, not drained**, at `suspended`: staff cannot see,
   advance or cancel them, so the table is never freed. Two consequences are known and
   left for Phase 1 (see the backend's lifecycle section).

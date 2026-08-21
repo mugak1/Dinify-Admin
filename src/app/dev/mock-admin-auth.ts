@@ -1,7 +1,6 @@
 import { Injectable } from '@angular/core';
 import { delay, Observable, of, throwError } from 'rxjs';
 
-import { REQUEST_ID_HEADER } from '../core/api/api.constants';
 import { AdminAuthApi } from '../core/auth/admin-auth.api';
 import {
   AdminElevateResponse,
@@ -10,6 +9,7 @@ import {
   AdminVerifyResponse,
   SecondFactorMethod,
 } from '../core/auth/session.model';
+import { MockHttpError } from './mock-http-error';
 
 /**
  * A build marker.
@@ -194,31 +194,5 @@ export class MockAdminAuthApi implements AdminAuthApi {
   /** The mock's own clock is the browser's — the real one comes from the server. */
   private iso(offsetMs: number): string {
     return new Date(Date.now() + offsetMs).toISOString();
-  }
-}
-
-/**
- * Shaped enough like `HttpErrorResponse` for `extractErrorMessage` to read it, without
- * pretending to be one — nothing in mock mode goes near `HttpClient`.
- */
-class MockHttpError extends Error {
-  /**
-   * Only present when the mocked failure actually reached a server. Shaped enough like
-   * `HttpHeaders` for `extractRequestId` to read it — which is the point: THIS IS NOT
-   * AN `HttpErrorResponse`, so anything branching on the shape of an error has to
-   * duck-type or it will be dead code in mock mode. See `classifyTransportFailure`.
-   */
-  readonly headers?: { get(name: string): string | null };
-
-  constructor(
-    readonly status: number,
-    readonly error: unknown,
-    requestId?: string,
-  ) {
-    super(`Mock HTTP ${status}`);
-    this.name = 'MockHttpError';
-    if (requestId) {
-      this.headers = { get: (name: string) => (name === REQUEST_ID_HEADER ? requestId : null) };
-    }
   }
 }

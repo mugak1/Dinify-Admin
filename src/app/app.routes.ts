@@ -6,6 +6,7 @@ import { ActivityPage } from './features/activity.page';
 import { HomePage } from './features/home.page';
 import { LoginPage } from './features/login.page';
 import { InvoicePage, ReceivablesPage } from './features/receivables.pages';
+import { RestaurantWorkspaceStore } from './core/restaurants/restaurant-workspace.store';
 import { RestaurantDetailPage } from './features/restaurant-detail.page';
 import {
   RestaurantActivityTab,
@@ -86,6 +87,16 @@ export const routes: Routes = [
         path: 'restaurants/:id',
         component: RestaurantDetailPage,
         title: 'Restaurant · Dinify Admin',
+        /**
+         * THE WORKSPACE'S DETAIL READ, scoped to this subtree.
+         *
+         * Provided HERE rather than at the root so exactly one instance exists per
+         * open restaurant and it dies with the route. The parent loads it and every
+         * tab reads it, which is what stops Overview issuing a second
+         * `GET /restaurants/<id>/` merely because it is a child route — the §9.1
+         * header and Overview are one screen, and two reads can disagree.
+         */
+        providers: [RestaurantWorkspaceStore],
         children: [
           { path: '', component: RestaurantOverviewTab },
           { path: 'readiness', component: RestaurantReadinessTab },

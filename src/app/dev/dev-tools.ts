@@ -3,7 +3,9 @@ import { Routes } from '@angular/router';
 
 import { environment } from '../../environments/environment';
 import { ADMIN_AUTH } from '../core/auth/admin-auth.api';
+import { RESTAURANT_API } from '../core/restaurants/restaurant.api';
 import { MockAdminAuthApi } from './mock-admin-auth';
+import { MockRestaurantApi } from './mock-restaurant-api';
 
 /**
  * THE DEVELOPMENT SEAM. Two exports, and the production build never sees this file.
@@ -23,7 +25,10 @@ import { MockAdminAuthApi } from './mock-admin-auth';
  * to a real backend while keeping the gallery available.
  */
 export const DEV_PROVIDERS: Provider[] = environment.useMockApi
-  ? [{ provide: ADMIN_AUTH, useClass: MockAdminAuthApi }]
+  ? [
+      { provide: ADMIN_AUTH, useClass: MockAdminAuthApi },
+      { provide: RESTAURANT_API, useClass: MockRestaurantApi },
+    ]
   : [];
 
 /** Mounted inside the shell, so the gallery is reviewed in its real chrome. */

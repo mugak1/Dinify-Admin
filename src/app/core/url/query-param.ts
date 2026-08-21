@@ -137,3 +137,29 @@ export function enumParam<T extends string>(
     serialize: (value) => (value === null || value === defaultValue ? null : value),
   };
 }
+
+/**
+ * A positive integer — `?page=3`.
+ *
+ * FAIL-SOFT ON THE CLIENT, exactly like `booleanParam` and `enumParam`: `?page=0`,
+ * `?page=abc` and `?page=-1` from a hand-edited or truncated URL all read as the
+ * default rather than throwing, and because the default is then OMITTED from the
+ * query the client still emits a well-formed request. The server stays the authority
+ * on what it will accept — `parse_directory_params` answers a malformed parameter
+ * with a 400 — but a filter is not a security boundary and must never break a page
+ * before a request is even made.
+ *
+ * Deliberately strict about the SPELLING as well as the value: `parseInt` would read
+ * `12abc` as 12 and `1.9` as 1, so a whole-number pattern is tested first. A URL that
+ * says something this codec cannot honour exactly should fall back, not approximate.
+ */
+export function integerParam(defaultValue = 1, minimum = 1): QueryParamCodec<number> {
+  return {
+    parse: (raw) => {
+      if (raw === null || !/^\d+$/.test(raw)) return defaultValue;
+      const value = Number(raw);
+      return Number.isSafeInteger(value) && value >= minimum ? value : defaultValue;
+    },
+    serialize: (value) => (value === defaultValue ? null : String(value)),
+  };
+}

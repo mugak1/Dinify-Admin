@@ -26,6 +26,15 @@ import { classifyTransportFailure, extractRequestId } from '../api/transport-fai
  *
  * Reporting twice on the real path is harmless — `reportUnavailable` sets a signal,
  * and setting it to what it already holds notifies nothing.
+ *
+ * ── THE REPORT IS SYMMETRIC, AND BOTH HALVES ARE REQUIRED ─────────────────────────
+ *
+ * A read that FAILS raises the outage state; a read that SUCCEEDS must clear it. The
+ * interceptor does both on the real transport (`reachableOnResponse`), so it is easy
+ * to write only the failure half here and never notice — but in mock mode nothing else
+ * clears it, and the banner then keeps claiming the control plane is down long after a
+ * retry has succeeded. `reportReadReachable` is the other half, and it is named rather
+ * than inlined so the pair is visible at every call site.
  */
 export type LoadFailureKind =
   /** No usable answer: status 0, any 5xx. The outage state is raised alongside. */
@@ -75,6 +84,21 @@ export function toLoadFailure(
     message: extractErrorMessage(error, fallback),
     requestId,
   };
+}
+
+/**
+ * A read SUCCEEDED, so the control plane is reachable — clear any outage state.
+ *
+ * The counterpart to `toLoadFailure`. Call it on the success path of every read that
+ * calls `toLoadFailure` on its failure path; the two belong together, and a screen
+ * that reports only failures leaves the shell's outage banner stuck up for the rest
+ * of the session once anything has failed once.
+ *
+ * A no-op on the real transport, where the interceptor has already done it: setting a
+ * signal to the value it already holds notifies nothing.
+ */
+export function reportReadReachable(status: AdminServiceStatus): void {
+  status.markReachable();
 }
 
 /** Duck-typed, for the same reason `classifyTransportFailure` is. */

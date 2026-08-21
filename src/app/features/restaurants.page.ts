@@ -1,11 +1,19 @@
-import { ChangeDetectionStrategy, Component, computed, effect, inject, signal } from '@angular/core';
+import {
+  ChangeDetectionStrategy,
+  Component,
+  DestroyRef,
+  computed,
+  effect,
+  inject,
+  signal,
+} from '@angular/core';
 import { takeUntilDestroyed, toObservable } from '@angular/core/rxjs-interop';
 import { Router } from '@angular/router';
 import { catchError, distinctUntilChanged, of, switchMap, tap } from 'rxjs';
 
 import { AdminServiceStatus } from '../core/api/service-status';
 import { formatEat } from '../core/formatting/time';
-import { LoadFailure, toLoadFailure } from '../core/restaurants/load-failure';
+import { LoadFailure, reportReadReachable, toLoadFailure } from '../core/restaurants/load-failure';
 import { RESTAURANT_API } from '../core/restaurants/restaurant.api';
 import {
   lifecycleLabel,
@@ -39,8 +47,17 @@ export type QuickView = 'all' | 'attention' | 'onboarding' | 'custom';
 /** Typing must not fire a request per keystroke; the URL is still the source of truth. */
 export const SEARCH_DEBOUNCE_MS = 250;
 
-/** What the directory can currently show. Four states, and never collapsed into one. */
-type DirectoryState = 'loading' | 'rows' | 'empty' | 'error';
+/**
+ * What the directory can currently show. FIVE states, and never collapsed into one.
+ *
+ * `beyond-end` is the one that is easy to miss: zero rows with a NON-ZERO count. The
+ * portfolio is not empty — the page number is simply past the end of it, which happens
+ * to a stale bookmark, a hand-edited URL, or a last page whose rows have since been
+ * filtered away. Reading it as `empty` tells the operator "No restaurants yet" about a
+ * platform that has restaurants, which is the same confident false statement this
+ * screen exists to avoid everywhere else.
+ */
+type DirectoryState = 'loading' | 'rows' | 'empty' | 'beyond-end' | 'error';
 
 /**
  * Restaurants — THE DIRECTORY (spec §15 step 1, columns per §9.1).
@@ -214,6 +231,23 @@ type DirectoryState = 'loading' | 'rows' | 'empty' | 'error';
         </div>
       }
 
+      @case ('beyond-end') {
+        <!-- NOT an empty portfolio. The count says there are restaurants; this page
+             number is simply past the end of them. Saying "No restaurants yet" here
+             would be a confident false statement about the whole platform. -->
+        <div class="rounded-lg bg-surface p-6 ring-1 ring-line">
+          <h2 class="text-admin-section text-ink">Nothing on this page</h2>
+          <p class="mt-1 max-w-prose text-admin-body text-ink-muted">
+            {{ beyondEndMessage() }}
+          </p>
+          <div class="mt-4">
+            <app-admin-button variant="primary" (pressed)="goToPage(lastPage())"
+              >Go to the last page</app-admin-button
+            >
+          </div>
+        </div>
+      }
+
       @default {
         <app-admin-table
           caption="Restaurant directory"
@@ -350,8 +384,17 @@ export class RestaurantsPage {
   protected readonly state = computed<DirectoryState>(() => {
     if (this._loading()) return 'loading';
     if (this._failure()) return 'error';
-    return this._rows().length ? 'rows' : 'empty';
+    if (this._rows().length) return 'rows';
+
+    // The server hands back honest metadata for a page past the end rather than a
+    // 404 — a well-formed page number the portfolio simply does not extend to. Read
+    // it, instead of collapsing the case into "there is nothing here".
+    const page = this._pagination();
+    return page && page.count > 0 ? 'beyond-end' : 'empty';
   });
+
+  /** The last page that actually holds rows, for the way back out of `beyond-end`. */
+  protected readonly lastPage = computed(() => this._pagination()?.pages ?? 1);
 
   protected readonly hasFilters = computed(
     () => !!this.search.value() || !!this.status.value() || this.attention.value(),
@@ -378,9 +421,24 @@ export class RestaurantsPage {
   protected readonly rangeLabel = computed(() => {
     const page = this._pagination();
     if (!page || page.count === 0) return 'No restaurants';
+    // Guarded rather than computed blindly: with no rows the arithmetic below runs
+    // backwards and produces a reversed range like "24951–34 of 34".
+    if (!this._rows().length) return `No restaurants on page ${page.page}`;
     const first = (page.page - 1) * page.page_size + 1;
     const last = Math.min(page.count, first + this._rows().length - 1);
     return `${first}–${last} of ${page.count}`;
+  });
+
+  protected readonly beyondEndMessage = computed(() => {
+    const page = this._pagination();
+    if (!page) return '';
+    const pages = page.pages === 1 ? '1 page' : `${page.pages} pages`;
+    const matches =
+      page.count === 1 ? '1 restaurant' : `${page.count} restaurants`;
+    const scope = this.hasFilters() ? 'match these filters' : 'in the directory';
+    return `Page ${page.page} is past the end. There ${
+      page.count === 1 ? 'is' : 'are'
+    } ${matches} ${scope}, across ${pages}.`;
   });
 
   protected readonly announcement = computed(() => {
@@ -393,6 +451,8 @@ export class RestaurantsPage {
         return this.hasFilters()
           ? 'No restaurants match these filters.'
           : 'No restaurants yet.';
+      case 'beyond-end':
+        return `This page is past the end of the directory. It has ${this.lastPage()} pages.`;
       default:
         return `${this.rangeLabel()} restaurants shown.`;
     }
@@ -467,7 +527,15 @@ export class RestaurantsPage {
         this._rows.set(result.results);
         this._pagination.set(result.pagination);
         this._failure.set(null);
+        // The other half of the outage report — see `reportReadReachable`. Without it
+        // a mocked failure leaves the shell's banner up after a successful retry,
+        // because no interceptor runs in mock mode to clear it.
+        reportReadReachable(this.status$);
       });
+
+    // A queued keystroke must not outlive the screen it was typed on — it would
+    // navigate a route the operator has already left.
+    inject(DestroyRef).onDestroy(() => this.cancelPendingSearch());
 
     // URL -> input, for changes this component did not make.
     effect(() => {
@@ -486,7 +554,7 @@ export class RestaurantsPage {
   protected onSearch(event: Event): void {
     const value = (event.target as HTMLInputElement).value;
     this.searchDraft.set(value);
-    if (this.debounce !== null) clearTimeout(this.debounce);
+    this.cancelPendingSearch();
     this.debounce = setTimeout(() => {
       this.debounce = null;
       this.publishSearch(value.trim() === '' ? null : value);
@@ -505,6 +573,13 @@ export class RestaurantsPage {
   }
 
   protected selectView(view: Exclude<QuickView, 'custom'>): void {
+    // THE PENDING KEYSTROKES ARE SUPERSEDED, so the timer that would publish them has
+    // to die with them. Without this, typing into Search and then picking a quick view
+    // inside the debounce window lets the stale callback put `?search=` back a moment
+    // later: a second request runs, and the view the operator just chose flips to
+    // Custom under them. `clearFilters()` routes through here for the same reason.
+    this.cancelPendingSearch();
+
     // Each view states the WHOLE filter set it means, so switching between them can
     // never leave a stray parameter behind that the highlighted tab does not describe.
     this.publishSearch(null);
@@ -531,6 +606,13 @@ export class RestaurantsPage {
    *  is almost always empty, and an empty page reads as "nothing matches". */
   private resetPage(): void {
     this.page.set(1);
+  }
+
+  /** Drop a debounced search that has been superseded or whose page is going away. */
+  private cancelPendingSearch(): void {
+    if (this.debounce === null) return;
+    clearTimeout(this.debounce);
+    this.debounce = null;
   }
 
   private publishSearch(value: string | null): void {

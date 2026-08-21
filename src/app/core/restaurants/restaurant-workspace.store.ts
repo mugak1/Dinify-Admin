@@ -3,7 +3,7 @@ import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { catchError, of, Subject, switchMap, tap } from 'rxjs';
 
 import { AdminServiceStatus } from '../api/service-status';
-import { LoadFailure, toLoadFailure } from './load-failure';
+import { LoadFailure, reportReadReachable, toLoadFailure } from './load-failure';
 import { RESTAURANT_API } from './restaurant.api';
 import { RestaurantDetail } from './restaurant.model';
 
@@ -89,6 +89,10 @@ export class RestaurantWorkspaceStore {
         }
         this._detail.set(result);
         this._failure.set(null);
+        // The other half of the outage report — see `reportReadReachable`. Without it
+        // a mocked failure leaves the shell's banner up after a successful retry,
+        // because no interceptor runs in mock mode to clear it.
+        reportReadReachable(this.status);
       });
   }
 

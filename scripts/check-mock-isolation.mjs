@@ -21,9 +21,9 @@
  *
  * ── HOW ───────────────────────────────────────────────────────────────────────────
  *
- * Both modules export a distinctive build marker, and each is used in a way a
- * minifier cannot drop — one through `console.warn`, one as a rendered `data-`
- * attribute. If either literal survives into `dist/`, it shipped.
+ * Each development-only module exports a distinctive build marker, and each is used
+ * in a way a minifier cannot drop — through `console.warn`, or as a rendered `data-`
+ * attribute. If any of those literals survives into `dist/`, it shipped.
  *
  * The scan FAILS LOUDLY when `dist/` is missing or holds no JavaScript, so a green
  * result can never mean "there was nothing to look at". Run it after `build:prod`.
@@ -51,6 +51,10 @@ const DIST_ROOT = join(REPO_ROOT, 'dist');
 export const FORBIDDEN_MARKERS = [
   { marker: 'DINIFY_ADMIN_MOCK_AUTH_PRESENT', source: 'src/app/dev/mock-admin-auth.ts' },
   { marker: 'DINIFY_ADMIN_GALLERY_PRESENT', source: 'src/app/dev/gallery.page.ts' },
+  {
+    marker: 'DINIFY_ADMIN_MOCK_RESTAURANTS_PRESENT',
+    source: 'src/app/dev/mock-restaurant-api.ts',
+  },
 ];
 
 const SCANNED_EXTENSIONS = ['.js', '.mjs', '.html', '.css'];
@@ -80,7 +84,16 @@ function selfTest() {
   const cases = [
     ['a bundle carrying the mock marker', 'x="DINIFY_ADMIN_MOCK_AUTH_PRESENT"', 1],
     ['a bundle carrying the gallery marker', 'a.setAttribute("data-build-marker","DINIFY_ADMIN_GALLERY_PRESENT")', 1],
-    ['a bundle carrying both', 'DINIFY_ADMIN_MOCK_AUTH_PRESENT DINIFY_ADMIN_GALLERY_PRESENT', 2],
+    [
+      'a bundle carrying the restaurant-mock marker',
+      'console.warn("DINIFY_ADMIN_MOCK_RESTAURANTS_PRESENT")',
+      1,
+    ],
+    [
+      'a bundle carrying all three',
+      'DINIFY_ADMIN_MOCK_AUTH_PRESENT DINIFY_ADMIN_GALLERY_PRESENT DINIFY_ADMIN_MOCK_RESTAURANTS_PRESENT',
+      3,
+    ],
     ['an ordinary production bundle', 'const e="Invalid credentials.";export{e};', 0],
     ['a near miss', 'const DINIFY_ADMIN = 1;', 0],
   ];

@@ -3,7 +3,7 @@ import { TestBed, fakeAsync, tick } from '@angular/core/testing';
 import { Router, provideRouter } from '@angular/router';
 import { RouterTestingHarness } from '@angular/router/testing';
 
-import { booleanParam, enumParam, stringParam, urlState } from './query-param';
+import { booleanParam, enumParam, integerParam, stringParam, urlState } from './query-param';
 
 const STATUSES = ['onboarding', 'live', 'suspended', 'offboarded'] as const;
 
@@ -15,6 +15,7 @@ class ProbeComponent {
   readonly status = this.url.param('status', enumParam(STATUSES));
   readonly attention = this.url.param('attention', booleanParam());
   readonly search = this.url.param('q', stringParam());
+  readonly page = this.url.param('page', integerParam());
 }
 
 /**
@@ -129,4 +130,46 @@ describe('urlState', () => {
     // Back should leave the screen, not undo three keystrokes.
     expect(history.length).toBe(before);
   }));
+});
+
+/**
+ * `?page=` is the fourth URL-backed parameter, and the first numeric one.
+ *
+ * It FAILS SOFT on the client for the same reason the others do: a hand-edited or
+ * truncated URL must not break a page before a request is even made. The server stays
+ * the authority — `parse_directory_params` answers a bad `page` with a 400 — but the
+ * client, having fallen back to the default, then OMITS the parameter entirely, so
+ * what it actually emits is always well-formed.
+ */
+describe('integerParam', () => {
+  const codec = integerParam();
+
+  it('reads a positive whole number', () => {
+    expect(codec.parse('3')).toBe(3);
+    expect(codec.parse('1')).toBe(1);
+    expect(codec.parse('1000')).toBe(1000);
+  });
+
+  it('falls back to the default for anything it cannot honour exactly', () => {
+    // `parseInt` would read '12abc' as 12 and '1.9' as 1. Approximating a URL the
+    // operator did not write is how a filtered view silently answers a different
+    // question, so a value this codec cannot honour exactly falls back instead.
+    for (const raw of [null, '', 'abc', '0', '-1', '1.9', '12abc', ' 3', '+3', '1e3', 'Infinity']) {
+      expect(codec.parse(raw)).withContext(String(raw)).toBe(1);
+    }
+  });
+
+  it('omits the default from the URL, so ordinary links stay short', () => {
+    expect(codec.serialize(1)).toBeNull();
+    expect(codec.serialize(2)).toBe('2');
+  });
+
+  it('honours a different default and minimum', () => {
+    const sized = integerParam(25, 5);
+    expect(sized.parse(null)).toBe(25);
+    expect(sized.parse('4')).withContext('below the minimum').toBe(25);
+    expect(sized.parse('5')).toBe(5);
+    expect(sized.serialize(25)).toBeNull();
+    expect(sized.serialize(50)).toBe('50');
+  });
 });

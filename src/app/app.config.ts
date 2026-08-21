@@ -12,6 +12,8 @@ import { errorClassifierInterceptor } from './core/api/error.interceptor';
 import { ADMIN_AUTH } from './core/auth/admin-auth.api';
 import { AdminAuthHttp } from './core/auth/admin-auth.http';
 import { AdminAuthService } from './core/auth/admin-auth.service';
+import { RESTAURANT_API } from './core/restaurants/restaurant.api';
+import { RestaurantHttp } from './core/restaurants/restaurant.http';
 import { DEV_PROVIDERS } from './dev/dev-tools';
 import { routes } from './app.routes';
 
@@ -46,11 +48,15 @@ export const appConfig: ApplicationConfig = {
     provideHttpClient(withInterceptors([errorClassifierInterceptor, csrfInterceptor])),
 
     /**
-     * The real transport. `DEV_PROVIDERS` follows, so a development build overrides
-     * it with the mock — later providers win — and the production build has no mock
-     * to override with, because `dev-tools.ts` is file-replaced.
+     * The real transports. `DEV_PROVIDERS` follows, so a development build overrides
+     * them with the mocks — later providers win — and the production build has no
+     * mock to override with, because `dev-tools.ts` is file-replaced.
+     *
+     * Both ports are registered here rather than at a route, so there is one answer
+     * to "what talks to the server" and a screen cannot quietly acquire its own.
      */
     { provide: ADMIN_AUTH, useClass: AdminAuthHttp },
+    { provide: RESTAURANT_API, useClass: RestaurantHttp },
     ...DEV_PROVIDERS,
 
     /**

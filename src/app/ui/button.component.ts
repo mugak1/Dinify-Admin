@@ -2,6 +2,10 @@ import { ChangeDetectionStrategy, Component, computed, input, output } from '@an
 
 export type ButtonVariant = 'primary' | 'secondary' | 'destructive' | 'ghost';
 
+const BASE =
+  'inline-flex h-control items-center justify-center gap-2 rounded px-3 ' +
+  'text-admin-label transition-colors disabled:cursor-not-allowed disabled:opacity-55';
+
 const VARIANTS: Record<ButtonVariant, string> = {
   // Every one of these reads --admin-accent or --admin-danger and nothing else.
   primary: 'bg-admin-accent text-admin-accent-fg hover:bg-admin-accent-hover',
@@ -9,6 +13,22 @@ const VARIANTS: Record<ButtonVariant, string> = {
   destructive: 'bg-admin-danger text-admin-danger-fg hover:bg-admin-danger-hover',
   ghost: 'bg-transparent text-ink-muted hover:bg-surface-sunken hover:text-ink',
 };
+
+/**
+ * The class string for a button of this variant.
+ *
+ * Exported so the ONE place a control has to be an anchor rather than a button — a
+ * primary action that NAVIGATES, like the restaurant header's "Review readiness" —
+ * can look identical without respelling the styles. §19 wants real `<button>`
+ * semantics for actions and real `<a>` semantics for navigation, and the honest way
+ * to have both is to share the appearance rather than fake the element.
+ *
+ * It is appearance only: an anchor using it must still supply its own focus and
+ * disabled behaviour, which is why this is a helper and not a directive.
+ */
+export function adminButtonClasses(variant: ButtonVariant, block = false): string {
+  return [BASE, block ? 'w-full' : '', VARIANTS[variant]].filter(Boolean).join(' ');
+}
 
 /**
  * The button.
@@ -69,15 +89,5 @@ export class AdminButtonComponent {
 
   readonly pressed = output<void>();
 
-  protected readonly classes = computed(() =>
-    [
-      'inline-flex h-control items-center justify-center gap-2 rounded px-3',
-      'text-admin-label transition-colors',
-      'disabled:cursor-not-allowed disabled:opacity-55',
-      this.block() ? 'w-full' : '',
-      VARIANTS[this.variant()],
-    ]
-      .filter(Boolean)
-      .join(' '),
-  );
+  protected readonly classes = computed(() => adminButtonClasses(this.variant(), this.block()));
 }

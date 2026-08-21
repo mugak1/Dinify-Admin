@@ -53,17 +53,24 @@ const STYLES: Record<StatusPillVariant, string> = {
  * the system with a solid fill, so it differs in FORM from every lifecycle state and
  * cannot be mistaken for one at a glance.
  *
- * ── THE BACKEND DOES NOT HAVE THIS FIELD YET ──────────────────────────────────────
+ * ── WHERE THE TEST FLAG COMES FROM ────────────────────────────────────────────────
  *
- * `Restaurant.is_test` DOES NOT EXIST — confirmed against `restaurants_app/models.py`
- * during recon. What exists is `Order.is_test` (migration `orders_app/0035`), and it
- * means something different: an order placed while the restaurant was still
- * `onboarding`, i.e. a pre-go-live REHEARSAL order. A rehearsal order is
- * operationally real and commercially invisible — it occupies its table and reaches
- * the kitchen board, but is excluded from every sales figure.
+ * `Restaurant.is_test` NOW EXISTS (migration `restaurants_app/0057`) and is what drives
+ * this variant: platform-owned metadata marking a tenant that is not a real commercial
+ * customer — a demo, a fixture, an internal rehearsal account. It is absent from both
+ * `EDIT_INFORMATION['restaurants']` and `SerializerPutRestaurant`, so no restaurant user
+ * can set it, and migration 0057 deliberately backfills NOTHING: whether an existing
+ * restaurant is a test tenant is an explicit operator decision, never inferred from its
+ * name. The admin directory and detail reads surface it directly.
  *
- * So the `test` variant is MOCK-DRIVEN until the step-1 backend PR adds a restaurant
- * level flag. Do not derive it from order data; those are different facts.
+ * DO NOT CONFUSE IT WITH `Order.is_test` (migration `orders_app/0035`), which is a
+ * different fact about a different object: one ORDER that is operationally real and
+ * commercially invisible, either because its tenant is a test tenant or because it was
+ * placed before go-live as a rehearsal. A real restaurant can have test orders, and a
+ * test restaurant's orders are all test orders — so neither flag may be derived from
+ * the other. The Overview tab marks a test LATEST ORDER with this same pill for the
+ * same reason it marks a test tenant: "a rehearsal happened" and "a sale happened" are
+ * not the same statement.
  */
 @Component({
   selector: 'app-status-pill',

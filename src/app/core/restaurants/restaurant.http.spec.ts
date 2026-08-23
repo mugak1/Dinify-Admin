@@ -9,6 +9,7 @@ import { TestBed } from '@angular/core/testing';
 import { RestaurantHttp } from './restaurant.http';
 import {
   DirectoryQuery,
+  OnboardingSummary,
   RestaurantDetail,
   RestaurantDirectoryPage,
   RestaurantRow,
@@ -64,6 +65,20 @@ const TEST_ROW: RestaurantRow = {
   needs_attention: false,
 };
 
+/**
+ * The Step 2C projection with every nullable field NULL — the shape a tracked legacy
+ * adoption with no control evidence actually has, and the one a helpful `?? ''` or a
+ * defaulted evidence would silently destroy.
+ */
+const SPARSE_ONBOARDING: OnboardingSummary = {
+  tracked: true,
+  source: 'legacy_adopted',
+  recorded_at: '2026-08-22T09:14:33+03:00',
+  owner_relationship: { status: 'consistent' },
+  owner_control: { status: 'not_established', evidence: null, evidence_at: null },
+  invitation: { status: 'not_applicable' },
+};
+
 const DETAIL: RestaurantDetail = {
   ...SPARSE_ROW,
   allowed_transitions: ['live', 'offboarded'],
@@ -74,9 +89,11 @@ const DETAIL: RestaurantDetail = {
     email: 'owner@spekeroadcafe.ug',
     phone_number: '256759410772',
     is_active: true,
-    claim_tracked: false,
-    claim_status: null,
+    // The compatibility aliases, as the server sends them alongside `onboarding`.
+    claim_tracked: true,
+    claim_status: 'not_established',
   },
+  onboarding: SPARSE_ONBOARDING,
   support: { open_issue_count: 0 },
   operations: {
     table_count: 0,
@@ -235,6 +252,22 @@ describe('RestaurantHttp', () => {
       expect(test.is_test).toBeTrue();
       expect(test.readiness.state).toBe('not_applicable');
     });
+
+    it('does NOT carry onboarding on a directory row', () => {
+      // The directory contract deliberately did not gain onboarding: five more
+      // per-row states would be five more columns nobody scans, and the question
+      // "who controls this tenant" belongs on the workspace. The transport must not
+      // grow a row-level projection to fill the gap.
+      let received: RestaurantDirectoryPage | undefined;
+      http.list(DEFAULT_QUERY).subscribe((value) => (received = value));
+
+      controller
+        .expectOne((request) => request.url === LIST_URL)
+        .flush({ status: 200, data: page([SPARSE_ROW]) });
+
+      const [row] = received?.results ?? [];
+      expect(Object.keys(row)).not.toContain('onboarding');
+    });
   });
 
   describe('detail', () => {
@@ -254,11 +287,103 @@ describe('RestaurantHttp', () => {
 
       expect(received?.owner?.email).toBe('owner@spekeroadcafe.ug');
       expect(received?.owner?.name).withContext('a nameless owner stays null').toBeNull();
-      expect(received?.owner?.claim_tracked).toBeFalse();
-      expect(received?.owner?.claim_status).toBeNull();
       expect(received?.operations.latest_order).withContext('no orders stays null').toBeNull();
       expect(received?.allowed_transitions).toEqual(['live', 'offboarded']);
       expect(received?.recent_activity[0].action).toBe('admin.restaurant.lifecycle_transition');
+    });
+
+    // ── THE STEP 2C ONBOARDING PROJECTION ────────────────────────────────────────
+    //
+    // The backend owns these semantics entirely. What is defended here is that the
+    // transport is a PIPE: it does not compute onboarding, does not infer it from the
+    // owner fields, does not synthesise it from the compatibility aliases, and does not
+    // fill a null with something friendlier. Every one of those would be the client
+    // inventing a fact about who controls a restaurant.
+
+    it('passes the onboarding projection through byte for byte', () => {
+      let received: RestaurantDetail | undefined;
+      http.detail(DETAIL_ID).subscribe((value) => (received = value));
+      controller
+        .expectOne(`/api/admin/v1/restaurants/${DETAIL_ID}/`)
+        .flush({ status: 200, message: 'ok', data: DETAIL });
+
+      expect(received?.onboarding).toEqual(SPARSE_ONBOARDING);
+    });
+
+    it('preserves every null inside owner_control rather than defaulting it', () => {
+      let received: RestaurantDetail | undefined;
+      http.detail(DETAIL_ID).subscribe((value) => (received = value));
+      controller
+        .expectOne(`/api/admin/v1/restaurants/${DETAIL_ID}/`)
+        .flush({ status: 200, message: 'ok', data: DETAIL });
+
+      // "No evidence" and "some evidence recorded at the epoch" are different claims.
+      expect(received?.onboarding.owner_control.evidence).toBeNull();
+      expect(received?.onboarding.owner_control.evidence_at).toBeNull();
+    });
+
+    it('carries the untracked shape through without turning it into a failure', () => {
+      // `tracked: false` with three `unavailable` statuses says the questions were not
+      // asked. A transport that helpfully substituted `not_established` would turn that
+      // into an evaluated verdict the server never reached.
+      const untracked: OnboardingSummary = {
+        tracked: false,
+        source: null,
+        recorded_at: null,
+        owner_relationship: { status: 'unavailable' },
+        owner_control: { status: 'unavailable', evidence: null, evidence_at: null },
+        invitation: { status: 'unavailable' },
+      };
+
+      let received: RestaurantDetail | undefined;
+      http.detail(DETAIL_ID).subscribe((value) => (received = value));
+      controller
+        .expectOne(`/api/admin/v1/restaurants/${DETAIL_ID}/`)
+        .flush({ status: 200, data: { ...DETAIL, onboarding: untracked } });
+
+      expect(received?.onboarding).toEqual(untracked);
+    });
+
+    it('does not derive onboarding from the compatibility aliases, or the reverse', () => {
+      // A payload where the aliases and the canonical object disagree is not something
+      // the server produces — it is here so a future "helpful" reconciliation in the
+      // transport fails loudly instead of silently picking a winner.
+      let received: RestaurantDetail | undefined;
+      http.detail(DETAIL_ID).subscribe((value) => (received = value));
+      controller.expectOne(`/api/admin/v1/restaurants/${DETAIL_ID}/`).flush({
+        status: 200,
+        data: {
+          ...DETAIL,
+          owner: { ...DETAIL.owner, claim_tracked: false, claim_status: null },
+        },
+      });
+
+      expect(received?.onboarding.tracked).withContext('the canonical value stands').toBeTrue();
+      expect(received?.onboarding.owner_control.status).toBe('not_established');
+      expect(received?.owner?.claim_tracked).withContext('the alias stands too').toBeFalse();
+    });
+
+    it('keeps every closed-vocabulary value exactly as the server spelled it', () => {
+      const rich: OnboardingSummary = {
+        tracked: true,
+        source: 'admin_created',
+        recorded_at: '2026-07-01T11:00:00+03:00',
+        owner_relationship: { status: 'owner_membership_mismatch' },
+        owner_control: {
+          status: 'stale_attestation',
+          evidence: 'legacy_attestation',
+          evidence_at: '2026-06-02T08:30:00+03:00',
+        },
+        invitation: { status: 'superseded' },
+      };
+
+      let received: RestaurantDetail | undefined;
+      http.detail(DETAIL_ID).subscribe((value) => (received = value));
+      controller
+        .expectOne(`/api/admin/v1/restaurants/${DETAIL_ID}/`)
+        .flush({ status: 200, data: { ...DETAIL, onboarding: rich } });
+
+      expect(received?.onboarding).toEqual(rich);
     });
 
     it('surfaces a 404 as an error rather than an empty result', () => {

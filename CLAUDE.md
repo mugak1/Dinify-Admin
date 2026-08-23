@@ -21,7 +21,10 @@ conventions change.
 ## Current Implementation Status
 
 **Step 0 (scaffold) complete, plus spec §15 STEP 1 (restaurant directory + detail
-workspace).** Steps 2–10 are not built.
+workspace) and the READ half of STEP 2C (the onboarding and owner-control projection,
+rendered on Overview).** Step 2 as a whole is NOT complete — nothing in this repo
+creates a restaurant, adopts one, attests owner control or issues an invitation. Steps
+3–10 are not built.
 
 - Shell, navigation and routing: ✅ the five §9 destinations, the §9.2 URL scheme,
   URL-backed filters
@@ -44,11 +47,19 @@ workspace).** Steps 2–10 are not built.
   loading / rows / empty / failed as four distinct states.
 - **Restaurant detail workspace: ✅ BUILT.** The §9.1 persistent header and a
   populated Overview tab, both from ONE `GET /api/admin/v1/restaurants/<id>/`.
+- **Step 2C onboarding truth on Overview: ✅ BUILT (read-only).** An Onboarding panel
+  beside Owner renders the backend's onboarding projection — provenance, when the admin
+  record appeared, the owner-relationship check, owner control with its evidence, and
+  the invitation state. Same one read; no new endpoint, no writer. See "The Onboarding
+  Projection" below.
 - **Readiness, Billing, Support and Activity tabs: ❌ still placeholders** with
   written empty states (spec §15 steps 3, 7, 6 and 8).
-- **Restaurant creation, owner invitation, the readiness ENGINE, lifecycle controls,
-  delegated drill-in, support triage, receivables, the Activity screen, Home
-  needs-attention and portfolio metrics: ❌ NOT BUILT.** Spec §15 steps 2–10.
+- **Restaurant creation, restaurant adoption, owner-control attestation, owner
+  invitation (issue / reissue / cancel), owner reassignment, the readiness ENGINE,
+  lifecycle controls, delegated drill-in, support triage, receivables, the Activity
+  screen, Home needs-attention and portfolio metrics: ❌ NOT BUILT.** Spec §15 steps
+  2–10. Step 2C gave this repo the onboarding facts to READ; every write in that domain
+  is still unbuilt.
 - **Deployment: 0C.1 ✅ EMPIRICALLY ACCEPTED (2026-08-20) · 0C.2 ✅ EMPIRICALLY
   ACCEPTED (2026-08-21).** `.github/workflows/deploy.yml` deploys over GitHub OIDC →
   private S3 → AWS SSM. The real Angular application is live on
@@ -71,8 +82,11 @@ not exist, and this repo renders that truth rather than filling the column:
 - **Subscription** is `Not configured`. The legacy `Restaurant` columns are shown in a
   fenced-off block LABELLED legacy; `legacy_validity_flag` is never rendered as
   Active, Paid, Current, Trial or In good standing.
-- **Owner claim** is `Not tracked yet`. An account existing is not a claim, and Step 2
-  builds the difference.
+- **Owner claim** was `Not tracked yet` — SUPERSEDED by Step 2C, which built the
+  difference. The Owner panel no longer carries that row at all; `onboarding` is the
+  canonical answer and the Onboarding panel is where it is rendered. The
+  `owner.claim_tracked` / `owner.claim_status` aliases remain in the typed model
+  because the server still sends them, and nothing renders them.
 - **TEST tenants now come from the real `Restaurant.is_test`** (backend migration
   `restaurants_app/0057`), not from mock data. See "Primitives".
 
@@ -413,9 +427,10 @@ the port is identical in both modes:
 | `restaurant-workspace.store.ts` | the detail read, scoped to the `/restaurants/:id` route |
 
 **CLOSED UNIONS WHERE THE SERVER HAS ONE, `string` WHERE IT DOES NOT.** Lifecycle state,
-readiness state, audit result and order status are enumerated on the server and are
-enumerated here. `payment_mode` and `readiness.blockers` are `string`, because there is
-no field and no vocabulary yet — a union invented here would be wrong the day one lands.
+readiness state, audit result, order status and all five Step 2C onboarding
+vocabularies are enumerated on the server and are enumerated here. `payment_mode` and
+`readiness.blockers` are `string`, because there is no field and no vocabulary yet — a
+union invented here would be wrong the day one lands.
 
 **THE TRANSPORT NORMALISES NOTHING.** A null `location`, `last_activity_at`,
 `latest_order` and `payment_mode` each say something different from `''` or `0`, and a
@@ -480,8 +495,64 @@ which makes it the single place the portal could start asserting something the d
 cannot support. **The rule is: translate, never upgrade.** `legacy_validity_flag` never
 becomes "Paid"; `not_applicable` never becomes "Ready"; `readiness_not_configured` is
 translated to a sentence about the CHECKLIST, never about the restaurant; an unknown
-blocker or audit action is humanised rather than shown raw or dropped.
+blocker or audit action is humanised rather than shown raw or dropped. Step 2C added
+five more vocabularies under the same rule — `legacy_adopted` becomes "Pre-existing
+restaurant" and never "Imported"; `attested` and `invitation_redeemed` both become
+"Established" while their EVIDENCE lines stay distinct; `not_applicable` never becomes
+"Not issued"; `stale_attestation` becomes "Stale evidence" and never "Established".
 `restaurant.labels.spec.ts` pins each of those directly.
+
+## The Onboarding Projection — spec §15 step 2C, READ ONLY
+
+`RestaurantDetail.onboarding` is the CANONICAL contract for how a restaurant entered the
+admin onboarding domain and who controls it. It arrives inside the EXISTING detail
+payload — there is no `GET /restaurants/<id>/onboarding/`, no second store and no second
+request. The workspace's one-read architecture is unchanged.
+
+It answers **five separate questions, and they stay five.**
+
+| row | field | why it is its own row |
+|---|---|---|
+| Source | `source` | `legacy_adopted` / `admin_created` — where it came from |
+| Recorded in Admin | `recorded_at` | when the ADMIN RECORD appeared, NOT `created_at` |
+| Owner relationship | `owner_relationship.status` | a STRUCTURAL check on owner-role membership |
+| Owner control | `owner_control.status` + `evidence` + `evidence_at` | whether anyone has PROVED control, and by what |
+| Invitation | `invitation.status` | the invitation lifecycle, where invitations apply |
+
+**THE FAILURE MODE IS ANSWERING ONE WITH ANOTHER, ALWAYS UPWARDS.** Structural
+consistency is not control. An administrator's attestation is not an observed sign-in. A
+legacy tenant's `not_applicable` invitation is not a missing one. Evidence recorded
+against a PREVIOUS owner (`stale_attestation`) establishes nothing about the current one.
+And `tracked: false` means the questions were NEVER ASKED — rendering it as "Not
+established" or "Not issued" manufactures a verdict out of an absence of data, which is
+the same defect class as a dead backend presenting as "Invalid credentials."
+
+So: **owner control is never inferred client-side**, there is no combined "Onboarding
+complete" status, and there is deliberately no green success treatment — §10 wants a
+completed state to recede. Warning emphasis is reserved for `stale_attestation`, the
+three owner-relationship inconsistencies and an `expired` invitation, and it is always ON
+TOP of wording that stands without colour (§22).
+
+**Live Baba House is the reference shape**, and its SEMANTICS — not its UUID — are a test
+fixture: tracked, `legacy_adopted`, `consistent`, `not_established`, no evidence,
+invitation `not_applicable`. Nothing in this repo may branch on which restaurant it is.
+
+`recorded_at` and `evidence_at` both go through `formatEat`, like every other timestamp
+here. A null renders `—`.
+
+**IT IS DETAIL-ONLY.** `GET /restaurants/` did not gain onboarding, and `RestaurantRow`
+must not grow it: the directory answers "which restaurants need me", and five more
+per-row states would be five more columns nobody scans.
+
+**THE OWNER PANEL NO LONGER MENTIONS CLAIMS.** It carries name, email, phone and account
+state. `owner.claim_tracked` / `owner.claim_status` are backend compatibility aliases
+that MIRROR `onboarding` (`tracked`, and the owner-control status while tracked); they
+stay in the typed model and nothing renders them. Two panels answering one question is
+how a screen starts disagreeing with itself.
+
+**THERE ARE NO ONBOARDING WRITES IN THIS REPO.** No adopt, no attest, no invite, no
+reissue, no cancel, no owner reassignment, no restaurant creation — and no disabled
+buttons standing in for them. A test asserts Overview ships zero `<button>` elements.
 
 ## The Error Classifier — one place, four cases
 
@@ -723,12 +794,19 @@ an unreachable server shows an operator a portfolio that does not exist, and the
 decisions they take from it are taken against fiction. REAL FAILURE ≠ MOCK DATA.
 
 **THE FIXTURES ARE NOT RICHER THAN THE BACKEND.** `mock-restaurants.fixtures.ts` DERIVES
-readiness, `needs_attention`, payment mode, subscription and owner claim from the same
-rules `restaurant_reads.py` applies, rather than writing pleasant values per row — a
-fixture that cannot disagree with the rule. The corpus covers onboarding-with-attention,
-an ordinary live tenant, a live TEST tenant, suspended, offboarded, open issues and none,
-no admin activity, a null location, a missing owner, a rehearsal (TEST) latest order, no
-orders at all, and enough rows to page at the default 25. The mock also FILTERS and PAGES
+readiness, `needs_attention`, payment mode, subscription, the onboarding projection and
+the owner-claim aliases from the same rules `restaurant_reads.py` applies, rather than
+writing pleasant values per row — a fixture that cannot disagree with the rule. The
+onboarding derivation applies the backend's own consequences: untracked forces every
+nested status to `unavailable`, a legacy adoption's invitation is always
+`not_applicable`, the evidence follows from the control state, and the claim aliases are
+mirrored off `onboarding` rather than written beside it. The corpus covers
+onboarding-with-attention, an ordinary live tenant, a live TEST tenant, suspended,
+offboarded, open issues and none, no admin activity, a null location, a missing owner, a
+rehearsal (TEST) latest order, no orders at all, an UNTRACKED tenant, the live Baba House
+shape, a valid legacy attestation, a redeemed invitation, one pending, one not issued,
+one expired, one cancelled, one superseded, all three owner-relationship inconsistencies
+and a stale attestation — and enough rows to page at the default 25. The mock also FILTERS and PAGES
 server-side, mirroring `apply_directory_filters` and the endpoint's slicing — otherwise
 `npm start` would review a directory that works differently from the deployed one, and
 the pagination arithmetic would never be exercised.

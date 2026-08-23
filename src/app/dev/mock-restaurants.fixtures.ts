@@ -1,7 +1,13 @@
 import {
   ActivityEntry,
   LifecycleState,
+  OnboardingSource,
+  OnboardingSummary,
   OperationsSummary,
+  OwnerControlEvidence,
+  OwnerControlStatus,
+  OwnerInvitationStatus,
+  OwnerRelationshipStatus,
   RestaurantDetail,
   RestaurantOwner,
   RestaurantRow,
@@ -25,7 +31,15 @@ import {
  *                     `restaurant_reads.needs_attention` recognises today
  *   payment mode    — null / unconfigured, because there is no field
  *   subscription    — the legacy Restaurant columns, labelled legacy
- *   owner claim     — `claim_tracked: false`, `claim_status: null`
+ *   onboarding      — the Step 2C projection, with the SERVER's own consequences
+ *                     applied (see `onboarding()` below): untracked means every nested
+ *                     status is `unavailable`, a legacy-adopted restaurant's invitation
+ *                     is `not_applicable` and never `not_issued`, and the evidence
+ *                     follows from the control state rather than being written beside
+ *                     it
+ *   owner claim     — the COMPATIBILITY ALIASES, mirrored off `onboarding` exactly as
+ *                     the backend mirrors them: `claim_tracked` = `onboarding.tracked`,
+ *                     `claim_status` = the owner-control status while tracked
  *
  * Derived rather than written out per row, so a fixture cannot disagree with the rule.
  *
@@ -36,6 +50,13 @@ import {
  * offboarded one, open support issues and none, a restaurant with no admin activity
  * at all, a missing location, a missing owner, a rehearsal (TEST) latest order, a
  * restaurant with no orders — and enough rows to page through at the default 25.
+ *
+ * Step 2C added the onboarding states to that list, because they are exactly the kind
+ * of distinction that is easy to render wrongly and impossible to notice: a tenant the
+ * domain has never heard of, a legacy adoption with no control evidence (the shape live
+ * Baba House returns), a valid administrative attestation, a redeemed invitation, an
+ * invitation still pending, each of the three owner-relationship inconsistencies, and
+ * an attestation that has gone stale under a change of owner.
  */
 
 /** A stable, uuid4-shaped id per fixture. Deterministic so deep links survive reloads. */
@@ -60,6 +81,29 @@ interface Seed {
   readonly legacyValid?: boolean;
   readonly legacyExpiryDaysAhead?: number | null;
   readonly preferredMethod?: string | null;
+  /**
+   * The Step 2C onboarding record, or `null` for a restaurant the domain has never
+   * heard of. Omitted means the commonest real shape: adopted from before the domain
+   * existed, structurally consistent, and no control evidence — which is exactly what
+   * live Baba House returns.
+   *
+   * Only the ANTECEDENTS are written here. Everything the backend derives from them —
+   * the invitation default, the evidence, the nulls that follow from being untracked —
+   * is applied by `onboarding()` below, so a seed cannot state a combination the server
+   * would never produce.
+   */
+  readonly onboarding?: OnboardingSeed | null;
+}
+
+interface OnboardingSeed {
+  readonly source?: OnboardingSource;
+  readonly recordedHoursAgo?: number;
+  readonly relationship?: OwnerRelationshipStatus;
+  readonly control?: OwnerControlStatus;
+  /** Hours ago the evidence was recorded. Ignored where the control state has none. */
+  readonly evidenceHoursAgo?: number;
+  /** Only meaningful for `admin_created`; a legacy adoption is always not applicable. */
+  readonly invitation?: OwnerInvitationStatus;
 }
 
 const SEEDS: readonly Seed[] = [
@@ -74,6 +118,9 @@ const SEEDS: readonly Seed[] = [
     operations: { table_count: 12, usable_table_count: 9, dining_area_count: 2 },
     latestOrderHoursAgo: 5,
     latestOrderTest: true, // A pre-go-live REHEARSAL order: real, commercially invisible.
+    // THE SHAPE LIVE BABA HOUSE RETURNS — adopted, consistent, no control evidence,
+    // and no invitation because none ever applied. Reviewed most often, so it is first.
+    onboarding: { source: 'legacy_adopted', recordedHoursAgo: 26 },
     activity: [
       ['admin.delegation.session_ended', 3, 'success', 'Simon Mugambi'],
       ['admin.delegation.minted', 4, 'success', 'Simon Mugambi'],
@@ -92,6 +139,16 @@ const SEEDS: readonly Seed[] = [
     owner: { name: 'David Okello', email: 'david@kampalabistro.ug', phone_number: '256701552910' },
     operations: { table_count: 24, usable_table_count: 24, dining_area_count: 3 },
     latestOrderHoursAgo: 1,
+    // Created here, invited, and the owner redeemed it — control established by an
+    // OBSERVED act. The invitation stays its own row: `consumed` and established
+    // control are related facts, not one fact said twice.
+    onboarding: {
+      source: 'admin_created',
+      recordedHoursAgo: 900,
+      control: 'invitation_redeemed',
+      evidenceHoursAgo: 880,
+      invitation: 'consumed',
+    },
     activity: [['admin.restaurant.lifecycle_transition', 52, 'success', 'Simon Mugambi']],
     legacyExpiryDaysAhead: 96,
     preferredMethod: 'monthly',
@@ -108,6 +165,14 @@ const SEEDS: readonly Seed[] = [
     operations: { table_count: 4, usable_table_count: 4, dining_area_count: 1 },
     latestOrderHoursAgo: 2,
     latestOrderTest: true,
+    // A VALID LEGACY ATTESTATION: established, but by an administrator's assertion
+    // rather than anything the owner did. The evidence line has to say which.
+    onboarding: {
+      source: 'legacy_adopted',
+      recordedHoursAgo: 300,
+      control: 'attested',
+      evidenceHoursAgo: 290,
+    },
     activity: [['admin.restaurant.lifecycle_transition', 9, 'success', 'Simon Mugambi']],
   },
   {
@@ -124,6 +189,13 @@ const SEEDS: readonly Seed[] = [
     },
     operations: { table_count: 18, usable_table_count: 11, dining_area_count: 2 },
     latestOrderHoursAgo: 15,
+    // The owner of record no longer holds active owner access — a STRUCTURAL problem,
+    // and the panel must state it without guessing which identity is the right one.
+    onboarding: {
+      source: 'legacy_adopted',
+      recordedHoursAgo: 400,
+      relationship: 'missing_owner_membership',
+    },
     activity: [
       ['admin.restaurant.lifecycle_transition', 14, 'success', 'Simon Mugambi'],
       ['admin.auth.elevated', 14, 'success', 'Simon Mugambi'],
@@ -141,6 +213,12 @@ const SEEDS: readonly Seed[] = [
     owner: { name: null, email: 'owner@spekeroadcafe.ug', phone_number: '256759410772' },
     operations: { table_count: 0, usable_table_count: 0, dining_area_count: 0 },
     latestOrderHoursAgo: null, // No orders at all.
+    // Invited and waiting. `pending` is waiting, not failing, so it stays quiet.
+    onboarding: {
+      source: 'admin_created',
+      recordedHoursAgo: 60,
+      invitation: 'pending',
+    },
     activity: [],
   },
   {
@@ -152,6 +230,16 @@ const SEEDS: readonly Seed[] = [
     owner: { name: 'Peter Ssemakula', email: 'peter@gardencityrooftop.ug', phone_number: '256703112884' },
     operations: { table_count: 31, usable_table_count: 28, dining_area_count: 4 },
     latestOrderHoursAgo: 0.4,
+    // TWO problems at once, and they must read as two: more than one active owner, and
+    // an attestation that was recorded against somebody who is no longer the owner.
+    // Neither may be allowed to present the restaurant as controlled.
+    onboarding: {
+      source: 'legacy_adopted',
+      recordedHoursAgo: 1_200,
+      relationship: 'multiple_owner_memberships',
+      control: 'stale_attestation',
+      evidenceHoursAgo: 1_100,
+    },
     activity: [
       ['admin.delegation.session_started', 6, 'success', 'Simon Mugambi'],
       ['admin.delegation.minted', 6, 'success', 'Simon Mugambi'],
@@ -165,6 +253,9 @@ const SEEDS: readonly Seed[] = [
     openIssues: 0,
     lastActivityHoursAgo: 1_900,
     owner: null, // No owner row — the Overview renders that honestly.
+    // NOT REPRESENTED IN THE DOMAIN AT ALL. Every onboarding question reads "Not
+    // tracked" — none of them was evaluated, so none of them may read as a failure.
+    onboarding: null,
     operations: { table_count: 9, usable_table_count: 0, dining_area_count: 1 },
     latestOrderHoursAgo: 2_100,
     activity: [['admin.restaurant.lifecycle_transition', 1_900, 'success', 'Simon Mugambi']],
@@ -180,6 +271,13 @@ const SEEDS: readonly Seed[] = [
     owner: { name: 'Aisha Namusoke', email: 'aisha@bugolobishawarma.ug', phone_number: '256788221094' },
     operations: { table_count: 6, usable_table_count: 5, dining_area_count: 1 },
     latestOrderHoursAgo: null,
+    // Created here and NOT YET INVITED. Distinct from Ankole's "not applicable": this
+    // one has an invitation owing, that one never will.
+    onboarding: {
+      source: 'admin_created',
+      recordedHoursAgo: 34,
+      invitation: 'not_issued',
+    },
     activity: [['admin.auth.login_success', 30, 'success', 'Simon Mugambi']],
   },
   {
@@ -191,6 +289,14 @@ const SEEDS: readonly Seed[] = [
     owner: { name: 'Julius Tumusiime', email: 'julius@mbararasteak.ug', phone_number: '256772660418' },
     operations: { table_count: 15, usable_table_count: 15, dining_area_count: 2 },
     latestOrderHoursAgo: 3,
+    // The invitation lapsed and the two owner records disagree. Both need looking at,
+    // and neither implies the other.
+    onboarding: {
+      source: 'admin_created',
+      recordedHoursAgo: 1_500,
+      relationship: 'owner_membership_mismatch',
+      invitation: 'expired',
+    },
   },
   {
     name: 'Gulu Highway Diner',
@@ -201,6 +307,13 @@ const SEEDS: readonly Seed[] = [
     owner: { name: 'Betty Aciro', email: 'betty@guluhighway.ug', phone_number: '256701998233' },
     operations: { table_count: 10, usable_table_count: 4, dining_area_count: 1 },
     latestOrderHoursAgo: 720,
+    // Deliberately withdrawn. Cancelled and superseded were decisions, not faults, so
+    // they stay quiet — only an EXPIRED invitation asks the operator to act.
+    onboarding: {
+      source: 'admin_created',
+      recordedHoursAgo: 2_000,
+      invitation: 'cancelled',
+    },
     legacyValid: false,
   },
 ];
@@ -239,6 +352,13 @@ const FILLER_SEEDS: readonly Seed[] = FILLER_NAMES.map((name, index) => ({
     dining_area_count: 1 + (index % 3),
   },
   latestOrderHoursAgo: index % 6 === 0 ? null : index + 2,
+  // Plain adoptions, like the fillers themselves — except one. `superseded` is the
+  // only invitation state the named seeds above do not carry, and a state no fixture
+  // ever reaches is a state nobody ever looks at.
+  onboarding:
+    index === 7
+      ? { source: 'admin_created', recordedHoursAgo: 520, invitation: 'superseded' }
+      : { source: 'legacy_adopted', recordedHoursAgo: 800 + index * 13 },
 }));
 
 const ALL_SEEDS: readonly Seed[] = [...SEEDS, ...FILLER_SEEDS];
@@ -283,6 +403,71 @@ function subscription(seed: Seed) {
   };
 }
 
+/**
+ * The Step 2C onboarding projection, deriving everything the backend derives.
+ *
+ * THREE RULES ARE APPLIED HERE RATHER THAN WRITTEN PER SEED, so no fixture can state a
+ * combination the server would never produce:
+ *
+ *   UNTRACKED IS TOTAL. No record means no provenance, no timestamp, and all three
+ *   nested questions `unavailable` — never `not_established`, which would report an
+ *   evaluation that never ran.
+ *
+ *   A LEGACY ADOPTION'S INVITATION IS ALWAYS `not_applicable`. There was no invitation
+ *   to issue, so a seed cannot ask for one; `not_issued` is reachable only from
+ *   `admin_created`.
+ *
+ *   EVIDENCE FOLLOWS THE CONTROL STATE. An attestation (valid or stale) is a
+ *   `legacy_attestation`; established-by-redemption is `invitation_redeemed`; the two
+ *   states with no evidence carry none, and therefore no timestamp either.
+ */
+function onboarding(seed: Seed): OnboardingSummary {
+  if (seed.onboarding === null) return UNTRACKED;
+
+  const settings = seed.onboarding ?? {};
+  const source = settings.source ?? 'legacy_adopted';
+  const control = settings.control ?? 'not_established';
+  const evidence = CONTROL_EVIDENCE[control];
+  const recordedHoursAgo = settings.recordedHoursAgo ?? 500;
+
+  return {
+    tracked: true,
+    source,
+    recorded_at: isoHoursAgo(recordedHoursAgo),
+    owner_relationship: { status: settings.relationship ?? 'consistent' },
+    owner_control: {
+      status: control,
+      evidence,
+      evidence_at:
+        evidence === null ? null : isoHoursAgo(settings.evidenceHoursAgo ?? recordedHoursAgo),
+    },
+    invitation: {
+      status:
+        source === 'legacy_adopted' ? 'not_applicable' : (settings.invitation ?? 'not_issued'),
+    },
+  };
+}
+
+/** Not represented in the domain: every question unevaluated, and none of them failed. */
+const UNTRACKED: OnboardingSummary = {
+  tracked: false,
+  source: null,
+  recorded_at: null,
+  owner_relationship: { status: 'unavailable' },
+  owner_control: { status: 'unavailable', evidence: null, evidence_at: null },
+  invitation: { status: 'unavailable' },
+};
+
+const CONTROL_EVIDENCE: Record<OwnerControlStatus, OwnerControlEvidence | null> = {
+  unavailable: null,
+  not_established: null,
+  attested: 'legacy_attestation',
+  // Stale evidence is still evidence — it is a legacy attestation that has stopped
+  // applying. Hiding it would leave "Stale evidence" with nothing to point at.
+  stale_attestation: 'legacy_attestation',
+  invitation_redeemed: 'invitation_redeemed',
+};
+
 function row(seed: Seed, index: number): RestaurantRow {
   const state = readiness(seed.status);
   return {
@@ -301,7 +486,7 @@ function row(seed: Seed, index: number): RestaurantRow {
   };
 }
 
-function owner(seed: Seed, index: number): RestaurantOwner | null {
+function owner(seed: Seed, index: number, record: OnboardingSummary): RestaurantOwner | null {
   if (seed.owner === null) return null;
   const supplied = seed.owner ?? {};
   return {
@@ -310,9 +495,12 @@ function owner(seed: Seed, index: number): RestaurantOwner | null {
     email: supplied.email ?? null,
     phone_number: supplied.phone_number ?? null,
     is_active: supplied.is_active ?? true,
-    // Never inferred from the existence of a User row — Step 2 builds the difference.
-    claim_tracked: false,
-    claim_status: null,
+    // THE COMPATIBILITY ALIASES, mirrored off the canonical record exactly as the
+    // backend mirrors them — derived rather than written, so the mock cannot show the
+    // two disagreeing when the real payload never would. Nothing in this application
+    // renders them; the Onboarding panel reads `onboarding` directly.
+    claim_tracked: record.tracked,
+    claim_status: record.tracked ? record.owner_control.status : null,
   };
 }
 
@@ -347,12 +535,19 @@ function activity(seed: Seed, index: number): readonly ActivityEntry[] {
 
 function detail(seed: Seed, index: number): RestaurantDetail {
   const base = row(seed, index);
+  const record = onboarding(seed);
   return {
     ...base,
     // Read off the lifecycle matrix, exactly as `lifecycle.allowed_targets` sorts it.
     allowed_transitions: ALLOWED_TRANSITIONS[seed.status],
+    // WHEN THE RESTAURANT WAS CREATED, which is not when the onboarding record was.
+    // Deliberately older than every `recorded_at` above, because for a legacy adoption
+    // it genuinely is — and a fixture where the two coincide would let the panel label
+    // one as the other without anyone noticing.
     created_at: isoHoursAgo(4_000 + index * 40),
-    owner: owner(seed, index),
+    owner: owner(seed, index, record),
+    // DETAIL ONLY. `row()` above must never gain this — the directory contract did not.
+    onboarding: record,
     support: { open_issue_count: base.open_issue_count },
     operations: operations(seed, index),
     recent_activity: activity(seed, index),

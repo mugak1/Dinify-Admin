@@ -115,10 +115,25 @@ export interface RestaurantRow extends RestaurantCommon {
 /**
  * The owner, from `serialize_owner`. `null` when the restaurant has no owner row.
  *
- * `claim_tracked` is false and `claim_status` is null for everyone, and they are
- * present rather than absent for a reason: an account existing is not the same as an
- * owner having claimed it. Step 2 builds the difference; until then the portal says
- * "not tracked yet" instead of inferring a claim from a `User` row.
+ * ── `claim_tracked` / `claim_status` ARE BACKEND COMPATIBILITY ALIASES ────────────
+ *
+ * They are no longer always false/null: Step 2C gave the admin plane a real onboarding
+ * domain, and these two fields now MIRROR it —
+ *
+ *   `claim_tracked`  mirrors `RestaurantDetail.onboarding.tracked`
+ *   `claim_status`   mirrors `onboarding.owner_control.status` while tracked, null
+ *                    otherwise
+ *
+ * `RestaurantDetail.onboarding` is the CANONICAL, richer contract, and it is what this
+ * application renders: it also carries provenance, the owner-relationship check, the
+ * evidence behind owner control and the invitation state, none of which these two
+ * fields can express. The aliases are kept in the type because the server still sends
+ * them and a consumer elsewhere may still read them — NOT so a second screen can grow
+ * its own answer to a question `onboarding` already answers. Two sources of truth for
+ * one fact is how the portal starts disagreeing with itself.
+ *
+ * Do not widen them, do not derive presentation from them, and do not render them
+ * alongside the onboarding panel.
  */
 export interface RestaurantOwner {
   readonly id: string;
@@ -180,12 +195,123 @@ export interface ActivityEntry {
   readonly actor: string | null;
 }
 
+/**
+ * ══ THE ADMIN ONBOARDING DOMAIN (Step 2C) ═════════════════════════════════════════
+ *
+ * Five closed vocabularies the backend spells exactly, mirroring the Step 2C contract
+ * that is already merged, deployed and empirically accepted. They are enumerated here
+ * for the same reason lifecycle state is: a state the server grows becomes a compile
+ * error rather than a blank cell.
+ *
+ * WHAT THIS DOMAIN IS FOR. Before Step 2C the portal could not tell "this restaurant
+ * has an owner row" from "somebody demonstrably controls this restaurant's owner
+ * account", so it said neither and rendered "Not tracked yet" for everyone. The server
+ * can now distinguish, separately:
+ *
+ *   - whether the restaurant is represented in the onboarding domain at all;
+ *   - HOW it got there (created here, or adopted from before the domain existed);
+ *   - whether `Restaurant.owner` agrees with who actually holds active owner access;
+ *   - whether control of the CURRENT owner is established, and by WHAT evidence;
+ *   - the invitation lifecycle, where invitations apply at all.
+ *
+ * Those are five different questions. Nothing in this application may answer one of
+ * them using another's value — see `restaurant.labels.ts`.
+ */
+
+/** How a restaurant entered the admin onboarding domain. */
+export type OnboardingSource = 'admin_created' | 'legacy_adopted';
+
+/**
+ * Whether `Restaurant.owner` agrees with active owner-role membership. A STRUCTURAL
+ * check about roles — it says nothing about whether anyone controls the account.
+ */
+export type OwnerRelationshipStatus =
+  | 'unavailable'
+  | 'consistent'
+  | 'missing_owner_membership'
+  | 'multiple_owner_memberships'
+  | 'owner_membership_mismatch';
+
+/**
+ * Whether control of the CURRENT owner's account is established.
+ *
+ * `attested` and `invitation_redeemed` are both established, by different evidence —
+ * an administrator's attestation is not an observed sign-in, and the portal must not
+ * describe one as the other. `stale_attestation` is evidence that exists but applies
+ * to a PREVIOUS owner, which establishes nothing about the current one.
+ */
+export type OwnerControlStatus =
+  | 'unavailable'
+  | 'not_established'
+  | 'attested'
+  | 'invitation_redeemed'
+  | 'stale_attestation';
+
+/** What established (or purported to establish) owner control. */
+export type OwnerControlEvidence = 'legacy_attestation' | 'invitation_redeemed';
+
+/**
+ * The owner-invitation lifecycle.
+ *
+ * `not_applicable` and `not_issued` ARE DIFFERENT FACTS and must never be collapsed:
+ * a legacy-adopted restaurant never had an invitation to issue, while an
+ * admin-created one has simply not been sent theirs yet. Reading the first as the
+ * second invents a missing step for every restaurant that predates the domain.
+ */
+export type OwnerInvitationStatus =
+  | 'unavailable'
+  | 'not_applicable'
+  | 'not_issued'
+  | 'pending'
+  | 'expired'
+  | 'consumed'
+  | 'cancelled'
+  | 'superseded';
+
+/**
+ * The onboarding projection carried by the DETAIL read.
+ *
+ * `tracked` is false for a restaurant the domain holds no record of; `source` and
+ * `recorded_at` are then null and the three nested statuses are `unavailable`. That is
+ * a statement that the questions have NOT BEEN EVALUATED — not that they were
+ * evaluated and failed.
+ *
+ * `recorded_at` IS NOT THE RESTAURANT'S CREATION DATE. It is when the restaurant
+ * entered the ADMIN ONBOARDING DOMAIN, which for a legacy-adopted tenant is long after
+ * it started trading. `RestaurantDetail.created_at` is the other one.
+ */
+export interface OnboardingSummary {
+  readonly tracked: boolean;
+  readonly source: OnboardingSource | null;
+  readonly recorded_at: string | null;
+
+  readonly owner_relationship: {
+    readonly status: OwnerRelationshipStatus;
+  };
+
+  readonly owner_control: {
+    readonly status: OwnerControlStatus;
+    readonly evidence: OwnerControlEvidence | null;
+    readonly evidence_at: string | null;
+  };
+
+  readonly invitation: {
+    readonly status: OwnerInvitationStatus;
+  };
+}
+
 /** `GET /restaurants/<uuid>/` — the workspace header and the Overview tab. */
 export interface RestaurantDetail extends RestaurantCommon {
   /** Read off the lifecycle service. Step 4 turns these into controls; not here. */
   readonly allowed_transitions: readonly LifecycleState[];
   readonly created_at: string | null;
   readonly owner: RestaurantOwner | null;
+  /**
+   * DETAIL ONLY, and deliberately so. `GET /restaurants/` did not gain onboarding —
+   * the directory answers "which restaurants need me", and five more per-row states
+   * would be five more columns nobody scans. `RestaurantRow` must not grow this.
+   */
+  readonly onboarding: OnboardingSummary;
   readonly support: { readonly open_issue_count: number };
   readonly operations: OperationsSummary;
   readonly recent_activity: readonly ActivityEntry[];

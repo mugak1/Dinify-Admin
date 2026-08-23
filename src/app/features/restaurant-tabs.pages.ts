@@ -7,7 +7,19 @@ import {
   activityResultIsNotable,
   activityResultLabel,
   NO_VALUE,
+  ONBOARDING_UNTRACKED_NOTE,
+  onboardingSourceLabel,
+  onboardingSourceNote,
   orderStatusLabel,
+  ownerControlEvidenceLabel,
+  ownerControlIsNotable,
+  ownerControlLabel,
+  ownerControlNote,
+  ownerInvitationIsNotable,
+  ownerInvitationLabel,
+  ownerRelationshipIsNotable,
+  ownerRelationshipLabel,
+  ownerRelationshipNote,
   paymentModeLabel,
   readinessBlockerLabel,
   readinessLabel,
@@ -31,6 +43,21 @@ const PANEL = 'rounded-lg bg-surface p-6 ring-1 ring-line';
 /** A definition-list row. §16 asks for density, not four oversized KPI cards. */
 const TERM = 'text-admin-label text-ink-muted';
 const DEFINITION = 'text-admin-body text-ink';
+
+/**
+ * The same row, for a value an operator has to look at.
+ *
+ * §16's warning hue means "careful", not "broken", and there is deliberately no
+ * matching success treatment: §10 asks a completed state to RECEDE. `consistent` and
+ * `Established` render as ordinary values, and nothing on this screen is green.
+ *
+ * COLOUR IS NEVER THE ONLY SIGNAL (§22). Every notable value here is a phrase that
+ * reads as a problem on its own — "Stale evidence", "Owner mismatch", "Expired" — and
+ * each is accompanied by prose saying what it means.
+ */
+const DEFINITION_NOTABLE = 'text-admin-body text-admin-warning';
+const NOTE = 'mt-2 max-w-prose text-admin-meta text-ink-subtle';
+const NOTE_NOTABLE = 'mt-2 max-w-prose text-admin-meta text-admin-warning';
 
 @Component({
   selector: 'app-restaurant-overview-tab',
@@ -79,8 +106,16 @@ const DEFINITION = 'text-admin-body text-ink';
 
         <div class="grid gap-4 md:grid-cols-2">
           <!-- B. OWNER ─────────────────────────────────────────────────────────────
-               Safe contact fields only, plus the claim state the backend explicitly
-               says it does not track. An account existing is not a claim. -->
+               WHO the owner is: identity, contact and account state. Nothing about
+               claims, control or invitations.
+
+               It used to carry an "Owner claim" row reading "Not tracked yet", from
+               the compatibility aliases owner.claim_tracked / owner.claim_status.
+               Step 2C made that both wrong and redundant — wrong because a
+               legacy-adopted tenant IS tracked and its control reads "Not established",
+               which is not the same statement, and redundant because the Onboarding
+               panel now answers it properly. Two panels answering one question is how a
+               screen starts disagreeing with itself, so this one stopped. -->
           <section [class]="panel" aria-labelledby="owner-heading">
             <h2 id="owner-heading" class="text-admin-section text-ink">Owner</h2>
             @if (data.owner; as owner) {
@@ -104,24 +139,98 @@ const DEFINITION = 'text-admin-body text-ink';
                   <dt [class]="term">Account</dt>
                   <dd [class]="definition">{{ owner.is_active ? 'Active' : 'Deactivated' }}</dd>
                 </div>
-
-                <div class="flex items-baseline justify-between gap-4">
-                  <dt [class]="term">Owner claim</dt>
-                  <dd [class]="definition">
-                    {{ owner.claim_tracked ? (owner.claim_status ?? noValue) : 'Not tracked yet' }}
-                  </dd>
-                </div>
               </dl>
-              @if (!owner.claim_tracked) {
-                <p class="mt-2 max-w-prose text-admin-meta text-ink-subtle">
-                  There is no owner-invitation record yet, so whether this owner has claimed
-                  their own account is not something the platform can answer.
-                </p>
-              }
             } @else {
               <p class="mt-2 text-admin-body text-ink-muted">
                 No owner account is attached to this restaurant.
               </p>
+            }
+          </section>
+
+          <!-- B2. ONBOARDING ───────────────────────────────────────────────────────
+               THE CANONICAL PRESENTATION of the Step 2C projection, beside Owner
+               because the two are read together and apart from it because they answer
+               different questions.
+
+               FIVE ROWS, AND THEY STAY FIVE. Provenance, when the admin record
+               appeared, the structural owner check, whether control of the CURRENT
+               owner is established, and the invitation. Collapsing them into one
+               "Onboarding complete" status would fuse facts that routinely disagree:
+               a restaurant can be consistent and uncontrolled, or controlled by an
+               attestation that no longer applies.
+
+               EVERY VALUE IS THE SERVER'S. Nothing here is inferred, defaulted or
+               strengthened, and there is no writer anywhere in this panel — no adopt,
+               no attest, no invite, no resend. Reading the truth is this slice. -->
+          <section [class]="panel" aria-labelledby="onboarding-heading">
+            <h2 id="onboarding-heading" class="text-admin-section text-ink">Onboarding</h2>
+            <dl class="mt-3 space-y-1.5">
+              <div class="flex items-baseline justify-between gap-4">
+                <dt [class]="term">Source</dt>
+                <dd [class]="definition">{{ onboardingSource() }}</dd>
+              </div>
+
+              <div class="flex items-baseline justify-between gap-4">
+                <!-- Named for what it is. NOT "Created" — for a pre-existing
+                     restaurant this instant is long after it started trading. The
+                     restaurant's own creation date is a different field. -->
+                <dt [class]="term">Recorded in Admin</dt>
+                <dd [class]="definition">{{ recordedAt() }}</dd>
+              </div>
+
+              <div class="flex items-baseline justify-between gap-4">
+                <dt [class]="term">Owner relationship</dt>
+                <dd [class]="ownerRelationshipNotable() ? definitionNotable : definition">
+                  {{ ownerRelationship() }}
+                </dd>
+              </div>
+
+              <div class="flex items-baseline justify-between gap-4">
+                <dt [class]="term">Owner control</dt>
+                <dd [class]="ownerControlNotable() ? definitionNotable : definition">
+                  {{ ownerControl() }}
+                </dd>
+              </div>
+
+              <div class="flex items-baseline justify-between gap-4">
+                <dt [class]="term">Invitation</dt>
+                <dd [class]="invitationNotable() ? definitionNotable : definition">
+                  {{ invitation() }}
+                </dd>
+              </div>
+            </dl>
+
+            <!-- The explanatory copy, in the order of the rows it explains. Each line
+                 is a sentence about ONE row; they are never joined, because "how this
+                 restaurant got here" and "nobody has proved they control it" are
+                 different facts an operator acts on differently. -->
+            @if (untracked()) {
+              <p [class]="note">{{ untrackedNote }}</p>
+            } @else {
+              @if (sourceNote(); as copy) {
+                <p [class]="note">{{ copy }}</p>
+              }
+
+              @if (relationshipNote(); as copy) {
+                <p [class]="noteNotable">{{ copy }}</p>
+              }
+
+              <!-- The EVIDENCE line. It names what established control and when —
+                   an administrator's attestation and an owner's redemption are
+                   different acts, and the portal never describes one as the other. -->
+              @if (evidenceLabel(); as evidence) {
+                <p [class]="ownerControlNotable() ? noteNotable : note">
+                  {{ evidence }}
+                  @if (evidenceAt(); as at) {
+                    <span aria-hidden="true"> · </span>
+                    <span>{{ at }}</span>
+                  }
+                </p>
+              }
+
+              @if (controlNote(); as copy) {
+                <p [class]="ownerControlNotable() ? noteNotable : note">{{ copy }}</p>
+              }
             }
           </section>
 
@@ -298,7 +407,11 @@ export class RestaurantOverviewTab {
   protected readonly panel = PANEL;
   protected readonly term = TERM;
   protected readonly definition = DEFINITION;
+  protected readonly definitionNotable = DEFINITION_NOTABLE;
+  protected readonly note = NOTE;
+  protected readonly noteNotable = NOTE_NOTABLE;
   protected readonly noValue = NO_VALUE;
+  protected readonly untrackedNote = ONBOARDING_UNTRACKED_NOTE;
 
   protected readonly blockerLabel = readinessBlockerLabel;
   protected readonly orderStatus = orderStatusLabel;
@@ -307,6 +420,85 @@ export class RestaurantOverviewTab {
   protected readonly resultIsNotable = activityResultIsNotable;
   protected readonly subscriptionMethod = subscriptionMethodLabel;
   protected readonly time = formatEat;
+
+  // --- onboarding (Step 2C) -------------------------------------------------------
+  //
+  // Every one of these is a projection of a value the server already sent. There is no
+  // client-side inference anywhere below: the panel never derives control from the
+  // relationship, never derives an invitation state from the source, and never fills a
+  // missing value with a friendlier one. Where the server says nothing, so does this.
+
+  private readonly onboarding = computed(() => this.restaurant()?.onboarding ?? null);
+
+  /** The domain holds no record. Distinct from every evaluated state — see the labels. */
+  protected readonly untracked = computed(() => this.onboarding()?.tracked === false);
+
+  protected readonly onboardingSource = computed(() => {
+    const summary = this.onboarding();
+    return summary ? onboardingSourceLabel(summary.source) : NO_VALUE;
+  });
+
+  protected readonly sourceNote = computed(() => {
+    const summary = this.onboarding();
+    return summary ? onboardingSourceNote(summary.source) : null;
+  });
+
+  /** EAT-labelled like every other timestamp, and `—` when there is none. */
+  protected readonly recordedAt = computed(() => formatEat(this.onboarding()?.recorded_at));
+
+  protected readonly ownerRelationship = computed(() => {
+    const summary = this.onboarding();
+    return summary ? ownerRelationshipLabel(summary.owner_relationship.status) : NO_VALUE;
+  });
+
+  protected readonly relationshipNote = computed(() => {
+    const summary = this.onboarding();
+    return summary ? ownerRelationshipNote(summary.owner_relationship.status) : null;
+  });
+
+  protected readonly ownerRelationshipNotable = computed(() => {
+    const summary = this.onboarding();
+    return summary ? ownerRelationshipIsNotable(summary.owner_relationship.status) : false;
+  });
+
+  protected readonly ownerControl = computed(() => {
+    const summary = this.onboarding();
+    return summary ? ownerControlLabel(summary.owner_control.status) : NO_VALUE;
+  });
+
+  protected readonly controlNote = computed(() => {
+    const summary = this.onboarding();
+    return summary ? ownerControlNote(summary.owner_control.status) : null;
+  });
+
+  protected readonly ownerControlNotable = computed(() => {
+    const summary = this.onboarding();
+    return summary ? ownerControlIsNotable(summary.owner_control.status) : false;
+  });
+
+  protected readonly evidenceLabel = computed(() => {
+    const summary = this.onboarding();
+    return summary ? ownerControlEvidenceLabel(summary.owner_control.evidence) : null;
+  });
+
+  /**
+   * Rendered only beside a named evidence. A bare timestamp with nothing to attach it
+   * to would invite the reader to attach it to whatever row is nearest.
+   */
+  protected readonly evidenceAt = computed(() => {
+    const at = this.onboarding()?.owner_control.evidence_at;
+    return at ? formatEat(at) : null;
+  });
+
+  protected readonly invitation = computed(() => {
+    const summary = this.onboarding();
+    return summary ? ownerInvitationLabel(summary.invitation.status) : NO_VALUE;
+  });
+
+  protected readonly invitationNotable = computed(() => {
+    const summary = this.onboarding();
+    return summary ? ownerInvitationIsNotable(summary.invitation.status) : false;
+  });
 
   protected readonly readiness = computed(() => {
     const data = this.restaurant();

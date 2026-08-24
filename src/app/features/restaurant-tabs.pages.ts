@@ -20,11 +20,16 @@ import {
   ownerRelationshipIsNotable,
   ownerRelationshipLabel,
   ownerRelationshipNote,
-  paymentModeLabel,
+  paymentCollectionModeLabel,
+  paymentCollectionModeNote,
+  paymentTimingLabel,
   readinessBlockerLabel,
   readinessLabel,
+  SUBSCRIPTION_TERMS_NOTE,
   subscriptionMethodLabel,
+  subscriptionTermsLabel,
 } from '../core/restaurants/restaurant.labels';
+import { CommercialAxis } from '../core/restaurants/restaurant.model';
 import { RestaurantWorkspaceStore } from '../core/restaurants/restaurant-workspace.store';
 import { StatusPillComponent } from '../ui/status-pill.component';
 
@@ -58,6 +63,19 @@ const DEFINITION = 'text-admin-body text-ink';
 const DEFINITION_NOTABLE = 'text-admin-body text-admin-warning';
 const NOTE = 'mt-2 max-w-prose text-admin-meta text-ink-subtle';
 const NOTE_NOTABLE = 'mt-2 max-w-prose text-admin-meta text-admin-warning';
+
+/**
+ * When a commercial axis was decided, EAT-labelled (§16) — or null where there is no
+ * decision to timestamp.
+ *
+ * Guarded on the VALUE rather than on `configured`, matching every other reader in this
+ * slice: what is displayed is what is checked, so a server that ever sent the two
+ * inconsistently would degrade rather than render a timestamp under "Not configured".
+ */
+function setAtLabel(axis: CommercialAxis<unknown> | undefined): string | null {
+  if (!axis || axis.value === null || !axis.set_at) return null;
+  return formatEat(axis.set_at);
+}
 
 @Component({
   selector: 'app-restaurant-overview-tab',
@@ -235,25 +253,66 @@ const NOTE_NOTABLE = 'mt-2 max-w-prose text-admin-meta text-admin-warning';
           </section>
 
           <!-- C + D. COMMERCIAL ─────────────────────────────────────────────────────
-               Payment mode and subscription, both reported as the backend reports
-               them. The legacy columns appear as LEGACY and are never restated as a
-               billing status: the validity flag is a bare boolean nothing maintains,
-               and calling it Paid would stop an operator chasing an invoice that was
-               never raised. -->
+               THE CANONICAL commercial OBJECT, and nothing else, above the fence.
+
+               Three INDEPENDENT facts get three rows, because they are three separate
+               decisions with three separate lifetimes and every partial combination is
+               a real state. There is deliberately no combined "Commercial configured"
+               verdict and no green success treatment: §10 asks a completed state to
+               recede, and a recorded price is not an achievement.
+
+               These rows read the same commercial object the DIRECTORY reads, through
+               the same label functions — one read, one vocabulary, so the row and this
+               header cannot disagree.
+
+               THE LEGACY COLUMNS ARE BELOW THE FENCE and are never consulted here. Where
+               they disagree with commercial — and payment_mode is frozen null while
+               has_commercial_subscription is frozen false, so for any configured
+               restaurant they DO — the canonical object wins. -->
           <section [class]="panel" aria-labelledby="commercial-heading">
             <h2 id="commercial-heading" class="text-admin-section text-ink">Commercial</h2>
             <dl class="mt-3 space-y-1.5">
+              <!-- WHEN the diner pays, relative to eating. A service-model fact. -->
               <div class="flex items-baseline justify-between gap-4">
-                <dt [class]="term">Payment mode</dt>
-                <dd [class]="definition">{{ paymentMode() }}</dd>
+                <dt [class]="term">Payment timing</dt>
+                <dd class="text-right">
+                  <span [class]="definition">{{ paymentTiming() }}</span>
+                  @if (paymentTimingSetAt(); as when) {
+                    <!-- WHEN THE DECISION WAS RECORDED — named precisely, because this
+                         is not when the terms took effect and not when anything was
+                         agreed. -->
+                    <span class="block text-admin-meta text-ink-subtle">Set {{ when }}</span>
+                  }
+                </dd>
               </div>
 
+              <!-- WHO takes the money. A custody fact, independent of the row above. -->
               <div class="flex items-baseline justify-between gap-4">
-                <dt [class]="term">Subscription</dt>
-                <dd [class]="definition">
-                  {{
-                    data.subscription.has_commercial_subscription ? 'Active' : 'Not configured'
-                  }}
+                <dt [class]="term">Collection mode</dt>
+                <dd class="text-right">
+                  <span [class]="definition">{{ collectionMode() }}</span>
+                  @if (collectionModeSetAt(); as when) {
+                    <span class="block text-admin-meta text-ink-subtle">Set {{ when }}</span>
+                  }
+                </dd>
+              </div>
+
+              <!-- WHAT DINIFY HAS WRITTEN DOWN that this restaurant pays it. The price
+                   and the recurrence themselves — never a status word. -->
+              <div class="flex items-baseline justify-between gap-4">
+                <dt [class]="term">Subscription terms</dt>
+                <dd class="text-right">
+                  <span [class]="definition">{{ subscriptionTerms() }}</span>
+                  @if (termsEffectiveFrom(); as when) {
+                    <span class="block text-admin-meta text-ink-subtle"
+                      >Effective from {{ when }}</span
+                    >
+                  }
+                  @if (termsRecordedAt(); as when) {
+                    <!-- RECORDED, not agreed, signed, activated or paid. Dinify wrote
+                         this down; nobody countersigned it. -->
+                    <span class="block text-admin-meta text-ink-subtle">Recorded {{ when }}</span>
+                  }
                 </dd>
               </div>
 
@@ -263,20 +322,33 @@ const NOTE_NOTABLE = 'mt-2 max-w-prose text-admin-meta text-admin-warning';
               </div>
             </dl>
 
-            @if (!data.payment_mode_configured) {
-              <p class="mt-2 max-w-prose text-admin-meta text-ink-subtle">
-                No commercial payment mode is recorded for this restaurant yet.
-              </p>
+            @if (collectionNote(); as copy) {
+              <!-- The one sentence each configured custody mode needs: offline is read
+                   DOWN as cash-only or unfinished, psp_online is read UP as a provider
+                   being connected. Both readings are wrong. -->
+              <p [class]="note">{{ copy }}</p>
             }
 
-            <!-- The legacy block, clearly fenced off. Shown because an operator
-                 reconciling an old record will want it, labelled so nobody mistakes
-                 it for the commercial subscription that does not exist. -->
+            @if (hasSubscriptionTerms()) {
+              <p [class]="note">{{ termsNote }}</p>
+            }
+
+            <!-- THE LEGACY BLOCK, BELOW A LITERAL FENCE. Kept because an operator
+                 reconciling an old record will want these three columns, which do still
+                 vary per restaurant — and kept unmistakably SUBORDINATE, because that is
+                 the whole reason it is safe to keep at all.
+
+                 It never overrides and never stands in for the canonical rows above:
+                 nothing here is a fallback when the commercial state is unconfigured, and the
+                 validity flag is a bare boolean that defaults true and that nothing
+                 maintains. Calling it Paid would stop an operator chasing an invoice
+                 that was never raised. -->
             <div class="mt-4 border-t border-line pt-3">
               <h3 class="text-admin-micro uppercase text-ink-subtle">Legacy record</h3>
               <p class="mt-1 max-w-prose text-admin-meta text-ink-subtle">
-                Columns carried over from before subscriptions were modelled. Not evidence
-                that any invoice exists.
+                Superseded columns, carried over from before the commercial domain existed.
+                Kept for reconciliation only. Where these disagree with the commercial
+                state above, the state above is authoritative.
               </p>
               <dl class="mt-2 space-y-1.5">
                 <div class="flex items-baseline justify-between gap-4">
@@ -419,6 +491,7 @@ export class RestaurantOverviewTab {
   protected readonly resultLabel = activityResultLabel;
   protected readonly resultIsNotable = activityResultIsNotable;
   protected readonly subscriptionMethod = subscriptionMethodLabel;
+  protected readonly termsNote = SUBSCRIPTION_TERMS_NOTE;
   protected readonly time = formatEat;
 
   // --- onboarding (Step 2C) -------------------------------------------------------
@@ -505,9 +578,64 @@ export class RestaurantOverviewTab {
     return data ? readinessLabel(data.readiness) : NO_VALUE;
   });
 
-  protected readonly paymentMode = computed(() => {
-    const data = this.restaurant();
-    return data ? paymentModeLabel(data) : NO_VALUE;
+  // --- commercial (Step 3E.1) -----------------------------------------------------
+  //
+  // Pure projections of the canonical `commercial` object, exactly as the onboarding
+  // block above projects `onboarding`. NOTHING HERE INFERS: no axis is derived from the
+  // other, terms are never derived from either axis, and none of the three is ever
+  // derived from a legacy field, from lifecycle state or from `is_test`. Where the
+  // server says nothing, so does this.
+
+  private readonly commercial = computed(() => this.restaurant()?.commercial ?? null);
+
+  protected readonly paymentTiming = computed(() => {
+    const summary = this.commercial();
+    return summary ? paymentTimingLabel(summary.payment_timing.value) : NO_VALUE;
+  });
+
+  /**
+   * Rendered only where the axis is CONFIGURED.
+   *
+   * The server nulls `set_at` alongside an unconfigured value, so this is belt and
+   * braces — but a bare timestamp under "Not configured" would invite the reader to
+   * attach it to a decision that was never made.
+   */
+  protected readonly paymentTimingSetAt = computed(() => setAtLabel(this.commercial()?.payment_timing));
+
+  protected readonly collectionMode = computed(() => {
+    const summary = this.commercial();
+    return summary ? paymentCollectionModeLabel(summary.payment_collection_mode.value) : NO_VALUE;
+  });
+
+  protected readonly collectionModeSetAt = computed(() =>
+    setAtLabel(this.commercial()?.payment_collection_mode),
+  );
+
+  protected readonly collectionNote = computed(() => {
+    const summary = this.commercial();
+    return summary ? paymentCollectionModeNote(summary.payment_collection_mode.value) : null;
+  });
+
+  protected readonly subscriptionTerms = computed(() => subscriptionTermsLabel(this.commercial()));
+
+  /**
+   * Guarded on `current` rather than on `configured`, like the label itself: what is
+   * rendered is what is checked.
+   */
+  private readonly terms = computed(() => this.commercial()?.subscription_terms.current ?? null);
+
+  protected readonly hasSubscriptionTerms = computed(() => this.terms() !== null);
+
+  /** WHEN THE TERMS BECAME APPLICABLE. Not when they were written down. */
+  protected readonly termsEffectiveFrom = computed(() => {
+    const at = this.terms()?.effective_from;
+    return at ? formatEat(at) : null;
+  });
+
+  /** WHEN DINIFY WROTE THEM DOWN. Never agreed, signed, activated or paid. */
+  protected readonly termsRecordedAt = computed(() => {
+    const at = this.terms()?.recorded_at;
+    return at ? formatEat(at) : null;
   });
 
   /** Always EAT-labelled (§16) — never the browser's clock, never an unlabelled one. */

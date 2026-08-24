@@ -1,5 +1,7 @@
 import {
   ActivityEntry,
+  BillingIntervalUnit,
+  CommercialSummary,
   LifecycleState,
   OnboardingSource,
   OnboardingSummary,
@@ -8,6 +10,8 @@ import {
   OwnerControlStatus,
   OwnerInvitationStatus,
   OwnerRelationshipStatus,
+  PaymentCollectionMode,
+  PaymentTiming,
   RestaurantDetail,
   RestaurantOwner,
   RestaurantRow,
@@ -29,8 +33,14 @@ import {
  *                     (the seam fails closed), `not_applicable` otherwise
  *   needs_attention — onboarding AND readiness not ready, the one condition
  *                     `restaurant_reads.needs_attention` recognises today
- *   payment mode    — null / unconfigured, because there is no field
- *   subscription    — the legacy Restaurant columns, labelled legacy
+ *   commercial      — the Step 3E.1 canonical projection, deriving what the server
+ *                     derives (see `commercial()` below): each axis's `configured` from
+ *                     its VALUE, and `subscription_terms.configured` from whether an
+ *                     open terms row exists — never written beside them
+ *   payment mode    — FROZEN null / unconfigured, because the server freezes it
+ *   subscription    — the legacy Restaurant columns, with `has_commercial_subscription`
+ *                     FROZEN false exactly as the server freezes it, even for a
+ *                     restaurant that has open terms
  *   onboarding      — the Step 2C projection, with the SERVER's own consequences
  *                     applied (see `onboarding()` below): untracked means every nested
  *                     status is `unavailable`, a legacy-adopted restaurant's invitation
@@ -57,6 +67,24 @@ import {
  * Baba House returns), a valid administrative attestation, a redeemed invitation, an
  * invitation still pending, each of the three owner-relationship inconsistencies, and
  * an attestation that has gone stale under a change of owner.
+ *
+ * Step 3E.1 added the commercial states for the same reason: nothing configured, both
+ * service axes configured, TIMING ONLY, COLLECTION ONLY, open terms, ZERO-PRICED terms,
+ * and a billing interval whose count is not 1. The two partial combinations are the
+ * ones a review would otherwise never see, and they are exactly what a collapsed
+ * "Configured / Not configured" cell would hide.
+ *
+ * ── EVERY CONFIGURED ROW IS ALSO A CANONICAL-VERSUS-LEGACY CONTRADICTION ──────────
+ *
+ * That is not a fixture contrivance — it is what the wire actually carries. The server
+ * FREEZES `payment_mode_configured` false and `has_commercial_subscription` false while
+ * `commercial` says otherwise, so every seed below with a configured axis or an open
+ * terms row is a live disagreement between the two contracts, and the screens must
+ * follow `commercial`. `legacyValid` runs the contradiction the other way: a restaurant
+ * with NO commercial configuration whose legacy validity flag is true must still read
+ * as not configured, and must never read as Active. `Speke Road Cafe` and
+ * `Bugolobi Shawarma Bar` carry that direction — both leave `legacyValid` at its
+ * default of true while recording no commercial state at all.
  */
 
 /** A stable, uuid4-shaped id per fixture. Deterministic so deep links survive reloads. */
@@ -93,6 +121,39 @@ interface Seed {
    * would never produce.
    */
   readonly onboarding?: OnboardingSeed | null;
+  /**
+   * The Step 3E.1 commercial antecedents. Omitted means NOTHING CONFIGURED — no timing,
+   * no collection mode, no terms — which is the honest default for a corpus whose
+   * restaurants mostly predate the domain.
+   *
+   * Only the antecedents are written here. Everything the backend DERIVES from them —
+   * each axis's `configured` flag, its `set_at`, `subscription_terms.configured`, and
+   * the nulls that follow from an axis being undecided — is applied by `commercial()`
+   * below, so a seed cannot state a combination the server would never produce.
+   */
+  readonly commercial?: CommercialSeed;
+}
+
+interface CommercialSeed {
+  /** Undecided when omitted. Independent of `collection` — every pairing is real. */
+  readonly timing?: PaymentTiming;
+  readonly timingSetHoursAgo?: number;
+  /** Undecided when omitted. Independent of `timing`. */
+  readonly collection?: PaymentCollectionMode;
+  readonly collectionSetHoursAgo?: number;
+  /** An OPEN terms row, or none. Independent of both axes above. */
+  readonly terms?: TermsSeed;
+}
+
+interface TermsSeed {
+  /** A DECIMAL STRING, exactly as the backend serialises a `Decimal`. Never a number. */
+  readonly amount: string;
+  /** ISO-4217. Defaults to the launch market, but is never assumed downstream. */
+  readonly currency?: string;
+  readonly unit?: BillingIntervalUnit;
+  readonly count?: number;
+  readonly effectiveHoursAgo?: number;
+  readonly recordedHoursAgo?: number;
 }
 
 interface OnboardingSeed {
@@ -121,6 +182,9 @@ const SEEDS: readonly Seed[] = [
     // THE SHAPE LIVE BABA HOUSE RETURNS — adopted, consistent, no control evidence,
     // and no invitation because none ever applied. Reviewed most often, so it is first.
     onboarding: { source: 'legacy_adopted', recordedHoursAgo: 26 },
+    // PARTIAL: the service model is decided, custody is not. A real mid-onboarding
+    // state, and the one a collapsed "Configured / Not configured" cell would erase.
+    commercial: { timing: 'pay_first', timingSetHoursAgo: 20 },
     activity: [
       ['admin.delegation.session_ended', 3, 'success', 'Simon Mugambi'],
       ['admin.delegation.minted', 4, 'success', 'Simon Mugambi'],
@@ -149,6 +213,17 @@ const SEEDS: readonly Seed[] = [
       evidenceHoursAgo: 880,
       invitation: 'consumed',
     },
+    // FULLY CONFIGURED, and the reference shape for the whole slice: both axes plus an
+    // open terms row at the spec's own example price. Note what the LEGACY half of this
+    // same payload says — payment mode unconfigured, has_commercial_subscription false.
+    // The screens must follow the object above, not the frozen booleans below it.
+    commercial: {
+      timing: 'pay_after',
+      timingSetHoursAgo: 700,
+      collection: 'psp_online',
+      collectionSetHoursAgo: 700,
+      terms: { amount: '150000.00', effectiveHoursAgo: 690, recordedHoursAgo: 700 },
+    },
     activity: [['admin.restaurant.lifecycle_transition', 52, 'success', 'Simon Mugambi']],
     legacyExpiryDaysAhead: 96,
     preferredMethod: 'monthly',
@@ -172,6 +247,16 @@ const SEEDS: readonly Seed[] = [
       recordedHoursAgo: 300,
       control: 'attested',
       evidenceHoursAgo: 290,
+    },
+    // ZERO-PRICED TERMS. A real, deliberate, recorded price — the internal tenant pays
+    // nothing — and emphatically NOT the same fact as having no terms row. It must read
+    // as UGX 0, never as "Free", "Trial", "Waived" or "No subscription".
+    commercial: {
+      timing: 'pay_first',
+      timingSetHoursAgo: 280,
+      collection: 'offline',
+      collectionSetHoursAgo: 280,
+      terms: { amount: '0.00', effectiveHoursAgo: 280, recordedHoursAgo: 280 },
     },
     activity: [['admin.restaurant.lifecycle_transition', 9, 'success', 'Simon Mugambi']],
   },
@@ -240,6 +325,9 @@ const SEEDS: readonly Seed[] = [
       control: 'stale_attestation',
       evidenceHoursAgo: 1_100,
     },
+    // PARTIAL, THE OTHER WAY ROUND: custody decided, service model not. The mirror of
+    // Ankole, so a review sees both halves of the partial state rendered.
+    commercial: { collection: 'offline', collectionSetHoursAgo: 900 },
     activity: [
       ['admin.delegation.session_started', 6, 'success', 'Simon Mugambi'],
       ['admin.delegation.minted', 6, 'success', 'Simon Mugambi'],
@@ -297,6 +385,21 @@ const SEEDS: readonly Seed[] = [
       relationship: 'owner_membership_mismatch',
       invitation: 'expired',
     },
+    // A BILLING INTERVAL WHOSE COUNT IS NOT 1. "every 2 months" — the case singular
+    // grammar gets wrong, and the case a named plan catalogue cannot express at all.
+    commercial: {
+      timing: 'pay_first',
+      timingSetHoursAgo: 1_400,
+      collection: 'offline',
+      collectionSetHoursAgo: 1_400,
+      terms: {
+        amount: '300000.00',
+        unit: 'month',
+        count: 2,
+        effectiveHoursAgo: 1_400,
+        recordedHoursAgo: 1_450,
+      },
+    },
   },
   {
     name: 'Gulu Highway Diner',
@@ -313,6 +416,20 @@ const SEEDS: readonly Seed[] = [
       source: 'admin_created',
       recordedHoursAgo: 2_000,
       invitation: 'cancelled',
+    },
+    // TERMS RECORDED WHILE BOTH SERVICE AXES ARE STILL UNDECIDED. The three facts are
+    // independent, and this is the combination that proves it: a price is on record
+    // before anyone settled how diners pay.
+    //
+    // The amount also carries a NON-ZERO FRACTION, which must survive to the screen.
+    // Rounding a stored digit away is the same defect class as rendering unconfigured
+    // state as Active — the portal asserting something tidier than the database holds.
+    commercial: {
+      terms: {
+        amount: '87500.50',
+        effectiveHoursAgo: 1_800,
+        recordedHoursAgo: 2_000,
+      },
     },
     legacyValid: false,
   },
@@ -393,6 +510,16 @@ function readiness(status: LifecycleState) {
   };
 }
 
+/**
+ * The LEGACY compatibility contract, frozen exactly where the server freezes it.
+ *
+ * `has_commercial_subscription` STAYS FALSE, and is deliberately not derived from
+ * whether the seed has open terms. That is the single most important line in this
+ * function: the backend keeps it false precisely so a deployed portal cannot render an
+ * open terms row as **Active**, and a mock that quietly flipped it would hide the exact
+ * disagreement this slice exists to resolve — the mock would then agree with a screen
+ * that is wrong.
+ */
 function subscription(seed: Seed) {
   return {
     source: 'legacy_restaurant_fields',
@@ -401,6 +528,74 @@ function subscription(seed: Seed) {
     legacy_expiry_at: isoDaysAhead(seed.legacyExpiryDaysAhead ?? null),
     preferred_method: seed.preferredMethod ?? 'per_order',
   };
+}
+
+/**
+ * The Step 3E.1 canonical projection, deriving what `commercial_reads` derives.
+ *
+ * THREE RULES ARE APPLIED HERE RATHER THAN WRITTEN PER SEED:
+ *
+ *   `configured` FOLLOWS THE VALUE, per axis — `_axis()` on the server derives it from
+ *   the value being non-null, so a seed cannot declare an axis configured while leaving
+ *   it undecided, or vice versa.
+ *
+ *   AN UNDECIDED AXIS HAS NO TIMESTAMP. The database keeps value/set_at/set_by
+ *   all-or-none, so `set_at` is nulled with the value rather than left dangling.
+ *
+ *   `subscription_terms.configured` IS `current !== null`. It is the presence of an
+ *   OPEN row and nothing else — never a separate flag a fixture could contradict.
+ *
+ * THE THREE FACTS STAY INDEPENDENT. Nothing here derives one axis from the other,
+ * derives terms from either axis, or derives any of them from lifecycle state,
+ * `is_test` or a legacy column.
+ */
+function commercial(seed: Seed): CommercialSummary {
+  const settings = seed.commercial ?? {};
+  const terms = settings.terms;
+
+  return {
+    payment_timing: axis(settings.timing ?? null, settings.timingSetHoursAgo ?? 200),
+    payment_collection_mode: axis(
+      settings.collection ?? null,
+      settings.collectionSetHoursAgo ?? 200,
+    ),
+    subscription_terms: {
+      configured: terms !== undefined,
+      current:
+        terms === undefined
+          ? null
+          : {
+              id: `5d6e7f80-9a1b-4c2d-8e3f-${termsId(seed)}`,
+              // The exact decimal STRING, passed through untouched — the wire carries a
+              // string so that no float ever touches a money value, and a mock that
+              // helpfully normalised it would be reviewing a different contract.
+              recurring_amount: terms.amount,
+              currency: terms.currency ?? 'UGX',
+              billing_interval: {
+                unit: terms.unit ?? 'month',
+                count: terms.count ?? 1,
+              },
+              effective_from: isoHoursAgo(terms.effectiveHoursAgo ?? 720) as string,
+              recorded_at: isoHoursAgo(terms.recordedHoursAgo ?? 720) as string,
+            },
+    },
+  };
+}
+
+function axis<T>(value: T | null, setHoursAgo: number) {
+  return {
+    configured: value !== null,
+    value,
+    set_at: value === null ? null : isoHoursAgo(setHoursAgo),
+  };
+}
+
+/** Deterministic, so a deep link into a terms row survives a reload. */
+function termsId(seed: Seed): string {
+  const slug = seed.name.replace(/[^a-z0-9]/gi, '').toLowerCase();
+  let hash = 0;
+  for (let i = 0; i < slug.length; i += 1) hash = (hash * 31 + slug.charCodeAt(i)) % 0xffffffffff;
+  return hash.toString(16).padStart(12, '0').slice(-12);
 }
 
 /**
@@ -477,6 +672,13 @@ function row(seed: Seed, index: number): RestaurantRow {
     status: seed.status,
     is_test: seed.isTest ?? false,
     readiness: state,
+    // THE CANONICAL COMMERCIAL OBJECT, on the ROW as well as the detail — the server
+    // computes it once and sends the same shape to both reads, so a mock that put it
+    // only on the detail would review a directory that cannot exist.
+    commercial: commercial(seed),
+    // FROZEN, exactly as the server freezes them. For any seed with a configured axis
+    // or open terms these now CONTRADICT `commercial` above, which is precisely what the
+    // deployed wire carries — and the screens must follow `commercial`.
     payment_mode: null,
     payment_mode_configured: false,
     subscription: subscription(seed),

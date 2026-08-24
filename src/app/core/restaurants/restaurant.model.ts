@@ -11,15 +11,23 @@
  *      exhaustiveness checking that makes a new state a compile error rather than a
  *      blank cell.
  *
- *   2. WHERE IT DOES NOT, THIS DOES NOT INVENT ONE. `payment_mode` has no
- *      authoritative field on the server at all and `readiness.blockers` carries
- *      codes Step 3 has not written yet. Declaring a union for either would be a
- *      guess with a type annotation on it.
+ *      Step 3E.1 added five more closed vocabularies under the same rule — payment
+ *      timing, payment collection mode and the billing-interval unit are all
+ *      enumerated in `commercial_app`, so they are enumerated here.
+ *
+ *   2. WHERE IT DOES NOT, THIS DOES NOT INVENT ONE. `readiness.blockers` carries codes
+ *      Step 3 has not written yet, and `currency` is any three-letter ISO-4217 code the
+ *      server accepts rather than a list this repo gets to choose. Declaring a union for
+ *      either would be a guess with a type annotation on it.
  *
  * NULLS ARE MEANINGFUL AND ARE PRESERVED. A null `location`, a null
- * `last_activity_at`, a null `latest_order` and a null `payment_mode` each say
- * something different from an empty string or a zero, and the transport layer
- * normalises none of them away.
+ * `last_activity_at`, a null `latest_order`, a null `subscription_terms.current` and a
+ * null axis `value` each say something different from an empty string or a zero, and
+ * the transport layer normalises none of them away.
+ *
+ * ONE MORE RULE ARRIVED WITH STEP 3E.1. The wire carries BOTH the canonical
+ * `commercial` object and the transitional legacy fields it supersedes, and they may
+ * disagree. WHERE THEY DO, `commercial` WINS — see the compatibility fence below.
  */
 
 /** `restaurants_app` spells exactly these four. There is no fifth. */
@@ -58,13 +66,148 @@ export interface ReadinessSummary {
 export const BLOCKER_READINESS_NOT_CONFIGURED = 'readiness_not_configured';
 
 /**
+ * ══ THE CANONICAL COMMERCIAL CONTRACT (Step 3E.1) ═════════════════════════════════
+ *
+ * `commercial` is the authoritative answer to what a restaurant has commercially
+ * agreed with Dinify. It arrives on BOTH the directory row and the detail payload —
+ * `restaurant_reads` calls `commercial_reads.commercial_summary` on each — so the two
+ * screens are structurally incapable of disagreeing, and this application models it on
+ * the shared shape below rather than as a detail-only extra.
+ *
+ * ── IT ANSWERS THREE INDEPENDENT QUESTIONS, AND THEY STAY THREE ───────────────────
+ *
+ *   payment_timing           Does the diner pay before or after eating? A SERVICE
+ *                            MODEL fact — quick-service versus full-service.
+ *   payment_collection_mode  Does Dinify initiate the diner's payment at all? A
+ *                            CUSTODY fact.
+ *   subscription_terms       What has Dinify recorded that this restaurant pays IT?
+ *
+ * Every partial combination is real and reachable. Timing decided while collection is
+ * not; collection decided while timing is not; terms recorded while both service axes
+ * are still open. THERE IS DELIBERATELY NO `commercial_configured` BOOLEAN on the
+ * server, and there must be none here either: collapsing three facts into one word
+ * makes "partially configured" unrepresentable, which is precisely the state an
+ * operator most needs to see.
+ *
+ * ── WHAT `subscription_terms.configured` MEANS, AND WHAT IT DOES NOT ──────────────
+ *
+ * It means ONE thing: an open `RestaurantSubscriptionTerms` row exists — recorded
+ * pricing intent, and nothing else. It is NOT active, paid, valid, current, in good
+ * standing, a trial, an invoice, an invoice paid, a successful collection, or an
+ * owner's agreement. Dinify has never collected a subscription payment through this
+ * system: there is no invoice model, no receivable and no collection path, so any word
+ * implying money changed hands is an assertion the database cannot support. The
+ * backend named the model TERMS and not `Agreement` for exactly this reason, and
+ * `restaurant.labels.ts` is where the vocabulary is held to it.
+ *
+ * ── NO INFERENCE, IN EITHER DIRECTION ────────────────────────────────────────────
+ *
+ * Nothing here is derived from `require_order_prepayments`, table configuration,
+ * transaction tender, `flat_fee`, `preferred_subscription_method`, the legacy validity
+ * or expiry columns, lifecycle state or `is_test`. `offline` is a PERMANENT,
+ * FIRST-CLASS mode — not cash-only, not degraded, not a fallback and not a pre-launch
+ * state — and `psp_online` carries no provider, no merchant id and no readiness
+ * verdict, because this platform has no PSP integration to be ready.
+ */
+
+/** `commercial_app` spells exactly these two. A service-model fact. */
+export type PaymentTiming = 'pay_first' | 'pay_after';
+
+/**
+ * `commercial_app` spells exactly these two. A CUSTODY fact: whether Dinify initiates
+ * the diner's payment. `offline` means it does not and the restaurant collects through
+ * whatever tender it likes — never "cash only", which names one tender out of many.
+ */
+export type PaymentCollectionMode = 'offline' | 'psp_online';
+
+/** `commercial_app` spells exactly these four. A generic recurrence, never a plan. */
+export type BillingIntervalUnit = 'day' | 'week' | 'month' | 'year';
+
+/**
+ * One configured-or-not commercial axis.
+ *
+ * `configured` IS THE SERVER'S BOOLEAN AND IS NOT RECOMPUTED HERE. The backend derives
+ * it from the value and keeps value/timestamp all-or-none at the database, so a client
+ * that re-derived it would at best duplicate the rule and at worst quietly disagree
+ * with it. The transport passes the projection through exactly as sent.
+ */
+export interface CommercialAxis<T> {
+  readonly configured: boolean;
+  /** The exact persisted MACHINE value. Turning it into prose is the labels' job. */
+  readonly value: T | null;
+  /** When this configuration DECISION was recorded. Null while unconfigured. */
+  readonly set_at: string | null;
+}
+
+/**
+ * The single OPEN terms row — `ended_at IS NULL`, guaranteed at most one by a partial
+ * unique index on the server.
+ *
+ * `recurring_amount` IS A DECIMAL STRING AND MUST STAY ONE. The backend serialises the
+ * `Decimal` with `str()` specifically so DRF's encoder cannot turn it into a float, and
+ * a price that renders differently from how it is stored is a price nobody can
+ * reconcile. Zero is a real, deliberate price — a waived period, a pilot — and is a
+ * different fact from having no terms row at all.
+ *
+ * `id` is not decoration: Step 3C's writers take `expected_terms_id`, so a future write
+ * screen asserts optimistic concurrency with the exact fact it read.
+ */
+export interface CommercialSubscriptionTerms {
+  readonly id: string;
+  readonly recurring_amount: string;
+  /** ISO-4217, three uppercase letters, stored with NO default. Never assumed UGX. */
+  readonly currency: string;
+  readonly billing_interval: {
+    readonly unit: BillingIntervalUnit;
+    /** At least 1, enforced by a check constraint. Not assumed to be 1. */
+    readonly count: number;
+  };
+  /** When these terms became commercially APPLICABLE. Not when they were recorded. */
+  readonly effective_from: string;
+  /** When a platform operator WROTE THEM DOWN. Never agreed/signed/activated/paid. */
+  readonly recorded_at: string;
+}
+
+export interface CommercialSummary {
+  readonly payment_timing: CommercialAxis<PaymentTiming>;
+  readonly payment_collection_mode: CommercialAxis<PaymentCollectionMode>;
+  readonly subscription_terms: {
+    /** An open terms row exists. See the block comment above for what that is not. */
+    readonly configured: boolean;
+    readonly current: CommercialSubscriptionTerms | null;
+  };
+}
+
+/**
+ * ══ TRANSITIONAL COMPATIBILITY — NOT THE COMMERCIAL DOMAIN ════════════════════════
+ *
+ * Everything from here to the end of this section is the pre-Step-3E contract. The
+ * backend still sends it, deliberately and unchanged, so a deployed client is not
+ * reinterpreted underneath it — `restaurant_reads.subscription_summary` calls leaving
+ * `has_commercial_subscription` False "the single most important line in this module to
+ * leave alone", because the deployed portal rendered that boolean as **Active**.
+ *
+ * WHERE THESE DISAGREE WITH `commercial`, `commercial` WINS. They are typed here for
+ * two reasons and no others: the wire carries them, and a reconciliation surface (the
+ * Overview "Legacy record" block) reads the three columns that still vary. NO NEW
+ * CONSUMER MAY BE BUILT ON THEM, nothing may fall back to them when `commercial` is
+ * unconfigured, and no canonical value may be inferred from them.
+ */
+
+/**
  * The LEGACY subscription columns on `Restaurant`, named for what they are.
  *
- * `has_commercial_subscription` is the key to branch on: it is False for every
- * restaurant today and becomes True when `RestaurantSubscription` lands. Everything
- * prefixed `legacy_` is a column nothing currently maintains — in particular
+ * `has_commercial_subscription` IS FROZEN FALSE ON THE SERVER and stays false even for
+ * a restaurant with open subscription terms. That is deliberate, not a gap waiting to
+ * be filled: the deployed portal rendered this boolean as **Active**, and an open terms
+ * row does not prove a payment was ever collected. Nothing may branch on it any more —
+ * `commercial.subscription_terms` is the answer, in honest vocabulary.
+ *
+ * Everything prefixed `legacy_` is a column nothing currently maintains. In particular
  * `legacy_validity_flag` defaults True and is not evidence that any invoice exists,
  * which is why nothing in this application may render it as paid, active or current.
+ * These three still VARY per restaurant, which is why the fenced-off Overview "Legacy
+ * record" block can usefully show them for reconciliation.
  */
 export interface SubscriptionSummary {
   readonly source: string;
@@ -76,13 +219,17 @@ export interface SubscriptionSummary {
 }
 
 /**
- * The commercial payment mode — `cash_only`, a PSP-backed mode, or whatever Step 2/3
- * settles on. `payment_mode` is null and `payment_mode_configured` is false for every
- * restaurant today because THERE IS NO SUCH FIELD on the server yet.
+ * The pre-Step-3E "payment mode", FROZEN at its Step-1 meaning: permanently null and
+ * unconfigured, for every restaurant, forever.
  *
- * `require_order_prepayments` is a diner-checkout toggle and is deliberately absent
- * from this contract; inferring one from the other would produce a confident answer
- * that is wrong for any restaurant that configured prepayment for its own reasons.
+ * IT IS NOT WIRED TO `payment_collection_mode`, on either side. The backend refused to
+ * point this key at the new domain precisely because "payment mode" was a placeholder
+ * for a concept nobody had modelled, and Step 3B then modelled TWO — a service-model
+ * axis and a custody axis — neither of which is what the old ambiguous label promised.
+ *
+ * SO THIS CARRIES NO INFORMATION. It is typed only because the wire still carries it,
+ * and because the canonical-beats-legacy regression fixtures need to be able to state a
+ * legacy half that contradicts `commercial`. NOTHING RENDERS IT.
  */
 export interface PaymentModeSummary {
   readonly payment_mode: string | null;
@@ -92,6 +239,13 @@ export interface PaymentModeSummary {
 /** The fields the directory row and the detail payload share, byte for byte. */
 interface RestaurantCommon extends PaymentModeSummary {
   readonly id: string;
+  /**
+   * THE CANONICAL COMMERCIAL ANSWER, on the SHARED shape because the server computes
+   * it once and sends the same object to both reads. It is deliberately not
+   * detail-only: the directory's Payment and Subscription-terms columns read exactly
+   * what the workspace reads, so a row and a header cannot disagree.
+   */
+  readonly commercial: CommercialSummary;
   readonly name: string;
   readonly location: string | null;
   readonly status: LifecycleState;

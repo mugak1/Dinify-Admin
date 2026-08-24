@@ -21,10 +21,12 @@ conventions change.
 ## Current Implementation Status
 
 **Step 0 (scaffold) complete, plus spec §15 STEP 1 (restaurant directory + detail
-workspace) and the READ half of STEP 2C (the onboarding and owner-control projection,
-rendered on Overview).** Step 2 as a whole is NOT complete — nothing in this repo
-creates a restaurant, adopts one, attests owner control or issues an invitation. Steps
-3–10 are not built.
+workspace), the READ half of STEP 2C (the onboarding and owner-control projection) and
+STEP 3E.1 (the canonical commercial READ migration), both rendered on Overview.** Step 2
+as a whole is NOT complete — nothing in this repo creates a restaurant, adopts one,
+attests owner control or issues an invitation. **Step 3E is NOT complete either: 3E.1 is
+the READ half, and this repo still has no commercial WRITE of any kind.** Steps 3–10 are
+otherwise not built.
 
 - Shell, navigation and routing: ✅ the five §9 destinations, the §9.2 URL scheme,
   URL-backed filters
@@ -52,6 +54,11 @@ creates a restaurant, adopts one, attests owner control or issues an invitation.
   record appeared, the owner-relationship check, owner control with its evidence, and
   the invitation state. Same one read; no new endpoint, no writer. See "The Onboarding
   Projection" below.
+- **Step 3E.1 canonical commercial reads: ✅ BUILT (read-only).** Both the directory and
+  the workspace now consume the backend's canonical `commercial` object — payment timing,
+  payment collection mode and subscription terms. The directory's `Payment` and
+  `Subscription terms` columns and Overview's Commercial panel all read it, and NOTHING
+  reads the superseded compatibility fields any more. See "The Commercial Projection".
 - **Readiness, Billing, Support and Activity tabs: ❌ still placeholders** with
   written empty states (spec §15 steps 3, 7, 6 and 8).
 - **Restaurant creation, restaurant adoption, owner-control attestation, owner
@@ -77,11 +84,17 @@ not exist, and this repo renders that truth rather than filling the column:
   `readiness_not_configured` is a statement about the CHECKLIST not being built, and
   the portal says so — it never reads as this restaurant having failed one. Step 3
   fills the seam; `readinessLabel` already renders "3 blockers" when it does.
-- **Payment mode** is `Not configured`, never inferred. `require_order_prepayments` is
-  a diner-checkout toggle and is deliberately absent from the contract.
-- **Subscription** is `Not configured`. The legacy `Restaurant` columns are shown in a
-  fenced-off block LABELLED legacy; `legacy_validity_flag` is never rendered as
-  Active, Paid, Current, Trial or In good standing.
+- **Payment mode** was `Not configured`, never inferred — SUPERSEDED by Step 3E.1. The
+  backend froze `payment_mode` at null permanently and modelled TWO real axes instead
+  (`payment_timing`, `payment_collection_mode`). The old label and its `paymentModeLabel`
+  helper are both gone; `require_order_prepayments` remains a diner-checkout toggle and
+  is still deliberately absent from the contract.
+- **Subscription** was `Not configured` — SUPERSEDED by Step 3E.1. The canonical answer
+  is `commercial.subscription_terms`, rendered as the recorded price and recurrence
+  rather than a status. `subscriptionLabel` — the one function in this repo that could
+  emit the word **Active** — is DELETED. The legacy `Restaurant` columns survive in a
+  fenced-off block LABELLED legacy; `legacy_validity_flag` is never rendered as Active,
+  Paid, Current, Trial or In good standing.
 - **Owner claim** was `Not tracked yet` — SUPERSEDED by Step 2C, which built the
   difference. The Owner panel no longer carries that row at all; `onboarding` is the
   canonical answer and the Onboarding panel is where it is rendered. The
@@ -427,14 +440,19 @@ the port is identical in both modes:
 | `restaurant-workspace.store.ts` | the detail read, scoped to the `/restaurants/:id` route |
 
 **CLOSED UNIONS WHERE THE SERVER HAS ONE, `string` WHERE IT DOES NOT.** Lifecycle state,
-readiness state, audit result, order status and all five Step 2C onboarding
-vocabularies are enumerated on the server and are enumerated here. `payment_mode` and
-`readiness.blockers` are `string`, because there is no field and no vocabulary yet — a
-union invented here would be wrong the day one lands.
+readiness state, audit result, order status, all five Step 2C onboarding vocabularies and
+the three Step 3E.1 commercial ones (`PaymentTiming`, `PaymentCollectionMode`,
+`BillingIntervalUnit`) are enumerated on the server and are enumerated here.
+`readiness.blockers` is `string` because the vocabulary is not written yet, and
+`currency` is `string` because it is any three-letter ISO-4217 code the server accepts
+rather than a list this repo gets to choose — a union invented for either would be wrong
+the day one lands.
 
 **THE TRANSPORT NORMALISES NOTHING.** A null `location`, `last_activity_at`,
-`latest_order` and `payment_mode` each say something different from `''` or `0`, and a
-helpful `?? ''` in the transport would destroy the distinction the screens render.
+`latest_order`, `subscription_terms.current` and a null commercial axis `value` each say
+something different from `''` or `0`, and a helpful `?? ''` in the transport would
+destroy the distinction the screens render. `recurring_amount` in particular stays the
+EXACT decimal string the server sent — see "Formatting".
 
 **ROUTE STRINGS LIVE IN `api.constants.ts`** beside `AUTH_ROUTES`, never concatenated in
 a component. `RESTAURANT_ROUTES.detail(id)` encodes the segment.
@@ -501,6 +519,119 @@ restaurant" and never "Imported"; `attested` and `invitation_redeemed` both beco
 "Established" while their EVIDENCE lines stay distinct; `not_applicable` never becomes
 "Not issued"; `stale_attestation` becomes "Stale evidence" and never "Established".
 `restaurant.labels.spec.ts` pins each of those directly.
+
+Step 3E.1 added the commercial vocabulary under the same rule, and it is where the
+pressure is highest: `offline` becomes "Restaurant collects" and never "Cash only";
+`psp_online` becomes "Dinify via PSP" and never "Connected", "Ready" or "Live"; an open
+terms row becomes its own price and recurrence and never "Active"; a `count` of 2 becomes
+"every 2 months" and never a plan name; and a zero price becomes `UGX 0` and never
+"Free". The spec asserts each of those as a NEGATIVE as well as a positive, because the
+failure mode is a word that reads fine until an operator acts on it.
+
+## The Commercial Projection — spec §15 step 3E.1, READ ONLY
+
+`commercial` is the CANONICAL answer to what a restaurant has commercially agreed with
+Dinify. It arrives on **BOTH** `GET /restaurants/` rows and the detail payload — the
+backend computes it once in `commercial_reads.commercial_summary` and hands the same
+object to each read — so it lives on the SHARED shape (`RestaurantCommon`), not as a
+detail-only extra. No new endpoint, no second store, no second request.
+
+### It answers THREE INDEPENDENT questions, and they stay three
+
+| field | question | vocabulary |
+|---|---|---|
+| `payment_timing` | does the diner pay before or after eating? (SERVICE MODEL) | `pay_first` / `pay_after` |
+| `payment_collection_mode` | does Dinify initiate the diner's payment at all? (CUSTODY) | `offline` / `psp_online` |
+| `subscription_terms` | what has Dinify recorded that this restaurant pays IT? | an open terms row, or none |
+
+Each axis carries its own `configured` / `value` / `set_at`. **THERE IS NO
+`commercial_configured` BOOLEAN on the server and there must be none here.** Every
+partial combination is real — timing decided while collection is not, terms recorded
+while both axes are still open — and collapsing three facts into one word makes
+"partially configured" unrepresentable, which is the state an operator most needs to
+see. The directory cell therefore NAMES the missing half (`Pay first · Collection not
+configured`) rather than flattening to `Configured`.
+
+### `configured` IS THE SERVER'S BOOLEAN
+The transport passes the projection through unchanged and derives nothing. It does not
+compute `configured` from a value, does not fill a null, does not reformat a decimal
+string and does not read a legacy field. **The transport is a pipe, not a commercial
+rules engine.** Everything that renders guards on the VALUE (or on
+`subscription_terms.current`) rather than on the boolean beside it — what is displayed
+is what is checked — so a server that ever sent the two inconsistently degrades instead
+of crashing.
+
+### OPEN TERMS ARE TERMS, NOT STATUS — the highest-risk mistake in this slice
+`subscription_terms.configured === true` means ONE thing: **an open
+`RestaurantSubscriptionTerms` row exists.** It is not Active, Paid, Current, Trial, In
+good standing, an invoice, an invoice paid, a successful collection or an owner's
+agreement. There is no invoice model on the server, no receivable and no collection
+path — Dinify has never taken a subscription payment through this system — so any word
+implying money changed hands is an assertion the database cannot support. The backend
+named the model TERMS and not `Agreement` for exactly this reason.
+
+So the cell states **the terms themselves** — `UGX 150,000 · every month` — and never a
+verdict about them. `subscriptionLabel`, which rendered `has_commercial_subscription`
+as **Active**, is deleted rather than fixed. There is deliberately no success treatment:
+a recorded price is not an achievement.
+
+### `offline` is a FIRST-CLASS MODE, `psp_online` is NOT A READINESS CLAIM
+`offline` means Dinify does not initiate the diner payment and the restaurant collects
+through whatever tender it likes. It is **never** cash-only (that names one tender out
+of many and misreports a restaurant running its own card machine), never degraded,
+never a fallback, never pre-launch — a restaurant is fully entitled to go live in it.
+`psp_online` records an INTENTION and proves nothing about a provider being connected:
+this platform has no PSP integration, so there is no provider, no merchant id and no
+readiness verdict to report. Both get one clarifying sentence on Overview, because the
+first is read DOWN and the second is read UP.
+
+### THE CANONICAL OBJECT OUTRANKS THE COMPATIBILITY FIELDS
+The wire carries BOTH contracts and **they disagree by design.** The server FREEZES
+`payment_mode` null, `payment_mode_configured` false and `has_commercial_subscription`
+false — `restaurant_reads` calls that last line "the single most important line in this
+module to leave alone", precisely because the deployed portal rendered it as **Active**
+— while `legacy_validity_flag` still varies and defaults TRUE.
+
+**WHERE THEY DISAGREE, `commercial` WINS.** Nothing infers a canonical value from a
+legacy one, nothing falls back to legacy when `commercial` is unconfigured, and nothing
+synthesises canonical state client-side. The legacy types stay in the model for two
+reasons only: the wire carries them, and the contradictory regression fixtures need to
+be able to state a legacy half. **A regression test proves both directions on BOTH
+screens** — canonical configured while legacy says unconfigured, and canonical
+unconfigured while legacy validity is true — asserting on the VISIBLE cell, because the
+failure being designed out is a screen quietly reading the wrong field.
+
+The Overview "Legacy record" block survives, below a literal fence, labelled
+`Superseded columns … the state above is authoritative`. It is for reconciliation and
+is never a second opinion.
+
+### Absence is not "Not configured"
+`NOT_CONFIGURED` says the server was asked and answered: no decision is recorded.
+`NO_VALUE` (`—`) says the server did not answer at all — a `commercial` object missing
+from the payload entirely. Rendering the second as the first manufactures a commercial
+verdict out of a missing payload, which is the same defect class as a dead backend
+presenting as "Invalid credentials." Both label entry points take
+`CommercialSummary | null | undefined` for exactly this.
+
+### NO CLIENT-SIDE COMMERCIAL INFERENCE, in any direction
+Not from `require_order_prepayments`, table configuration, transaction tender,
+`flat_fee`, `preferred_subscription_method`, the legacy validity or expiry columns,
+lifecycle state, or `is_test`. `is_test` affects portfolio visibility later; it does not
+rewrite the commercial facts a restaurant has recorded.
+
+### THERE ARE NO COMMERCIAL WRITES IN THIS REPO
+No `setPaymentTiming`, no `setPaymentCollectionMode`, no `recordSubscriptionTerms` /
+`replaceSubscriptionTerms` / `endSubscriptionTerms`, no generic `post()`, no generic
+`ApiService` — and no disabled buttons standing in for them. `RestaurantApi` still
+exposes exactly `list()` and `detail()`, and a test asserts Overview ships zero
+`<button>` elements.
+
+> **Step 3E.2 is the SERVICE-CONFIGURATION controls** (payment timing, collection mode).
+> **Step 3E.3 is the SUBSCRIPTION-TERMS controls.** Both need elevation, a written
+> reason and 409 handling, none of which exist here. The read already carries their
+> concurrency tokens: `payment_timing.value`, `payment_collection_mode.value` and
+> `subscription_terms.current.id` are what a writer sends back as `expected_*`. The
+> domain facts ARE the tokens — there is deliberately no separate version counter.
 
 ## The Onboarding Projection — spec §15 step 2C, READ ONLY
 
@@ -762,10 +893,24 @@ the same reason: "a rehearsal happened" and "a sale happened" are different stat
 Pure functions in `core/formatting/`, plus thin pipes, so nothing downstream
 reinvents them.
 
-- **Currency**: `UGX 150,000`. No decimals, no faux precision, **never a float** — the
-  backend's money fields are Postgres `DecimalField`s that arrive as STRINGS precisely
-  so no float touches a money value, and `formatUGX` groups a decimal string
-  TEXTUALLY rather than parsing it. A missing amount renders `—`, distinct from `UGX 0`.
+- **Currency**: `UGX 150,000`. **Never a float** — the backend's money fields are
+  Postgres `DecimalField`s that arrive as STRINGS precisely so no float touches a money
+  value (`commercial_reads` calls `str()` on the `Decimal` for exactly this), and the
+  formatter groups the string TEXTUALLY rather than parsing it. A missing amount renders
+  `—`, distinct from `UGX 0` — zero is a real, deliberate price.
+
+  **`formatMoney(amount, currency)` is the rule and `formatUGX` is a one-line wrapper**,
+  so there is ONE money rule rather than two that can drift. **The currency is an
+  argument and is never assumed**: `RestaurantSubscriptionTerms.currency` is stored with
+  no default, and relabelling a different code as shillings is a quiet corruption of a
+  money value.
+
+  **An ALL-ZERO fraction is dropped (§16's no-faux-precision rule); a NON-ZERO fraction
+  is KEPT, verbatim.** `"150000.00"` → `UGX 150,000`, but `"150000.50"` → `UGX 150,000.50`.
+  Step 3E.1 changed this: the formatter used to truncate unconditionally, which deleted a
+  stored digit from a price an operator is expected to reconcile. Truth beats typography
+  — rounding a recorded amount away on screen is the same defect class as rendering
+  unconfigured state as `Active`.
 - **Time**: `15:42 EAT · 19 Aug 2026`. Always `Africa/Kampala`, always labelled.
   Administration may happen from another timezone and "yesterday at 23:50" must never
   be ambiguous — a lifecycle decision against the wrong day is not a cosmetic error.
@@ -794,9 +939,20 @@ an unreachable server shows an operator a portfolio that does not exist, and the
 decisions they take from it are taken against fiction. REAL FAILURE ≠ MOCK DATA.
 
 **THE FIXTURES ARE NOT RICHER THAN THE BACKEND.** `mock-restaurants.fixtures.ts` DERIVES
-readiness, `needs_attention`, payment mode, subscription, the onboarding projection and
-the owner-claim aliases from the same rules `restaurant_reads.py` applies, rather than
-writing pleasant values per row — a fixture that cannot disagree with the rule. The
+readiness, `needs_attention`, the commercial projection, the legacy compatibility fields,
+the onboarding projection and the owner-claim aliases from the same rules
+`restaurant_reads.py` and `commercial_reads.py` apply, rather than writing pleasant
+values per row — a fixture that cannot disagree with the rule. The commercial derivation
+applies the backend's own consequences too: each axis's `configured` follows its VALUE,
+an undecided axis carries no `set_at`, and `subscription_terms.configured` is simply
+whether an open row exists.
+
+**AND THE MOCK KEEPS THE LEGACY FIELDS FROZEN, exactly as the server freezes them** —
+`payment_mode` null and `has_commercial_subscription` false even for a restaurant with
+open terms. That is deliberate and is the point: every configured seed is therefore a
+LIVE canonical-versus-legacy contradiction, which is what the deployed wire actually
+carries. A mock that quietly flipped the boolean would agree with a screen that is
+wrong. The
 onboarding derivation applies the backend's own consequences: untracked forces every
 nested status to `unavailable`, a legacy adoption's invitation is always
 `not_applicable`, the evidence follows from the control state, and the claim aliases are
@@ -806,7 +962,13 @@ offboarded, open issues and none, no admin activity, a null location, a missing 
 rehearsal (TEST) latest order, no orders at all, an UNTRACKED tenant, the live Baba House
 shape, a valid legacy attestation, a redeemed invitation, one pending, one not issued,
 one expired, one cancelled, one superseded, all three owner-relationship inconsistencies
-and a stale attestation — and enough rows to page at the default 25. The mock also FILTERS and PAGES
+and a stale attestation. Step 3E.1 added the commercial states: nothing configured, both
+service axes configured, TIMING ONLY (Ankole), COLLECTION ONLY (Garden City), open terms,
+ZERO-PRICED terms (the internal Demo Kitchen), an interval whose count is 2 (Mbarara),
+terms recorded while BOTH axes are still undecided together with a non-zero decimal
+fraction (Gulu Highway), and the reverse contradiction — legacy validity true with no
+commercial state at all (Speke Road, Bugolobi). There are enough rows to page at the
+default 25. The mock also FILTERS and PAGES
 server-side, mirroring `apply_directory_filters` and the endpoint's slicing — otherwise
 `npm start` would review a directory that works differently from the deployed one, and
 the pagination arithmetic would never be exercised.

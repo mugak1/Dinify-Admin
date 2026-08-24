@@ -14,7 +14,11 @@ import {
 } from '../core/restaurants/restaurant.api';
 import { RestaurantWorkspaceStore } from '../core/restaurants/restaurant-workspace.store';
 import {
+  CommercialSubscriptionTerms,
+  CommercialSummary,
   OnboardingSummary,
+  PaymentCollectionMode,
+  PaymentTiming,
   RestaurantDetail,
   RestaurantDirectoryPage,
 } from '../core/restaurants/restaurant.model';
@@ -76,6 +80,49 @@ const UNTRACKED: OnboardingSummary = {
   invitation: { status: 'unavailable' },
 };
 
+/**
+ * The canonical commercial projection, built the way the SERVER builds it — each axis's
+ * `configured` derived from its value, `subscription_terms.configured` from whether an
+ * open row exists. A builder that let a spec state `configured: true` beside a null
+ * value would be asserting against a payload the backend cannot emit.
+ */
+function commercial(
+  settings: {
+    timing?: PaymentTiming;
+    collection?: PaymentCollectionMode;
+    terms?: Partial<CommercialSubscriptionTerms>;
+  } = {},
+): CommercialSummary {
+  const terms = settings.terms;
+  return {
+    payment_timing: {
+      configured: settings.timing !== undefined,
+      value: settings.timing ?? null,
+      set_at: settings.timing === undefined ? null : '2026-08-20T09:30:00+03:00',
+    },
+    payment_collection_mode: {
+      configured: settings.collection !== undefined,
+      value: settings.collection ?? null,
+      set_at: settings.collection === undefined ? null : '2026-08-18T14:05:00+03:00',
+    },
+    subscription_terms: {
+      configured: terms !== undefined,
+      current:
+        terms === undefined
+          ? null
+          : {
+              id: '5d6e7f80-9a1b-4c2d-8e3f-000000000001',
+              recurring_amount: '150000.00',
+              currency: 'UGX',
+              billing_interval: { unit: 'month', count: 1 },
+              effective_from: '2026-08-01T00:00:00+03:00',
+              recorded_at: '2026-08-03T11:20:00+03:00',
+              ...terms,
+            },
+    },
+  };
+}
+
 function detail(overrides: Partial<RestaurantDetail> = {}): RestaurantDetail {
   return {
     id: ID,
@@ -88,6 +135,7 @@ function detail(overrides: Partial<RestaurantDetail> = {}): RestaurantDetail {
       blocker_count: 1,
       blockers: ['readiness_not_configured'],
     },
+    commercial: commercial(),
     payment_mode: null,
     payment_mode_configured: false,
     subscription: {
@@ -464,6 +512,44 @@ describe('RestaurantOverviewTab', () => {
   function text(): string {
     return el().textContent ?? '';
   }
+  /**
+   * The COMMERCIAL PANEL's text alone.
+   *
+   * The semantic negatives below have to be scoped, not page-wide: the Owner panel
+   * legitimately renders "Account: Active" for an enabled owner account, and the
+   * Operations panel legitimately renders a latest order whose status is "Paid". Both
+   * are true statements about different objects. A page-wide search for those words
+   * would fail on facts that are correct, and — worse — would have to be loosened to
+   * pass, which is exactly how a real assertion turns into a decorative one.
+   *
+   * What is actually being proved is narrower and stronger: THE COMMERCIAL PANEL never
+   * describes recorded terms with an account-status word.
+   */
+  function commercialPanel(): Element | null {
+    return (harness.routeDebugElement?.nativeElement as HTMLElement).querySelector(
+      '[aria-labelledby="commercial-heading"]',
+    );
+  }
+
+  function commercialText(): string {
+    return commercialPanel()?.textContent ?? '';
+  }
+
+  /**
+   * ONE ROW of the commercial panel, addressed by its term.
+   *
+   * Sharper than searching the panel, and the sharpness matters: the panel also carries
+   * the Readiness row, which legitimately reads "Not configured" because the go-live
+   * seam fails closed until Step 3. A panel-wide negative for that phrase would fail on
+   * a correct statement about a different fact — so the assertions that care about ONE
+   * commercial fact address that fact directly.
+   */
+  function commercialRow(term: string): string {
+    const terms = Array.from(commercialPanel()?.querySelectorAll('dt') ?? []);
+    const dt = terms.find((node) => node.textContent?.trim() === term);
+    return dt?.nextElementSibling?.textContent?.trim() ?? '';
+  }
+
   async function loaded(): Promise<void> {
     harness = await RouterTestingHarness.create();
     await harness.navigateByUrl(`/restaurants/${ID}`, RestaurantDetailPage);
@@ -535,35 +621,220 @@ describe('RestaurantOverviewTab', () => {
     flush();
   }));
 
-  it('reports payment mode as not configured, inferring nothing', fakeAsync(async () => {
+  /**
+   * ══ THE COMMERCIAL PANEL (Step 3E.1) ════════════════════════════════════════════
+   *
+   * Three INDEPENDENT canonical facts get three rows. The panel reads `commercial` and
+   * nothing else above the fence; the legacy columns stay below it, subordinate and
+   * labelled, and are never a fallback.
+   */
+  it('gives each canonical commercial fact its own row', fakeAsync(async () => {
     await loaded();
 
-    expect(text()).toContain('Payment mode');
-    expect(text()).toContain('Not configured');
-    for (const invented of ['Cash only', 'Prepay', 'Mobile money', 'PSP']) {
-      expect(text()).withContext(invented).not.toContain(invented);
+    expect(text()).toContain('Payment timing');
+    expect(text()).toContain('Collection mode');
+    expect(text()).toContain('Subscription terms');
+
+    // The old ambiguous label is gone: the backend has two axes, not one "mode".
+    expect(text()).not.toContain('Payment mode');
+    flush();
+  }));
+
+  it('reports each unconfigured axis as not configured, inferring nothing', fakeAsync(async () => {
+    await loaded();
+
+    expect(commercialText()).toContain('Not configured');
+    // Never inferred from `require_order_prepayments`, table configuration, transaction
+    // tender, lifecycle state or `is_test`.
+    for (const invented of ['Cash only', 'Prepay', 'Mobile money', 'PSP connected']) {
+      expect(commercialText()).withContext(invented).not.toContain(invented);
     }
     flush();
   }));
 
-  it('reports the subscription as not configured and labels the legacy columns', fakeAsync(async () => {
+  it('renders both service axes with their set_at timestamps in EAT', fakeAsync(async () => {
+    api.answer = () =>
+      of(detail({ commercial: commercial({ timing: 'pay_first', collection: 'offline' }) }));
     await loaded();
 
-    expect(text()).toContain('Legacy record');
-    // `legacy_validity_flag` is true on this fixture. It is a bare boolean nothing
-    // maintains, so it may never be restated as a billing status.
+    expect(text()).toContain('Pay first');
+    expect(text()).toContain('Restaurant collects');
+    // `set_at` = when the configuration DECISION was recorded. Named precisely, and
+    // EAT-labelled like every other timestamp in this application.
     expect(text()).toContain('Set');
-    for (const invented of [
-      'Paid',
-      'Active subscription',
-      'Current',
-      'In good standing',
-      'Trial',
-    ]) {
-      expect(text()).withContext(invented).not.toContain(invented);
+    expect(text()).toContain('EAT');
+    expect(text()).toContain('20 Aug 2026');
+    flush();
+  }));
+
+  it('does not describe offline as cash-only, degraded or unfinished', fakeAsync(async () => {
+    api.answer = () => of(detail({ commercial: commercial({ collection: 'offline' }) }));
+    await loaded();
+
+    // A permanent, first-class mode: Dinify does not initiate the payment and the
+    // restaurant collects through whatever tender it likes.
+    expect(commercialText()).toContain('Dinify does not initiate the diner payment');
+    for (const invented of ['Cash only', 'cash only', 'Degraded', 'Fallback', 'Pre-launch']) {
+      expect(commercialText()).withContext(invented).not.toContain(invented);
     }
     flush();
   }));
+
+  it('does not claim psp_online means a provider is connected', fakeAsync(async () => {
+    api.answer = () => of(detail({ commercial: commercial({ collection: 'psp_online' }) }));
+    await loaded();
+
+    expect(commercialText()).toContain('Dinify via PSP');
+    // The mode records an INTENTION. This platform has no PSP integration at all.
+    expect(commercialText()).toContain('does not confirm that a provider is connected');
+    for (const invented of ['PSP connected', 'Payments live', 'Ready to collect']) {
+      expect(commercialText()).withContext(invented).not.toContain(invented);
+    }
+    flush();
+  }));
+
+  it('renders recorded TERMS with effective_from and recorded_at, precisely named', fakeAsync(async () => {
+    api.answer = () => of(detail({ commercial: commercial({ terms: {} }) }));
+    await loaded();
+
+    expect(commercialText()).toContain('UGX 150,000 · every month');
+    // The two timestamps answer DIFFERENT questions and are labelled as such:
+    // `effective_from` is when the terms became commercially applicable, `recorded_at`
+    // is when Dinify wrote them down. Neither is agreed, signed, activated or paid.
+    expect(commercialText()).toContain('Effective from');
+    expect(commercialText()).toContain('Recorded');
+    for (const invented of ['Agreed', 'Signed', 'Activated', 'Paid']) {
+      expect(commercialText()).withContext(invented).not.toContain(invented);
+    }
+    flush();
+  }));
+
+  it('NEVER RENDERS OPEN TERMS AS AN ACCOUNT STATUS', fakeAsync(async () => {
+    // The panel used to read `has_commercial_subscription ? 'Active' : 'Not configured'`.
+    // An open terms row means somebody at Dinify wrote down a price — not that an
+    // invoice exists, not that anything was collected, not that anyone agreed.
+    api.answer = () => of(detail({ commercial: commercial({ terms: {} }) }));
+    await loaded();
+
+    expect(commercialText()).toContain('Recorded terms only');
+    for (const invented of ['Active', 'Paid', 'Current account', 'In good standing', 'Trial', 'Subscribed']) {
+      expect(commercialText()).withContext(invented).not.toContain(invented);
+    }
+    flush();
+  }));
+
+  it('renders zero-priced terms as a real price', fakeAsync(async () => {
+    api.answer = () =>
+      of(detail({ commercial: commercial({ terms: { recurring_amount: '0.00' } }) }));
+    await loaded();
+
+    expect(commercialText()).toContain('UGX 0 · every month');
+    for (const invented of ['Free', 'Waived', 'No subscription']) {
+      expect(commercialText()).withContext(invented).not.toContain(invented);
+    }
+    flush();
+  }));
+
+  it('keeps a stored decimal fraction on screen', fakeAsync(async () => {
+    api.answer = () =>
+      of(detail({ commercial: commercial({ terms: { recurring_amount: '87500.50' } }) }));
+    await loaded();
+
+    expect(commercialText()).toContain('UGX 87,500.50');
+    expect(commercialText()).not.toContain('UGX 87,500 ·');
+    flush();
+  }));
+
+  it('keeps the legacy record present, labelled and SUBORDINATE', fakeAsync(async () => {
+    await loaded();
+
+    expect(commercialText()).toContain('Legacy record');
+    expect(commercialText()).toContain('Superseded columns');
+    // It exists for reconciliation and says so, rather than reading as a second opinion
+    // on the canonical rows above it.
+    expect(commercialText()).toContain('the state above is authoritative');
+    for (const invented of ['Paid', 'Active subscription', 'In good standing', 'Trial']) {
+      expect(commercialText()).withContext(invented).not.toContain(invented);
+    }
+    flush();
+  }));
+
+  /**
+   * ══ THE COMPATIBILITY CUT-OVER'S MOST IMPORTANT PROOF, ON THE WORKSPACE ═════════
+   *
+   * Same two directions the directory spec proves, asserted here on the Overview panel,
+   * because "the directory is right and the workspace is wrong" is exactly the drift a
+   * shared label layer exists to prevent — and a test that only covered one screen would
+   * not catch it.
+   */
+  describe('canonical commercial state OUTRANKS the compatibility fields', () => {
+    const CONTRADICTORY_LEGACY = {
+      source: 'legacy_restaurant_fields',
+      has_commercial_subscription: false,
+      legacy_validity_flag: true,
+      legacy_expiry_at: '2026-12-31T00:00:00+03:00',
+      preferred_method: 'monthly',
+    };
+
+    it('CASE A — canonical configured, legacy says unconfigured: canonical wins', fakeAsync(async () => {
+      api.answer = () =>
+        of(
+          detail({
+            commercial: commercial({
+              timing: 'pay_first',
+              collection: 'offline',
+              terms: { recurring_amount: '150000.00' },
+            }),
+            // Frozen legacy fields, contradicting all of the above — the real wire shape.
+            payment_mode: null,
+            payment_mode_configured: false,
+            subscription: { ...CONTRADICTORY_LEGACY, legacy_validity_flag: false },
+          }),
+        );
+      await loaded();
+
+      expect(commercialRow('Payment timing')).toContain('Pay first');
+      expect(commercialRow('Collection mode')).toContain('Restaurant collects');
+      expect(commercialRow('Subscription terms')).toContain('UGX 150,000 · every month');
+
+      // THE SPECIFIC FAILURE THIS GUARDS: a commercial row falling back to the frozen
+      // legacy booleans and reporting a fully-configured restaurant as unconfigured.
+      // Asserted per row, because Readiness sits in the same panel and says "Not
+      // configured" truthfully — the seam fails closed until Step 3.
+      for (const row of ['Payment timing', 'Collection mode', 'Subscription terms']) {
+        expect(commercialRow(row)).withContext(row).not.toContain('Not configured');
+      }
+      flush();
+    }));
+
+    it('CASE B — canonical unconfigured, legacy validity TRUE: never Active', fakeAsync(async () => {
+      api.answer = () =>
+        of(detail({ commercial: commercial(), subscription: CONTRADICTORY_LEGACY }));
+      await loaded();
+
+      for (const row of ['Payment timing', 'Collection mode', 'Subscription terms']) {
+        expect(commercialRow(row)).withContext(row).toBe('Not configured');
+      }
+      for (const invented of ['Active', 'Paid', 'Current account', 'In good standing', 'Trial', 'Subscribed']) {
+        expect(commercialText()).withContext(invented).not.toContain(invented);
+      }
+      // And no note claiming terms exist, because none do.
+      expect(commercialText()).not.toContain('Recorded terms only');
+      flush();
+    }));
+
+    it('shows terms recorded while both service axes are still undecided', fakeAsync(async () => {
+      // The three facts are independent, and one may not suppress another.
+      api.answer = () =>
+        of(detail({ commercial: commercial({ terms: { recurring_amount: '87500.50' } }) }));
+      await loaded();
+
+      expect(commercialRow('Subscription terms')).toContain('UGX 87,500.50 · every month');
+      expect(commercialRow('Payment timing')).toBe('Not configured');
+      expect(commercialRow('Collection mode')).toBe('Not configured');
+      flush();
+    }));
+  });
 
   it('shows the operational counts', fakeAsync(async () => {
     await loaded();

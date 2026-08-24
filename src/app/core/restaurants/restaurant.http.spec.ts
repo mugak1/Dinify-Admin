@@ -8,6 +8,7 @@ import { TestBed } from '@angular/core/testing';
 
 import { RestaurantHttp } from './restaurant.http';
 import {
+  CommercialSummary,
   DirectoryQuery,
   OnboardingSummary,
   RestaurantDetail,
@@ -28,10 +29,47 @@ const DEFAULT_QUERY: DirectoryQuery = {
 };
 
 /**
+ * The canonical commercial projection, with NOTHING configured — the shape a restaurant
+ * that has made no commercial decisions actually returns. Every null here is one a
+ * helpful `?? ''` or `?? 0` in the transport would destroy.
+ */
+const UNCONFIGURED_COMMERCIAL: CommercialSummary = {
+  payment_timing: { configured: false, value: null, set_at: null },
+  payment_collection_mode: { configured: false, value: null, set_at: null },
+  subscription_terms: { configured: false, current: null },
+};
+
+/** The same projection fully populated, with a terms row on every field. */
+const CONFIGURED_COMMERCIAL: CommercialSummary = {
+  payment_timing: {
+    configured: true,
+    value: 'pay_first',
+    set_at: '2026-08-24T12:00:00+00:00',
+  },
+  payment_collection_mode: {
+    configured: true,
+    value: 'psp_online',
+    set_at: '2026-08-23T09:30:00+00:00',
+  },
+  subscription_terms: {
+    configured: true,
+    current: {
+      id: '5d6e7f80-9a1b-4c2d-8e3f-000000000abc',
+      recurring_amount: '150000.00',
+      currency: 'UGX',
+      billing_interval: { unit: 'month', count: 2 },
+      effective_from: '2026-08-01T00:00:00+00:00',
+      recorded_at: '2026-08-24T12:00:00+00:00',
+    },
+  },
+};
+
+/**
  * A row carrying every null the backend can actually send. Fixtures that only ever
  * hold populated values are how a transport quietly grows a `?? ''`.
  */
 const SPARSE_ROW: RestaurantRow = {
+  commercial: UNCONFIGURED_COMMERCIAL,
   id: DETAIL_ID,
   name: 'Speke Road Cafe',
   location: null,
@@ -386,6 +424,16 @@ describe('RestaurantHttp', () => {
       expect(received?.onboarding).toEqual(rich);
     });
 
+    it('passes the canonical commercial object through on DETAIL, byte for byte', () => {
+      let received: RestaurantDetail | undefined;
+      http.detail(DETAIL_ID).subscribe((value) => (received = value));
+      controller
+        .expectOne(`/api/admin/v1/restaurants/${DETAIL_ID}/`)
+        .flush({ status: 200, data: { ...DETAIL, commercial: CONFIGURED_COMMERCIAL } });
+
+      expect(received?.commercial).toEqual(CONFIGURED_COMMERCIAL);
+    });
+
     it('surfaces a 404 as an error rather than an empty result', () => {
       const seen: number[] = [];
       http.detail(DETAIL_ID).subscribe({
@@ -397,6 +445,128 @@ describe('RestaurantHttp', () => {
         .flush({ status: 404, message: 'Restaurant not found.' }, { status: 404, statusText: 'Not Found' });
 
       expect(seen).toEqual([404]);
+    });
+  });
+
+  /**
+   * ══ THE CANONICAL COMMERCIAL CONTRACT SURVIVES THE TRANSPORT UNTOUCHED ══════════
+   *
+   * The rule this block exists to hold: THE TRANSPORT IS A PIPE, NOT A COMMERCIAL RULES
+   * ENGINE. It unwraps the envelope and hands the payload on. It does not derive
+   * `configured` from a value, does not fill a null, does not reformat a decimal string,
+   * does not read a legacy field, and does not invent a commercial fact the server did
+   * not send — because every one of those would put a claim on screen that no row in the
+   * database supports.
+   */
+  describe('the commercial projection', () => {
+    function listedRow(commercial: CommercialSummary): RestaurantRow | undefined {
+      let received: RestaurantDirectoryPage | undefined;
+      http.list(DEFAULT_QUERY).subscribe((value) => (received = value));
+      controller
+        .expectOne((request) => request.url === LIST_URL)
+        .flush({ status: 200, data: page([{ ...SPARSE_ROW, commercial }]) });
+      return received?.results[0];
+    }
+
+    it('carries commercial on DIRECTORY rows', () => {
+      // It is deliberately NOT detail-only: the server computes it once and sends the
+      // same object to both reads, which is what makes a row and a workspace header
+      // structurally incapable of disagreeing.
+      expect(listedRow(CONFIGURED_COMMERCIAL)?.commercial).toEqual(CONFIGURED_COMMERCIAL);
+    });
+
+    it('preserves PARTIAL configuration exactly as sent', () => {
+      // The three facts are independent and every partial combination is real. A
+      // transport that normalised one axis onto the other would erase the state.
+      const partial: CommercialSummary = {
+        payment_timing: { configured: true, value: 'pay_after', set_at: '2026-08-24T12:00:00+00:00' },
+        payment_collection_mode: { configured: false, value: null, set_at: null },
+        subscription_terms: { configured: false, current: null },
+      };
+
+      const row = listedRow(partial);
+      expect(row?.commercial).toEqual(partial);
+      expect(row?.commercial.payment_timing.value).toBe('pay_after');
+      expect(row?.commercial.payment_collection_mode.configured).toBeFalse();
+    });
+
+    it('leaves every null NULL', () => {
+      const row = listedRow(UNCONFIGURED_COMMERCIAL);
+      expect(row?.commercial.payment_timing.value).toBeNull();
+      expect(row?.commercial.payment_timing.set_at).toBeNull();
+      expect(row?.commercial.payment_collection_mode.value).toBeNull();
+      expect(row?.commercial.payment_collection_mode.set_at).toBeNull();
+      expect(row?.commercial.subscription_terms.current)
+        .withContext('a null terms row is not an empty object')
+        .toBeNull();
+    });
+
+    it('keeps recurring_amount the EXACT string the backend sent', () => {
+      // The backend serialises the Decimal with `str()` so DRF's encoder cannot turn it
+      // into a float. A transport that parsed it would reintroduce exactly the hazard
+      // that was avoided, and a price nobody can reconcile.
+      const amounts = ['150000.00', '0.00', '150000.50', '99999999.99'];
+      for (const amount of amounts) {
+        const row = listedRow({
+          ...CONFIGURED_COMMERCIAL,
+          subscription_terms: {
+            configured: true,
+            current: { ...CONFIGURED_COMMERCIAL.subscription_terms.current!, recurring_amount: amount },
+          },
+        });
+        const received = row?.commercial.subscription_terms.current?.recurring_amount;
+        expect(received).withContext(amount).toBe(amount);
+        expect(typeof received).withContext(`${amount} stays a string`).toBe('string');
+      }
+    });
+
+    it('keeps the terms id exact — it is a concurrency token, not decoration', () => {
+      // Step 3C's writers take `expected_terms_id`. A value this layer reshaped would
+      // make a future optimistic-concurrency assertion fail against a fact it did read.
+      const row = listedRow(CONFIGURED_COMMERCIAL);
+      expect(row?.commercial.subscription_terms.current?.id)
+        .toBe('5d6e7f80-9a1b-4c2d-8e3f-000000000abc');
+    });
+
+    it('keeps the billing interval unit and count unchanged', () => {
+      const interval = listedRow(CONFIGURED_COMMERCIAL)?.commercial.subscription_terms.current
+        ?.billing_interval;
+      expect(interval?.unit).toBe('month');
+      expect(interval?.count).withContext('a count of 2 is not normalised to 1').toBe(2);
+    });
+
+    it('keeps every commercial timestamp unchanged', () => {
+      // Formatting is the presentation layer's job, and it happens against EAT. A
+      // transport that pre-formatted would leave the pages unable to distinguish
+      // `set_at` from `effective_from` from `recorded_at`.
+      const row = listedRow(CONFIGURED_COMMERCIAL);
+      expect(row?.commercial.payment_timing.set_at).toBe('2026-08-24T12:00:00+00:00');
+      expect(row?.commercial.payment_collection_mode.set_at).toBe('2026-08-23T09:30:00+00:00');
+      expect(row?.commercial.subscription_terms.current?.effective_from)
+        .toBe('2026-08-01T00:00:00+00:00');
+      expect(row?.commercial.subscription_terms.current?.recorded_at)
+        .toBe('2026-08-24T12:00:00+00:00');
+    });
+
+    it('DOES NOT DERIVE canonical state from the compatibility fields', () => {
+      // The wire carries both contracts and they disagree by design: the server freezes
+      // `payment_mode` null and `has_commercial_subscription` false while `commercial`
+      // says otherwise. The transport must reconcile NEITHER direction — it hands both
+      // on exactly as they arrived and lets the labels decide which one is authoritative.
+      const row = listedRow(CONFIGURED_COMMERCIAL);
+
+      expect(row?.commercial.payment_collection_mode.value)
+        .withContext('canonical is untouched by the frozen legacy null')
+        .toBe('psp_online');
+      expect(row?.commercial.subscription_terms.configured)
+        .withContext('canonical is untouched by the frozen legacy false')
+        .toBeTrue();
+
+      expect(row?.payment_mode).withContext('legacy is not back-filled either').toBeNull();
+      expect(row?.payment_mode_configured).toBeFalse();
+      expect(row?.subscription.has_commercial_subscription)
+        .withContext('the frozen legacy flag is not flipped to match')
+        .toBeFalse();
     });
   });
 });

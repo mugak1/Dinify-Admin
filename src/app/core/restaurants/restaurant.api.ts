@@ -16,9 +16,25 @@ import { DirectoryQuery, RestaurantDetail, RestaurantDirectoryPage } from './res
  * the set of endpoints this repo can call stays enumerable; a generic client that
  * takes a URL makes every future screen free to invent its own contract.
  *
- * STEP 1 IS A READ SLICE. There is no write here and there must not be one until the
- * step that owns it lands — the lifecycle transition is Step 4, and it needs the
- * elevation dialog, a preflight and a written reason, none of which exist yet.
+ * IT IS STILL A READ PORT, AND STEP 3E.1 DELIBERATELY LEFT IT ONE. That step migrated
+ * this application onto the backend's canonical `commercial` object — payment timing,
+ * payment collection mode and subscription terms — but added no way to CHANGE any of
+ * them. Reading the authoritative domain correctly comes first; exposing writes against
+ * that exact truth comes second, which is the whole reason the two are separate steps.
+ *
+ * So there is no `setPaymentTiming`, no `setPaymentCollectionMode`, no
+ * `recordSubscriptionTerms` / `replaceSubscriptionTerms` / `endSubscriptionTerms`, no
+ * generic `post()` and no generic `ApiService` — and there must not be one until the
+ * step that owns it lands:
+ *
+ *   Step 3E.2  the service-configuration controls (timing, collection mode)
+ *   Step 3E.3  the subscription-terms controls
+ *   Step 4     the lifecycle transition
+ *
+ * Each needs things this slice does not have: elevation, a written reason, and the
+ * optimistic-concurrency assertion the read already carries the tokens for
+ * (`payment_timing.value`, `payment_collection_mode.value`,
+ * `subscription_terms.current.id` are what a writer sends back as `expected_*`).
  */
 export interface RestaurantApi {
   /** The directory page for `query`. Only `KNOWN_PARAMS` are ever sent. */

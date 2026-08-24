@@ -47,12 +47,40 @@ export class RestaurantWorkspaceStore {
   private readonly _detail = signal<RestaurantDetail | null>(null);
   private readonly _failure = signal<LoadFailure | null>(null);
   private readonly _loading = signal(false);
+  private readonly _mutating = signal(false);
 
   /** The restaurant, once read. Null while loading, and after a failure. */
   readonly detail = this._detail.asReadonly();
   /** Why the read failed, or null. `kind === 'not-found'` is its own rendered state. */
   readonly failure = this._failure.asReadonly();
   readonly loading = this._loading.asReadonly();
+
+  /**
+   * True while a service-configuration write is in flight for THIS restaurant.
+   *
+   * ── WHY THE FLAG LIVES HERE AND NOT ON THE TAB ────────────────────────────────────
+   *
+   * It was a signal on the Overview component, and review found the hole: the tabs are
+   * SIBLING ROUTES under this store, so switching to Readiness DESTROYS Overview while
+   * the request keeps running — the write is deliberately not torn down with the
+   * component. Coming back builds a fresh instance whose local flag reads false, and it
+   * would happily start a second write against the same restaurant.
+   *
+   * That is the exact race the one-at-a-time rule exists to prevent: each write returns
+   * the WHOLE canonical commercial object, so two in flight can land out of order and
+   * the older snapshot repaints the newer axis change.
+   *
+   * The guarantee is a property of the WORKSPACE — "one service-configuration mutation
+   * at a time for this restaurant" — not of one tab's component, so it belongs on the
+   * thing whose lifetime actually matches: this store is provided on `/restaurants/:id`
+   * and outlives every tab beneath it.
+   *
+   * NOT SOLVED BY `takeUntilDestroyed`, and that alternative is worse. The request has
+   * already been sent; cancelling the subscription does not un-send it, so the server may
+   * still commit while the client throws the response away — manufacturing an
+   * indeterminate outcome out of a routine tab click.
+   */
+  readonly mutating = this._mutating.asReadonly();
 
   readonly state = computed<WorkspaceState>(() => {
     if (this._loading()) return 'loading';
@@ -144,5 +172,24 @@ export class RestaurantWorkspaceStore {
     const current = this._detail();
     if (current === null) return;
     this._detail.set({ ...current, commercial });
+  }
+
+  /**
+   * Claim the single service-configuration write slot. False when one is already in
+   * flight, in which case the caller must not send anything.
+   */
+  beginMutation(): boolean {
+    if (this._mutating()) return false;
+    this._mutating.set(true);
+    return true;
+  }
+
+  /**
+   * Release the slot. Safe to call from a callback whose component has since been
+   * destroyed — which is the ordinary case when an operator navigates away mid-write,
+   * and precisely why the flag is held here.
+   */
+  endMutation(): void {
+    this._mutating.set(false);
   }
 }

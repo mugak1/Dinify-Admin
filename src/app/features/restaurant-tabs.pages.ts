@@ -765,7 +765,16 @@ export class RestaurantOverviewTab {
 
   /** Which axis is being edited, or none. Never both — see the template comment. */
   protected readonly editing = signal<'timing' | 'collection' | null>(null);
-  protected readonly pending = signal(false);
+
+  /**
+   * IN FLIGHT — owned by the route-scoped workspace, not by this component.
+   *
+   * The tabs are sibling routes, so this component is destroyed and rebuilt on every tab
+   * switch while a write keeps running. A local flag reads false on the new instance and
+   * would let a second write start against the same restaurant; the store's lifetime is
+   * the restaurant's, which is what the one-at-a-time rule is actually about.
+   */
+  protected readonly pending = this.workspace.mutating;
   protected readonly writeError = signal<string | null>(null);
   protected readonly writeFieldErrors = signal<Record<string, readonly string[]>>({});
   protected readonly confirmation = signal<string | null>(null);
@@ -786,8 +795,11 @@ export class RestaurantOverviewTab {
     () => this.commercial()?.payment_collection_mode.value ?? null,
   );
 
-  /** While a write is in flight, neither axis may start another. */
-  protected readonly changeDisabled = computed(() => this.pending());
+  /**
+   * While a write is in flight ANYWHERE IN THIS WORKSPACE, neither axis may start
+   * another — including on a freshly rebuilt Overview after a tab round-trip.
+   */
+  protected readonly changeDisabled = computed(() => this.workspace.mutating());
 
   protected readonly timingOptions: readonly CommercialAxisOption[] = [
     {
@@ -842,14 +854,14 @@ export class RestaurantOverviewTab {
    * service-configuration change may be in progress at a time.
    */
   protected openEditor(axis: 'timing' | 'collection'): void {
-    if (this.pending()) return;
+    if (this.workspace.mutating()) return;
     this.clearOutcome();
     this.expectedCurrent.set(axis === 'timing' ? this.timingValue() : this.collectionValue());
     this.editing.set(axis);
   }
 
   protected closeEditor(): void {
-    if (this.pending()) return;
+    if (this.workspace.mutating()) return;
     this.editing.set(null);
     this.expectedCurrent.set(null);
     this.clearOutcome();
@@ -857,9 +869,12 @@ export class RestaurantOverviewTab {
 
   protected saveTiming(submission: CommercialAxisSubmission): void {
     const id = this.restaurant()?.id;
-    if (id === undefined || this.pending()) return;
+    if (id === undefined) return;
+    // The slot is claimed BEFORE anything is sent, and the claim is the guard — a
+    // separate `pending()` check would be a second source of truth that could disagree
+    // with it.
+    if (!this.beginWrite()) return;
 
-    this.beginWrite();
     this.api
       .setPaymentTiming(id, {
         value: submission.value as PaymentTiming,
@@ -876,9 +891,12 @@ export class RestaurantOverviewTab {
 
   protected saveCollection(submission: CommercialAxisSubmission): void {
     const id = this.restaurant()?.id;
-    if (id === undefined || this.pending()) return;
+    if (id === undefined) return;
+    // The slot is claimed BEFORE anything is sent, and the claim is the guard — a
+    // separate `pending()` check would be a second source of truth that could disagree
+    // with it.
+    if (!this.beginWrite()) return;
 
-    this.beginWrite();
     this.api
       .setPaymentCollectionMode(id, {
         value: submission.value as PaymentCollectionMode,
@@ -891,11 +909,13 @@ export class RestaurantOverviewTab {
       });
   }
 
-  private beginWrite(): void {
-    this.pending.set(true);
+  /** Claim the workspace's single write slot. False means: send nothing. */
+  private beginWrite(): boolean {
+    if (!this.workspace.beginMutation()) return false;
     this.writeError.set(null);
     this.writeFieldErrors.set({});
     this.confirmation.set(null);
+    return true;
   }
 
   private clearOutcome(): void {
@@ -915,7 +935,7 @@ export class RestaurantOverviewTab {
    */
   private onWritten(changed: boolean, commercial: CommercialSummary, axisLabel: string): void {
     this.workspace.adoptCommercial(commercial);
-    this.pending.set(false);
+    this.workspace.endMutation();
     this.editing.set(null);
     this.expectedCurrent.set(null);
     this.writeError.set(null);
@@ -937,7 +957,7 @@ export class RestaurantOverviewTab {
    * status, and a conflict is a well-formed answer rather than a defect.
    */
   private onWriteFailed(error: unknown): void {
-    this.pending.set(false);
+    this.workspace.endMutation();
 
     // Re-authentication dismissed. NOTHING was sent, so the draft and the reason are
     // kept and the editor stays open — wiping an operator's typed reason because they

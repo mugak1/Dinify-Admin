@@ -714,6 +714,19 @@ out of order and the older snapshot would repaint the other axis. That is a race
 client would be doing to itself; it is NOT a substitute for server concurrency, which
 `expected_current` and the 409 still own.
 
+**THE IN-FLIGHT FLAG LIVES ON THE ROUTE-SCOPED STORE, NOT ON THE TAB**, and that is the
+whole point rather than a detail. The tabs are SIBLING ROUTES, so switching to Readiness
+DESTROYS Overview while the request keeps running — the write is deliberately not torn
+down with the component. A component-local flag reads false on the rebuilt instance, and
+a second write could start against the same restaurant; review found exactly that. The
+guarantee is a property of the WORKSPACE, so it is held by the thing whose lifetime
+matches. `beginMutation()` / `endMutation()` are safe to call from a callback whose
+component has since been destroyed, which is the ordinary case.
+
+`takeUntilDestroyed` WOULD BE WORSE, not a fix: the request has already been sent, so
+cancelling the subscription does not un-send it — the server may still commit while the
+client discards the response, manufacturing an indeterminate outcome out of a tab click.
+
 ### THE OUTCOMES ARE GENUINELY DIFFERENT
 | outcome | what happens |
 |---|---|

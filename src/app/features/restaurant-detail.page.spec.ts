@@ -533,7 +533,14 @@ describe('RestaurantOverviewTab', () => {
               path: 'restaurants/:id',
               component: RestaurantDetailPage,
               providers: [RestaurantWorkspaceStore],
-              children: [{ path: '', component: RestaurantOverviewTab }],
+              children: [
+                { path: '', component: RestaurantOverviewTab },
+                // A REAL SIBLING TAB, mounted the way it ships. Overview is destroyed and
+                // rebuilt when the operator switches to it while the workspace store
+                // survives, and that asymmetry is exactly what the in-flight write state
+                // has to be correct across — so the suite has to be able to navigate it.
+                { path: 'readiness', component: RestaurantReadinessTab },
+              ],
             },
             { path: 'restaurants', children: [] },
           ],
@@ -1102,6 +1109,57 @@ describe('RestaurantOverviewTab', () => {
       pending.next({ changed: true, commercial: commercial({ timing: 'pay_after' }) });
       pending.complete();
       harness.detectChanges();
+      flush();
+    }));
+
+    it('SURVIVES A TAB ROUND-TRIP: no second writer after Overview is rebuilt', fakeAsync(async () => {
+      // THE REGRESSION THIS EXISTS FOR. The tabs are SIBLING ROUTES under the workspace,
+      // so switching to Readiness destroys Overview while the write keeps running — it is
+      // deliberately not torn down with the component, because cancelling a subscription
+      // does not un-send a request the server may still commit.
+      //
+      // With the in-flight flag held on the COMPONENT, the rebuilt instance read false and
+      // would start a second write. Two whole-commercial snapshots could then land out of
+      // order and the older one would repaint the newer axis change. The flag lives on the
+      // route-scoped store instead, whose lifetime is the restaurant's.
+      const pending = new Subject<CommercialMutationResult>();
+      await loaded();
+      api.writeAnswer = () => pending;
+
+      openEditor('Payment timing');
+      chooseAndReason('pay_after');
+      saveButton().click();
+      harness.detectChanges();
+      expect(api.writes.length).toBe(1);
+
+      // Away to another tab, and back. The harness tracks the top-level routed
+      // component — the persistent workspace shell — while the CHILD beneath it is
+      // destroyed and rebuilt, which is precisely the lifetime difference under test.
+      await harness.navigateByUrl(`/restaurants/${ID}/readiness`, RestaurantDetailPage);
+      harness.detectChanges();
+      expect(editor()).withContext('Overview is gone while on another tab').toBeNull();
+
+      await harness.navigateByUrl(`/restaurants/${ID}`, RestaurantDetailPage);
+      harness.detectChanges();
+
+      // The write is still in flight, and the rebuilt tab knows it.
+      expect(changeButton('Payment timing')!.disabled).withContext('timing').toBeTrue();
+      expect(changeButton('Collection mode')!.disabled).withContext('collection').toBeTrue();
+
+      changeButton('Payment timing')!.click();
+      harness.detectChanges();
+      expect(editor()).withContext('no editor opens while a write is in flight').toBeNull();
+      expect(api.writes.length).withContext('still exactly one request').toBe(1);
+
+      // And the original write still lands on the surviving workspace.
+      pending.next({ changed: true, commercial: commercial({ timing: 'pay_after' }) });
+      pending.complete();
+      harness.detectChanges();
+
+      expect(axisValue('payment_timing')).toBe('Pay after');
+      expect(changeButton('Payment timing')!.disabled)
+        .withContext('the slot is released even though the original component is gone')
+        .toBeFalse();
       flush();
     }));
 

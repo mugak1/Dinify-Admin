@@ -8,12 +8,15 @@ import { RouterTestingHarness } from '@angular/router/testing';
 import { Observable, Subject, of, throwError } from 'rxjs';
 
 import { AdminServiceStatus } from '../core/api/service-status';
+import { ElevationCancelledError } from '../core/auth/elevation.service';
+import { formatEat } from '../core/formatting/time';
 import {
   RESTAURANT_API,
   RestaurantApi,
 } from '../core/restaurants/restaurant.api';
 import { RestaurantWorkspaceStore } from '../core/restaurants/restaurant-workspace.store';
 import {
+  CommercialMutationResult,
   CommercialSubscriptionTerms,
   CommercialSummary,
   OnboardingSummary,
@@ -21,6 +24,8 @@ import {
   PaymentTiming,
   RestaurantDetail,
   RestaurantDirectoryPage,
+  SetPaymentCollectionModeRequest,
+  SetPaymentTimingRequest,
 } from '../core/restaurants/restaurant.model';
 import { RestaurantDetailPage } from './restaurant-detail.page';
 import {
@@ -200,9 +205,22 @@ function detail(overrides: Partial<RestaurantDetail> = {}): RestaurantDetail {
   };
 }
 
+/** One recorded write, so a test can assert the EXACT body that was sent. */
+interface RecordedWrite {
+  readonly axis: 'timing' | 'collection';
+  readonly restaurantId: string;
+  readonly body: Record<string, unknown>;
+}
+
 class StubApi implements RestaurantApi {
   detailCalls: string[] = [];
   answer: () => Observable<RestaurantDetail> = () => of(detail());
+
+  /** Every service-configuration write attempted, in order. */
+  readonly writes: RecordedWrite[] = [];
+  /** How the next write answers. Defaults to a successful, changed mutation. */
+  writeAnswer: () => Observable<CommercialMutationResult> = () =>
+    of({ changed: true, commercial: commercial({ timing: 'pay_after' }) });
 
   list(): Observable<RestaurantDirectoryPage> {
     throw new Error('the workspace must not read the directory');
@@ -210,6 +228,24 @@ class StubApi implements RestaurantApi {
   detail(id: string): Observable<RestaurantDetail> {
     this.detailCalls.push(id);
     return this.answer();
+  }
+
+  setPaymentTiming(
+    restaurantId: string,
+    request: SetPaymentTimingRequest,
+  ): Observable<CommercialMutationResult> {
+    // Captured as a plain record so a test can assert on KEY PRESENCE — `expected_current`
+    // being present-and-null is a different request from it being absent.
+    this.writes.push({ axis: 'timing', restaurantId, body: { ...request } });
+    return this.writeAnswer();
+  }
+
+  setPaymentCollectionMode(
+    restaurantId: string,
+    request: SetPaymentCollectionModeRequest,
+  ): Observable<CommercialMutationResult> {
+    this.writes.push({ axis: 'collection', restaurantId, body: { ...request } });
+    return this.writeAnswer();
   }
 }
 
@@ -497,7 +533,14 @@ describe('RestaurantOverviewTab', () => {
               path: 'restaurants/:id',
               component: RestaurantDetailPage,
               providers: [RestaurantWorkspaceStore],
-              children: [{ path: '', component: RestaurantOverviewTab }],
+              children: [
+                { path: '', component: RestaurantOverviewTab },
+                // A REAL SIBLING TAB, mounted the way it ships. Overview is destroyed and
+                // rebuilt when the operator switches to it while the workspace store
+                // survives, and that asymmetry is exactly what the in-flight write state
+                // has to be correct across — so the suite has to be able to navigate it.
+                { path: 'readiness', component: RestaurantReadinessTab },
+              ],
             },
             { path: 'restaurants', children: [] },
           ],
@@ -549,7 +592,12 @@ describe('RestaurantOverviewTab', () => {
   function commercialRow(term: string): string {
     const terms = Array.from(commercialPanel()?.querySelectorAll('dt') ?? []);
     const dt = terms.find((node) => node.textContent?.trim() === term);
-    return dt?.nextElementSibling?.textContent?.trim() ?? '';
+    const dd = dt?.nextElementSibling;
+    // The two editable axes carry a Change control inside their `dd`, so the VALUE is
+    // read off its own element. Falling back to the whole `dd` keeps this working for
+    // the rows that have no control (subscription terms, readiness).
+    const value = dd?.querySelector('[data-axis-value]');
+    return (value ?? dd)?.textContent?.trim() ?? '';
   }
 
   async function loaded(): Promise<void> {
@@ -834,6 +882,530 @@ describe('RestaurantOverviewTab', () => {
       expect(commercialRow('Subscription terms')).toContain('UGX 87,500.50 · every month');
       expect(commercialRow('Payment timing')).toBe('Not configured');
       expect(commercialRow('Collection mode')).toBe('Not configured');
+      flush();
+    }));
+  });
+
+  /**
+   * ══ THE SERVICE-CONFIGURATION CONTROLS (Step 3E.2) ══════════════════════════════
+   *
+   * These pin the behaviours that could let an operator corrupt commercial state — not
+   * layout, not classes. The recurring theme is that the SERVER is authoritative and the
+   * screen never gets ahead of it: no row moves before a 200, no token is recomputed
+   * after an editor opens, no conflict is retried, and no local write can race another.
+   */
+  describe('service-configuration controls', () => {
+    const REASON = 'Switching to table service';
+
+    /** The Change button for one axis, addressed through its row. */
+    function changeButton(term: string): HTMLButtonElement | null {
+      const terms = Array.from(commercialPanel()?.querySelectorAll('dt') ?? []);
+      const dt = terms.find((node) => node.textContent?.trim() === term);
+      return dt?.nextElementSibling?.querySelector('button') ?? null;
+    }
+
+    function editor(): Element | null {
+      return commercialPanel()?.querySelector('[data-commercial-editor]') ?? null;
+    }
+
+    function editorHeading(): string {
+      return editor()?.querySelector('h3')?.textContent?.trim() ?? '';
+    }
+
+    /** The rendered value of one axis, read off its own element rather than the blob. */
+    function axisValue(key: string): string {
+      return (
+        commercialPanel()?.querySelector(`[data-axis-value="${key}"]`)?.textContent?.trim() ?? ''
+      );
+    }
+
+    function openEditor(term: string): void {
+      changeButton(term)!.click();
+      harness.detectChanges();
+    }
+
+    function chooseAndReason(value: string, reason = REASON): void {
+      const radio = editor()!.querySelector<HTMLInputElement>(`input[value="${value}"]`)!;
+      radio.click();
+      const box = editor()!.querySelector<HTMLTextAreaElement>('[data-commercial-reason]')!;
+      box.value = reason;
+      box.dispatchEvent(new Event('input'));
+      harness.detectChanges();
+    }
+
+    function saveButton(): HTMLButtonElement {
+      return Array.from(editor()!.querySelectorAll('button')).find(
+        (button) => button.textContent?.trim() === 'Save change',
+      )!;
+    }
+
+    // --- what the panel offers ----------------------------------------------------
+
+    it('offers a control on each service axis, and NONE on subscription terms', fakeAsync(async () => {
+      // Subscription terms are Step 3E.3. Not a disabled placeholder either — a control
+      // that cannot work still tells an operator the capability is there.
+      await loaded();
+
+      expect(changeButton('Payment timing')).withContext('timing').not.toBeNull();
+      expect(changeButton('Collection mode')).withContext('collection').not.toBeNull();
+      expect(changeButton('Subscription terms')).withContext('terms').toBeNull();
+      flush();
+    }));
+
+    it('shows the current canonical value on each axis', fakeAsync(async () => {
+      api.answer = () =>
+        of(detail({ commercial: commercial({ timing: 'pay_first', collection: 'offline' }) }));
+      await loaded();
+
+      expect(axisValue('payment_timing')).toBe('Pay first');
+      expect(axisValue('payment_collection_mode')).toBe('Restaurant collects');
+      flush();
+    }));
+
+    // --- one editor, one flight ---------------------------------------------------
+
+    it('opens ONE editor at a time, and opening the other replaces it', fakeAsync(async () => {
+      await loaded();
+
+      openEditor('Payment timing');
+      expect(editorHeading()).toBe('Payment timing');
+      expect(commercialPanel()!.querySelectorAll('[data-commercial-editor]').length).toBe(1);
+
+      openEditor('Collection mode');
+      expect(editorHeading()).toBe('Collection mode');
+      expect(commercialPanel()!.querySelectorAll('[data-commercial-editor]').length).toBe(1);
+      flush();
+    }));
+
+    it('does not mutate the displayed value merely by opening an editor', fakeAsync(async () => {
+      api.answer = () => of(detail({ commercial: commercial({ timing: 'pay_first' }) }));
+      await loaded();
+
+      openEditor('Payment timing');
+      chooseAndReason('pay_after');
+
+      // Choosing an option is not deciding anything. The row still reports what the
+      // server last confirmed.
+      expect(axisValue('payment_timing')).toBe('Pay first');
+      expect(api.writes.length).toBe(0);
+      flush();
+    }));
+
+    it('keeps Save unavailable without a different value AND a substantive reason', fakeAsync(async () => {
+      api.answer = () => of(detail({ commercial: commercial({ timing: 'pay_first' }) }));
+      await loaded();
+      openEditor('Payment timing');
+
+      expect(saveButton().disabled).withContext('nothing chosen').toBeTrue();
+
+      chooseAndReason('pay_after', 'too short');
+      expect(saveButton().disabled).withContext('reason below the bar').toBeTrue();
+
+      chooseAndReason('pay_first', REASON);
+      expect(saveButton().disabled).withContext('same value as stored').toBeTrue();
+
+      chooseAndReason('pay_after', REASON);
+      expect(saveButton().disabled).withContext('different value, real reason').toBeFalse();
+      flush();
+    }));
+
+    // --- the request ---------------------------------------------------------------
+
+    it('sends the EXACT loaded value as expected_current, and only that axis', fakeAsync(async () => {
+      api.answer = () =>
+        of(detail({ commercial: commercial({ timing: 'pay_first', collection: 'offline' }) }));
+      await loaded();
+
+      openEditor('Payment timing');
+      chooseAndReason('pay_after');
+      saveButton().click();
+      harness.detectChanges();
+
+      expect(api.writes.length).toBe(1);
+      const [write] = api.writes;
+      expect(write.axis).toBe('timing');
+      expect(write.restaurantId).toBe(ID);
+      expect(write.body).toEqual({
+        value: 'pay_after',
+        expected_current: 'pay_first',
+        reason: REASON,
+      });
+      // The OTHER axis is not in the request at all. Each endpoint writes one decision.
+      expect(Object.keys(write.body)).not.toContain('payment_collection_mode');
+      expect(Object.keys(write.body)).not.toContain('value_collection');
+      flush();
+    }));
+
+    it('sends an EXPLICIT null for an unconfigured axis', fakeAsync(async () => {
+      // "Nobody had configured this when I loaded it" is a real assertion, and the only
+      // one that succeeds against a fresh restaurant. An omitted key asserts nothing.
+      await loaded();
+
+      openEditor('Collection mode');
+      chooseAndReason('offline', 'Initial collection setup for launch');
+      saveButton().click();
+      harness.detectChanges();
+
+      const [write] = api.writes;
+      expect(Object.keys(write.body)).toContain('expected_current');
+      expect(write.body['expected_current']).toBeNull();
+      expect(JSON.stringify(write.body)).toContain('"expected_current":null');
+      flush();
+    }));
+
+    // --- no optimistic UI ----------------------------------------------------------
+
+    it('does NOT repaint the row while the write is in flight', fakeAsync(async () => {
+      api.answer = () => of(detail({ commercial: commercial({ timing: 'pay_first' }) }));
+      const pending = new Subject<CommercialMutationResult>();
+      await loaded();
+      api.writeAnswer = () => pending;
+
+      openEditor('Payment timing');
+      chooseAndReason('pay_after');
+      saveButton().click();
+      harness.detectChanges();
+
+      // §16: a write is real once its audit row commits. Until then the screen says what
+      // the server last confirmed, and the editor stays open.
+      expect(axisValue('payment_timing')).toBe('Pay first');
+      expect(editor()).not.toBeNull();
+      expect(saveButton().disabled).withContext('duplicate submit is impossible').toBeTrue();
+
+      pending.next({ changed: true, commercial: commercial({ timing: 'pay_after' }) });
+      pending.complete();
+      harness.detectChanges();
+
+      expect(axisValue('payment_timing')).toBe('Pay after');
+      flush();
+    }));
+
+    it('cannot start a second write while one is pending, on either axis', fakeAsync(async () => {
+      const pending = new Subject<CommercialMutationResult>();
+      await loaded();
+      api.writeAnswer = () => pending;
+
+      openEditor('Payment timing');
+      chooseAndReason('pay_after');
+      saveButton().click();
+      harness.detectChanges();
+
+      // Both Change controls are unavailable. Each write returns the WHOLE canonical
+      // object, so two in flight could land out of order and the older snapshot would
+      // repaint the other axis.
+      expect(changeButton('Payment timing')!.disabled).toBeTrue();
+      expect(changeButton('Collection mode')!.disabled).toBeTrue();
+
+      changeButton('Collection mode')!.click();
+      harness.detectChanges();
+      expect(editorHeading()).withContext('the pending editor is still the one open').toBe(
+        'Payment timing',
+      );
+
+      saveButton().click();
+      harness.detectChanges();
+      expect(api.writes.length).withContext('still exactly one request').toBe(1);
+
+      pending.next({ changed: true, commercial: commercial({ timing: 'pay_after' }) });
+      pending.complete();
+      harness.detectChanges();
+      flush();
+    }));
+
+    it('SURVIVES A TAB ROUND-TRIP: no second writer after Overview is rebuilt', fakeAsync(async () => {
+      // THE REGRESSION THIS EXISTS FOR. The tabs are SIBLING ROUTES under the workspace,
+      // so switching to Readiness destroys Overview while the write keeps running — it is
+      // deliberately not torn down with the component, because cancelling a subscription
+      // does not un-send a request the server may still commit.
+      //
+      // With the in-flight flag held on the COMPONENT, the rebuilt instance read false and
+      // would start a second write. Two whole-commercial snapshots could then land out of
+      // order and the older one would repaint the newer axis change. The flag lives on the
+      // route-scoped store instead, whose lifetime is the restaurant's.
+      const pending = new Subject<CommercialMutationResult>();
+      await loaded();
+      api.writeAnswer = () => pending;
+
+      openEditor('Payment timing');
+      chooseAndReason('pay_after');
+      saveButton().click();
+      harness.detectChanges();
+      expect(api.writes.length).toBe(1);
+
+      // Away to another tab, and back. The harness tracks the top-level routed
+      // component — the persistent workspace shell — while the CHILD beneath it is
+      // destroyed and rebuilt, which is precisely the lifetime difference under test.
+      await harness.navigateByUrl(`/restaurants/${ID}/readiness`, RestaurantDetailPage);
+      harness.detectChanges();
+      expect(editor()).withContext('Overview is gone while on another tab').toBeNull();
+
+      await harness.navigateByUrl(`/restaurants/${ID}`, RestaurantDetailPage);
+      harness.detectChanges();
+
+      // The write is still in flight, and the rebuilt tab knows it.
+      expect(changeButton('Payment timing')!.disabled).withContext('timing').toBeTrue();
+      expect(changeButton('Collection mode')!.disabled).withContext('collection').toBeTrue();
+
+      changeButton('Payment timing')!.click();
+      harness.detectChanges();
+      expect(editor()).withContext('no editor opens while a write is in flight').toBeNull();
+      expect(api.writes.length).withContext('still exactly one request').toBe(1);
+
+      // And the original write still lands on the surviving workspace.
+      pending.next({ changed: true, commercial: commercial({ timing: 'pay_after' }) });
+      pending.complete();
+      harness.detectChanges();
+
+      expect(axisValue('payment_timing')).toBe('Pay after');
+      expect(changeButton('Payment timing')!.disabled)
+        .withContext('the slot is released even though the original component is gone')
+        .toBeFalse();
+      flush();
+    }));
+
+    // --- success -------------------------------------------------------------------
+
+    it('adopts the canonical response, closes the editor, and confirms', fakeAsync(async () => {
+      api.answer = () => of(detail({ commercial: commercial({ timing: 'pay_first' }) }));
+      await loaded();
+      api.writeAnswer = () =>
+        of({ changed: true, commercial: commercial({ timing: 'pay_after', collection: 'offline' }) });
+
+      openEditor('Payment timing');
+      chooseAndReason('pay_after');
+      saveButton().click();
+      harness.detectChanges();
+
+      // The WHOLE returned projection is adopted — including the other axis, which this
+      // request never mentioned. The server's re-read is authoritative.
+      expect(axisValue('payment_timing')).toBe('Pay after');
+      expect(axisValue('payment_collection_mode')).toBe('Restaurant collects');
+      expect(editor()).withContext('editor closed').toBeNull();
+      expect(commercialText()).toContain('Payment timing recorded.');
+      // No second GET merely to learn what the write already returned.
+      expect(api.detailCalls.length).toBe(1);
+      flush();
+    }));
+
+    it('ADVANCES the concurrency token for the next edit', fakeAsync(async () => {
+      // Loaded null -> wrote pay_first. The NEXT edit must assert pay_first, not the
+      // stale null it originally held.
+      await loaded();
+      api.writeAnswer = () => of({ changed: true, commercial: commercial({ timing: 'pay_first' }) });
+
+      openEditor('Payment timing');
+      chooseAndReason('pay_first', 'Initial service model setup');
+      saveButton().click();
+      harness.detectChanges();
+
+      expect(api.writes[0].body['expected_current']).withContext('first assertion').toBeNull();
+
+      openEditor('Payment timing');
+      chooseAndReason('pay_after', 'Correcting to table service');
+      saveButton().click();
+      harness.detectChanges();
+
+      expect(api.writes[1].body['expected_current']).toBe('pay_first');
+      flush();
+    }));
+
+    it('accepts changed:false without claiming a new decision was written', fakeAsync(async () => {
+      // The lost-response retry. The server committed the first time; this exact retry
+      // is a successful no-op, and must not be described as a second write.
+      api.answer = () => of(detail({ commercial: commercial({ timing: 'pay_first' }) }));
+      await loaded();
+      const settled = commercial({ timing: 'pay_after' });
+      api.writeAnswer = () => of({ changed: false, commercial: settled });
+
+      openEditor('Payment timing');
+      chooseAndReason('pay_after');
+      saveButton().click();
+      harness.detectChanges();
+
+      expect(axisValue('payment_timing')).withContext('canonical state adopted').toBe('Pay after');
+      expect(commercialText()).toContain('Nothing was changed.');
+      expect(commercialText()).not.toContain('Payment timing recorded.');
+      // The set_at shown is the server's; nothing manufactured a fresh one.
+      expect(commercialText()).toContain(formatEat(settled.payment_timing.set_at));
+      flush();
+    }));
+
+    // --- failures ------------------------------------------------------------------
+
+    it('keeps the form and the draft open on a 400, with the field error', fakeAsync(async () => {
+      await loaded();
+      api.writeAnswer = () =>
+        throwError(() => ({
+          status: 400,
+          error: {
+            status: 400,
+            message: 'The request could not be applied.',
+            errors: { reason: ['Please state a reason of at least 10 characters.'] },
+          },
+        }));
+
+      openEditor('Payment timing');
+      chooseAndReason('pay_after');
+      saveButton().click();
+      harness.detectChanges();
+
+      expect(editor()).withContext('form stays open').not.toBeNull();
+      expect(
+        editor()!.querySelector<HTMLTextAreaElement>('[data-commercial-reason]')!.value,
+      ).withContext('draft preserved').toBe(REASON);
+      expect(editor()!.textContent).toContain('at least 10 characters');
+      flush();
+    }));
+
+    it('does NOT auto-retry a 409, reloads, and discards the stale editor', fakeAsync(async () => {
+      api.answer = () => of(detail({ commercial: commercial({ timing: 'pay_first' }) }));
+      await loaded();
+      expect(api.detailCalls.length).toBe(1);
+
+      api.writeAnswer = () =>
+        throwError(() => ({
+          status: 409,
+          error: {
+            status: 409,
+            message: 'Commercial configuration changed since it was loaded.',
+            code: 'stale_service_configuration',
+          },
+        }));
+
+      openEditor('Payment timing');
+      chooseAndReason('pay_after');
+      saveButton().click();
+      harness.detectChanges();
+
+      // Exactly ONE attempt. Replaying with a fresh token would overwrite whatever the
+      // other operator just decided — the thing expected_current exists to prevent.
+      expect(api.writes.length).toBe(1);
+      // The stale editor is gone, so another Save needs a fresh choice, a fresh reason
+      // and a fresh token.
+      expect(editor()).toBeNull();
+      expect(text()).toContain('Configuration changed since you loaded it');
+      // And the workspace was told to re-read.
+      expect(api.detailCalls.length).withContext('reload requested').toBe(2);
+      tick();
+      flush();
+    }));
+
+    it('preserves the draft when re-authentication is cancelled', fakeAsync(async () => {
+      await loaded();
+      api.writeAnswer = () => throwError(() => new ElevationCancelledError());
+
+      openEditor('Payment timing');
+      chooseAndReason('pay_after');
+      saveButton().click();
+      harness.detectChanges();
+
+      // Nothing was sent, so nothing was decided — and making the operator retype a
+      // reason they already wrote would be a tax on cancelling a prompt.
+      expect(editor()).withContext('form stays open').not.toBeNull();
+      expect(
+        editor()!.querySelector<HTMLTextAreaElement>('[data-commercial-reason]')!.value,
+      ).toBe(REASON);
+      expect(editor()!.textContent).toContain('Re-authentication was cancelled');
+      expect(editor()!.textContent).toContain('Nothing was changed');
+      flush();
+    }));
+
+    it('does not claim an indeterminate outage failed to commit', fakeAsync(async () => {
+      await loaded();
+      api.writeAnswer = () =>
+        throwError(() => ({ status: 0, error: null, message: 'Http failure response' }));
+
+      openEditor('Payment timing');
+      chooseAndReason('pay_after');
+      saveButton().click();
+      harness.detectChanges();
+
+      // The write MAY have committed. The copy says exactly that, and the draft survives
+      // so the operator can deliberately retry the same request — which, if the first one
+      // landed, answers changed:false.
+      expect(editor()!.textContent).toContain('not known whether this change was recorded');
+      expect(
+        editor()!.querySelector<HTMLTextAreaElement>('[data-commercial-reason]')!.value,
+      ).toBe(REASON);
+      flush();
+    }));
+
+    // --- truthfulness ---------------------------------------------------------------
+
+    it('never calls offline cash-only, and never claims psp_online is connected', fakeAsync(async () => {
+      await loaded();
+      openEditor('Collection mode');
+      const copy = editor()!.textContent ?? '';
+
+      expect(copy).toContain('Restaurant collects');
+      expect(copy).toContain('Dinify via PSP');
+      // INITIATES, never collects or holds — the restaurant stays merchant of record.
+      expect(copy).toContain('initiating the diner payment');
+      expect(copy).toContain('merchant of record');
+      for (const invented of [
+        'Cash only',
+        'cash only',
+        'PSP connected',
+        'Online payments active',
+        'Dinify collects',
+        'Dinify holds',
+      ]) {
+        expect(copy).withContext(invented).not.toContain(invented);
+      }
+      flush();
+    }));
+
+    it('keeps psp_online SELECTABLE, and warns rather than blocking', fakeAsync(async () => {
+      // A legitimate commercial value. The safety mechanism is fail-closed readiness
+      // later, not a control that refuses to record what an operator decided.
+      await loaded();
+      openEditor('Collection mode');
+
+      const psp = editor()!.querySelector<HTMLInputElement>('input[value="psp_online"]')!;
+      expect(psp.disabled).toBeFalse();
+
+      chooseAndReason('psp_online', 'Moving to provider-initiated collection');
+      expect(saveButton().disabled).withContext('Save is not blocked by the warning').toBeFalse();
+      expect(editor()!.querySelector('[data-commercial-warning]')?.textContent).toContain(
+        'cannot satisfy future go-live readiness',
+      );
+      flush();
+    }));
+
+    it('does not promise that payment timing changes current order behaviour', fakeAsync(async () => {
+      // Nothing in the order or kitchen runtime consumes this value yet, so the copy
+      // records a service model and claims no runtime consequence.
+      await loaded();
+      openEditor('Payment timing');
+      const copy = editor()!.textContent ?? '';
+
+      expect(copy).toContain('Settlement is expected before the kitchen fires the order.');
+      for (const overclaim of [
+        'immediately',
+        'every order will',
+        'takes effect now',
+        'existing orders',
+      ]) {
+        expect(copy).withContext(overclaim).not.toContain(overclaim);
+      }
+      flush();
+    }));
+
+    it('leaves subscription terms untouched by a service-configuration write', fakeAsync(async () => {
+      api.answer = () =>
+        of(detail({ commercial: commercial({ timing: 'pay_first', terms: {} }) }));
+      await loaded();
+      expect(commercialRow('Subscription terms')).toContain('UGX 150,000 · every month');
+
+      api.writeAnswer = () =>
+        of({ changed: true, commercial: commercial({ timing: 'pay_after', terms: {} }) });
+      openEditor('Payment timing');
+      chooseAndReason('pay_after');
+      saveButton().click();
+      harness.detectChanges();
+
+      expect(commercialRow('Subscription terms')).toContain('UGX 150,000 · every month');
+      expect(changeButton('Subscription terms')).toBeNull();
       flush();
     }));
   });
@@ -1458,15 +2030,20 @@ describe('RestaurantOverviewTab — onboarding', () => {
     }));
   });
 
-  // ── NO WRITES ANYWHERE ───────────────────────────────────────────────────────────
+  // ── EXACTLY TWO WRITES, AND NO OTHERS ────────────────────────────────────────────
 
-  it('introduces no consequential action on the whole tab', fakeAsync(async () => {
+  it('offers the two service-configuration controls and NOTHING else', fakeAsync(async () => {
     await loadedWith(onboarding({ source: 'admin_created', invitation: { status: 'pending' } }));
 
-    // The only interactive things Overview has ever had are navigation links. Step 2C
-    // is a read slice: no adopt, no attest, no invite, no create, no lifecycle control.
+    // This assertion used to be `toEqual([])`. Step 3E.2 deliberately gave Overview its
+    // first two consequential actions, so the honest replacement is not a weaker check
+    // but a SHARPER one: the exact set, in place of a count that has stopped being true.
+    //
+    // Everything the onboarding and billing domains might tempt a future slice into
+    // adding is still absent — and, specifically, subscription terms have no control at
+    // all, not even a disabled one. Those are Step 3E.3.
     const buttons = Array.from(el().querySelectorAll('button')).map((b) => b.textContent?.trim());
-    expect(buttons).toEqual([]);
+    expect(buttons).toEqual(['Change', 'Change']);
     for (const fake of [
       'Adopt',
       'Attest',
@@ -1475,6 +2052,11 @@ describe('RestaurantOverviewTab — onboarding', () => {
       'Send invitation',
       'Create restaurant',
       'Assign owner',
+      'Record terms',
+      'Replace terms',
+      'End terms',
+      'Edit subscription',
+      'Edit commercial',
     ]) {
       expect(text()).withContext(fake).not.toContain(fake);
     }

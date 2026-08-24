@@ -312,6 +312,66 @@ describe('errorClassifierInterceptor', () => {
       expect(defects.current()).toBeNull();
     });
 
+    it('replays a COMMERCIAL WRITE with its concurrency token byte-for-byte', () => {
+      // THE REGRESSION THIS EXISTS FOR (Step 3E.2). A service-configuration write asserts
+      // `expected_current` — the exact axis value the operator reviewed before deciding.
+      // Elevation happens BETWEEN the assertion and the write reaching the domain, and
+      // another operator can move the axis during the TOTP prompt.
+      //
+      // If anything rebuilt the request after elevation — re-reading the store, taking a
+      // "fresh" token — the replay would assert a value nobody reviewed and would
+      // overwrite that other operator's decision, silently, with the conflict check
+      // passing. The interceptor replays the ORIGINAL `HttpRequest`, and this pins it.
+      const route = apiUrl('/restaurants/abc/commercial/payment-timing/');
+      const original = {
+        value: 'pay_after',
+        expected_current: 'pay_first',
+        reason: 'Switching to table service',
+      };
+
+      let result: unknown = null;
+      http.post(route, original).subscribe((response) => (result = response));
+
+      backend
+        .expectOne(route)
+        .flush({ detail: ELEVATION_REQUIRED_DETAIL }, { status: 403, statusText: 'Forbidden' });
+      elevation.succeed();
+
+      const replay = backend.expectOne(route);
+      expect(replay.request.body).toEqual(original);
+      replay.flush({ status: 200, data: { changed: true, commercial: {} } });
+
+      expect(result).toEqual({ status: 200, data: { changed: true, commercial: {} } });
+    });
+
+    it('replays an EXPLICIT NULL assertion as a null, not as an omission', () => {
+      // The unconfigured-axis case. "Nobody had configured this when I loaded it" is the
+      // only assertion that succeeds against a fresh restaurant, and it survives the
+      // elevation round trip only if the original body is replayed rather than rebuilt —
+      // a reconstructed body is one `??` away from dropping the key entirely, which the
+      // server answers 400.
+      const route = apiUrl('/restaurants/abc/commercial/payment-collection-mode/');
+      const original = {
+        value: 'offline',
+        expected_current: null,
+        reason: 'Initial collection setup',
+      };
+
+      http.post(route, original).subscribe();
+
+      backend
+        .expectOne(route)
+        .flush({ detail: ELEVATION_REQUIRED_DETAIL }, { status: 403, statusText: 'Forbidden' });
+      elevation.succeed();
+
+      const replay = backend.expectOne(route);
+      const body = replay.request.body as Record<string, unknown>;
+      expect(Object.keys(body)).toContain('expected_current');
+      expect(body['expected_current']).toBeNull();
+      expect(JSON.stringify(body)).toContain('"expected_current":null');
+      replay.flush({ status: 200, data: { changed: true, commercial: {} } });
+    });
+
     it('opens ONE prompt for concurrent refusals and replays them all', () => {
       const done: string[] = [];
       http.post(apiUrl('/a/'), {}).subscribe(() => done.push('a'));

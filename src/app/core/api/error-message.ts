@@ -62,6 +62,49 @@ export function extractDetail(error: unknown): string | null {
   return typeof detail === 'string' ? detail : null;
 }
 
+/**
+ * The server's PER-FIELD validation errors, keyed by request-body field name.
+ *
+ * A 400 from an elevated commercial write carries `{"errors": {"reason": ["Please
+ * state a reason of at least 10 characters."]}}` — DRF's serializer errors, or the
+ * domain's own single-field refusal. Rendering that beside the field it names is the
+ * difference between an operator fixing their reason and an operator staring at one
+ * flattened sentence wondering which control it belongs to.
+ *
+ * `extractErrorMessage` FLATTENS the same structure into one line, and that stays the
+ * right answer for a banner. This is the narrower reader for a FORM, and the two are
+ * kept separate for the same reason `extractDetail` is separate: a caller should have
+ * to say which shape it wants rather than get whichever the flattener happened to pick.
+ *
+ * Returns an empty object when the body carries no field errors — including for the
+ * 409 conflict body, which deliberately has no `errors` key at all.
+ */
+export function extractFieldErrors(error: unknown): Record<string, readonly string[]> {
+  const body = unwrap(error);
+  if (!isRecord(body)) return {};
+  const errors = body['errors'];
+  if (!isRecord(errors)) return {};
+
+  const out: Record<string, readonly string[]> = {};
+  for (const [field, value] of Object.entries(errors)) {
+    const messages = toMessages(value);
+    if (messages.length) out[field] = messages;
+  }
+  return out;
+}
+
+/** One field's errors as a flat string list. DRF sends `string | string[]`. */
+function toMessages(value: unknown): readonly string[] {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed ? [trimmed] : [];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((entry) => toMessages(entry));
+  }
+  return [];
+}
+
 function readMessage(body: unknown): string | null {
   if (typeof body === 'string') {
     // A non-JSON body (an Apache error page, a proxy failure). Prose only — an HTML

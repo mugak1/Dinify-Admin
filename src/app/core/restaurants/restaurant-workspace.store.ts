@@ -5,7 +5,7 @@ import { catchError, of, Subject, switchMap, tap } from 'rxjs';
 import { AdminServiceStatus } from '../api/service-status';
 import { LoadFailure, reportReadReachable, toLoadFailure } from './load-failure';
 import { RESTAURANT_API } from './restaurant.api';
-import { RestaurantDetail } from './restaurant.model';
+import { CommercialSummary, RestaurantDetail } from './restaurant.model';
 
 /** What the workspace is currently able to show. Four states, never collapsed. */
 export type WorkspaceState = 'idle' | 'loading' | 'loaded' | 'error';
@@ -47,12 +47,40 @@ export class RestaurantWorkspaceStore {
   private readonly _detail = signal<RestaurantDetail | null>(null);
   private readonly _failure = signal<LoadFailure | null>(null);
   private readonly _loading = signal(false);
+  private readonly _mutating = signal(false);
 
   /** The restaurant, once read. Null while loading, and after a failure. */
   readonly detail = this._detail.asReadonly();
   /** Why the read failed, or null. `kind === 'not-found'` is its own rendered state. */
   readonly failure = this._failure.asReadonly();
   readonly loading = this._loading.asReadonly();
+
+  /**
+   * True while a service-configuration write is in flight for THIS restaurant.
+   *
+   * ── WHY THE FLAG LIVES HERE AND NOT ON THE TAB ────────────────────────────────────
+   *
+   * It was a signal on the Overview component, and review found the hole: the tabs are
+   * SIBLING ROUTES under this store, so switching to Readiness DESTROYS Overview while
+   * the request keeps running — the write is deliberately not torn down with the
+   * component. Coming back builds a fresh instance whose local flag reads false, and it
+   * would happily start a second write against the same restaurant.
+   *
+   * That is the exact race the one-at-a-time rule exists to prevent: each write returns
+   * the WHOLE canonical commercial object, so two in flight can land out of order and
+   * the older snapshot repaints the newer axis change.
+   *
+   * The guarantee is a property of the WORKSPACE — "one service-configuration mutation
+   * at a time for this restaurant" — not of one tab's component, so it belongs on the
+   * thing whose lifetime actually matches: this store is provided on `/restaurants/:id`
+   * and outlives every tab beneath it.
+   *
+   * NOT SOLVED BY `takeUntilDestroyed`, and that alternative is worse. The request has
+   * already been sent; cancelling the subscription does not un-send it, so the server may
+   * still commit while the client throws the response away — manufacturing an
+   * indeterminate outcome out of a routine tab click.
+   */
+  readonly mutating = this._mutating.asReadonly();
 
   readonly state = computed<WorkspaceState>(() => {
     if (this._loading()) return 'loading';
@@ -115,5 +143,53 @@ export class RestaurantWorkspaceStore {
   reload(): void {
     const id = this._id();
     if (id !== null) this.requests.next(id);
+  }
+
+  /**
+   * Adopt the canonical `commercial` projection a successful WRITE returned (Step 3E.2).
+   *
+   * ── WHY THIS EXISTS RATHER THAN A REFETCH ─────────────────────────────────────────
+   *
+   * The service-configuration endpoints re-read the projection INSIDE the mutation's own
+   * transaction and hand back the state the write actually produced. That is strictly
+   * better than a follow-up GET: it is the same canonical shape, it cannot race the
+   * write, and it costs no second round trip. So the response is adopted, and a screen
+   * that fetched again merely to learn what it had just been told would be adding a
+   * request and a window in which the two answers could differ.
+   *
+   * ── WHY IT IS DELIBERATELY NARROW ─────────────────────────────────────────────────
+   *
+   * It replaces ONLY `commercial`. Every other field of the loaded detail — the owner,
+   * the onboarding projection, operations, recent activity, the legacy compatibility
+   * block — is preserved untouched, because the write response does not carry them and
+   * a merge that guessed at them would quietly discard state the workspace still holds.
+   *
+   * A no-op when nothing is loaded: there is no detail to attach a projection to, and
+   * synthesising one from a partial response would produce a restaurant object whose
+   * other halves were invented.
+   */
+  adoptCommercial(commercial: CommercialSummary): void {
+    const current = this._detail();
+    if (current === null) return;
+    this._detail.set({ ...current, commercial });
+  }
+
+  /**
+   * Claim the single service-configuration write slot. False when one is already in
+   * flight, in which case the caller must not send anything.
+   */
+  beginMutation(): boolean {
+    if (this._mutating()) return false;
+    this._mutating.set(true);
+    return true;
+  }
+
+  /**
+   * Release the slot. Safe to call from a callback whose component has since been
+   * destroyed — which is the ordinary case when an operator navigates away mid-write,
+   * and precisely why the flag is held here.
+   */
+  endMutation(): void {
+    this._mutating.set(false);
   }
 }

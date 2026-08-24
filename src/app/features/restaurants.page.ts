@@ -16,11 +16,11 @@ import { formatEat } from '../core/formatting/time';
 import { LoadFailure, reportReadReachable, toLoadFailure } from '../core/restaurants/load-failure';
 import { RESTAURANT_API } from '../core/restaurants/restaurant.api';
 import {
+  commercialPaymentLabel,
   lifecycleLabel,
   lifecycleVariant,
-  paymentModeLabel,
   readinessLabel,
-  subscriptionLabel,
+  subscriptionTermsLabel,
 } from '../core/restaurants/restaurant.labels';
 import {
   DirectoryPagination,
@@ -462,11 +462,22 @@ export class RestaurantsPage {
     { key: 'restaurant', header: 'Restaurant', cell: true },
     { key: 'status', header: 'Lifecycle', cell: true },
     { key: 'readiness', header: 'Readiness', value: (row) => readinessLabel(row.readiness) },
-    { key: 'payment', header: 'Payment mode', value: (row) => paymentModeLabel(row) },
+    // BOTH CANONICAL SERVICE AXES, in one cell. The header lost the word "mode"
+    // because there is no longer one mode to name: the backend has a timing axis and a
+    // custody axis, and this column reports both. It stays ONE column — §15 keeps the
+    // directory dense, and an eighth column is not the price of a second fact.
+    //
+    // Partial configuration survives into the cell rather than being flattened. Both
+    // this and the workspace read `commercial` through the SAME label function, so a
+    // row and the header it opens cannot describe a restaurant differently.
+    { key: 'payment', header: 'Payment', value: (row) => commercialPaymentLabel(row.commercial) },
     {
+      // TERMS, NOT STATUS. This column used to read `Active` off a legacy boolean; it
+      // now states the recorded price and recurrence, which is what the database can
+      // actually prove. See `subscriptionTermsLabel`.
       key: 'subscription',
-      header: 'Subscription',
-      value: (row) => subscriptionLabel(row.subscription),
+      header: 'Subscription terms',
+      value: (row) => subscriptionTermsLabel(row.commercial),
     },
     {
       key: 'issues',

@@ -1,4 +1,4 @@
-import { formatAmount, formatUGX, NO_AMOUNT } from './currency';
+import { formatAmount, formatMoney, formatUGX, NO_AMOUNT } from './currency';
 import { formatEat, formatEatDate, formatEatTime, formatRelativeToServer, NO_TIME } from './time';
 
 describe('formatUGX', () => {
@@ -6,10 +6,31 @@ describe('formatUGX', () => {
     expect(formatUGX('150000.00')).toBe('UGX 150,000');
   });
 
-  it('never shows decimals, whatever the wire carries', () => {
-    // No faux precision (§16). A restaurant is not billed in fractions of a shilling.
-    expect(formatUGX('150000.99')).toBe('UGX 150,000');
-    expect(formatUGX('0.50')).toBe('UGX 0');
+  it('drops an ALL-ZERO fraction as faux precision (§16)', () => {
+    // `UGX 150,000`, not `UGX 150,000.00`. Trailing zeroes claim a precision the price
+    // does not have and make a column of figures harder to scan.
+    expect(formatUGX('150000.00')).toBe('UGX 150,000');
+    expect(formatUGX('0.00')).toBe('UGX 0');
+    expect(formatUGX('1500.000')).toBe('UGX 1,500');
+  });
+
+  it('KEEPS A NON-ZERO FRACTION — truth beats typography', () => {
+    // This formatter used to truncate unconditionally, which deleted a stored digit
+    // from a price an operator is expected to reconcile. A recorded amount is a fact,
+    // and rounding one away on screen is the portal asserting something tidier than
+    // what the database holds — the same defect class as rendering unconfigured
+    // commercial state as `Active`.
+    expect(formatUGX('150000.50')).toBe('UGX 150,000.50');
+    expect(formatUGX('150000.99')).toBe('UGX 150,000.99');
+    expect(formatUGX('0.50')).toBe('UGX 0.50');
+    expect(formatUGX('0.01')).toBe('UGX 0.01');
+  });
+
+  it('preserves the fraction VERBATIM rather than re-scaling it', () => {
+    // The server's scale is the scale the column was stored at. Every reformatting is
+    // another chance to corrupt the figure, so there is none.
+    expect(formatUGX('4500.5')).toBe('UGX 4,500.5');
+    expect(formatUGX('4500.500')).toBe('UGX 4,500.500');
   });
 
   /**
@@ -51,6 +72,49 @@ describe('formatUGX', () => {
 
   it('formatAmount drops the unit for a column that carries it in the header', () => {
     expect(formatAmount('150000')).toBe('150,000');
+  });
+});
+
+/**
+ * `formatMoney` is the general rule and `formatUGX` is a one-line wrapper over it, so
+ * there is ONE money rule in this application rather than two that can drift about
+ * whether a stored fraction survives.
+ */
+describe('formatMoney', () => {
+  it('labels the amount with the currency it was given', () => {
+    expect(formatMoney('150000.00', 'UGX')).toBe('UGX 150,000');
+    expect(formatMoney('4500.75', 'KES')).toBe('KES 4,500.75');
+    expect(formatMoney('1200000', 'TZS')).toBe('TZS 1,200,000');
+  });
+
+  it('DOES NOT ASSUME UGX', () => {
+    // `RestaurantSubscriptionTerms.currency` is stored with no default and takes any
+    // three-letter ISO-4217 code. Relabelling a different currency as shillings is a
+    // quiet corruption of a money value — the one thing this module exists to prevent.
+    expect(formatMoney('4500.75', 'KES')).not.toContain('UGX');
+    expect(formatMoney('4500.75', 'KES')).toContain('KES');
+  });
+
+  it('still renders the figure when no currency code came with it', () => {
+    // Dropping the amount because the code is missing would lose more than it protects.
+    // What it must never do is label the figure with a currency it guessed.
+    expect(formatMoney('150000.00', '')).toBe('150,000');
+    expect(formatMoney('150000.00', '   ')).toBe('150,000');
+  });
+
+  it('treats a missing amount as absent, and zero as a real price', () => {
+    expect(formatMoney(null, 'UGX')).toBe(NO_AMOUNT);
+    expect(formatMoney(undefined, 'UGX')).toBe(NO_AMOUNT);
+    expect(formatMoney('', 'UGX')).toBe(NO_AMOUNT);
+    // Zero is a deliberate recorded price — a waived period, a pilot — and is a
+    // DIFFERENT fact from having no amount at all.
+    expect(formatMoney('0.00', 'UGX')).toBe('UGX 0');
+    expect(formatMoney('0.00', 'UGX')).not.toBe(NO_AMOUNT);
+  });
+
+  it('never parses a decimal string into a number', () => {
+    // A value beyond IEEE-754 range survives intact only if no arithmetic happens.
+    expect(formatMoney('12345678901234567890.25', 'UGX')).toBe('UGX 12,345,678,901,234,567,890.25');
   });
 });
 

@@ -1,3 +1,4 @@
+import * as labelModule from './restaurant.labels';
 import {
   activityActionLabel,
   activityResultIsNotable,
@@ -15,16 +16,25 @@ import {
   ownerRelationshipIsNotable,
   ownerRelationshipLabel,
   ownerRelationshipNote,
-  paymentModeLabel,
+  billingIntervalLabel,
+  commercialPaymentLabel,
+  paymentCollectionModeLabel,
+  paymentCollectionModeNote,
+  paymentTimingLabel,
   readinessBlockerLabel,
   readinessLabel,
-  subscriptionLabel,
+  SUBSCRIPTION_TERMS_NOTE,
   subscriptionMethodLabel,
+  subscriptionTermsLabel,
 } from './restaurant.labels';
 import {
+  CommercialSubscriptionTerms,
+  CommercialSummary,
   OwnerControlStatus,
   OwnerInvitationStatus,
   OwnerRelationshipStatus,
+  PaymentCollectionMode,
+  PaymentTiming,
   ReadinessSummary,
   SubscriptionSummary,
 } from './restaurant.model';
@@ -41,6 +51,49 @@ function subscription(overrides: Partial<SubscriptionSummary> = {}): Subscriptio
     legacy_expiry_at: null,
     preferred_method: 'per_order',
     ...overrides,
+  };
+}
+
+/**
+ * The canonical commercial projection, built the way the SERVER builds it — each axis's
+ * `configured` derived from its value, and `subscription_terms.configured` from whether
+ * an open row exists. A builder that let a spec state `configured: true` beside a null
+ * value would be testing a payload the backend cannot emit.
+ */
+function commercial(
+  settings: {
+    timing?: PaymentTiming;
+    collection?: PaymentCollectionMode;
+    terms?: Partial<CommercialSubscriptionTerms>;
+  } = {},
+): CommercialSummary {
+  const terms = settings.terms;
+  return {
+    payment_timing: {
+      configured: settings.timing !== undefined,
+      value: settings.timing ?? null,
+      set_at: settings.timing === undefined ? null : '2026-08-20T12:00:00+03:00',
+    },
+    payment_collection_mode: {
+      configured: settings.collection !== undefined,
+      value: settings.collection ?? null,
+      set_at: settings.collection === undefined ? null : '2026-08-20T12:00:00+03:00',
+    },
+    subscription_terms: {
+      configured: terms !== undefined,
+      current:
+        terms === undefined
+          ? null
+          : {
+              id: '5d6e7f80-9a1b-4c2d-8e3f-000000000001',
+              recurring_amount: '150000.00',
+              currency: 'UGX',
+              billing_interval: { unit: 'month', count: 1 },
+              effective_from: '2026-08-01T00:00:00+03:00',
+              recorded_at: '2026-08-01T00:00:00+03:00',
+              ...terms,
+            },
+    },
   };
 }
 
@@ -93,37 +146,217 @@ describe('restaurant labels', () => {
     });
   });
 
-  describe('payment mode', () => {
-    it('says not configured, and infers nothing', () => {
-      expect(paymentModeLabel({ payment_mode: null, payment_mode_configured: false })).toBe(
-        'Not configured',
-      );
+  describe('payment timing', () => {
+    it('names each side of the closed vocabulary', () => {
+      expect(paymentTimingLabel('pay_first')).toBe('Pay first');
+      expect(paymentTimingLabel('pay_after')).toBe('Pay after');
     });
 
-    it('renders a real mode when a field finally exists to hold one', () => {
-      expect(paymentModeLabel({ payment_mode: 'cash_only', payment_mode_configured: true })).toBe(
-        'Cash only',
-      );
+    it('says not configured for an undecided axis', () => {
+      expect(paymentTimingLabel(null)).toBe('Not configured');
     });
   });
 
-  describe('subscription', () => {
-    it('says not configured while there is no commercial subscription', () => {
-      expect(subscriptionLabel(subscription())).toBe('Not configured');
+  describe('payment collection mode', () => {
+    it('names each side of the closed vocabulary', () => {
+      expect(paymentCollectionModeLabel('offline')).toBe('Restaurant collects');
+      expect(paymentCollectionModeLabel('psp_online')).toBe('Dinify via PSP');
     });
 
-    it('does NOT upgrade the legacy validity flag into a billing status', () => {
-      // `legacy_validity_flag` defaults true and nothing maintains it. An operator who
-      // reads "Paid" stops chasing an invoice that was never raised.
-      const label = subscriptionLabel(subscription({ legacy_validity_flag: true }));
-      for (const invented of ['Active', 'Paid', 'Current', 'Trial', 'In good standing']) {
-        expect(label).withContext(invented).not.toBe(invented);
+    it('says not configured for an undecided axis', () => {
+      expect(paymentCollectionModeLabel(null)).toBe('Not configured');
+    });
+
+    it('never describes offline as cash, degraded, manual or pre-launch', () => {
+      // `offline` is a PERMANENT, FIRST-CLASS mode: Dinify does not initiate the diner
+      // payment and the restaurant collects through whatever tender it likes. Naming one
+      // tender misreports every restaurant running its own card machine, and any word
+      // implying absence misreports a restaurant fully entitled to go live this way.
+      const label = paymentCollectionModeLabel('offline');
+      const note = paymentCollectionModeNote('offline') ?? '';
+      for (const invented of ['Cash', 'cash', 'Manual', 'Offline only', 'No online payments', 'Degraded', 'Fallback', 'Pre-launch']) {
+        expect(label).withContext(`label: ${invented}`).not.toContain(invented);
+        expect(note).withContext(`note: ${invented}`).not.toContain(invented);
       }
     });
 
-    it('humanises the legacy billing method', () => {
+    it('never claims psp_online means a provider is connected or payments work', () => {
+      // The mode records an INTENTION. This platform has no PSP integration, so there is
+      // no provider, no merchant id and nothing operational to report.
+      const label = paymentCollectionModeLabel('psp_online');
+      for (const invented of ['Connected', 'Ready', 'Live', 'Enabled', 'Active']) {
+        expect(label).withContext(invented).not.toContain(invented);
+      }
+      // The note exists precisely to block the stronger read.
+      expect(paymentCollectionModeNote('psp_online')).toContain('does not confirm');
+    });
+
+    it('has nothing to say about an axis nobody decided', () => {
+      expect(paymentCollectionModeNote(null)).toBeNull();
+    });
+  });
+
+  describe('the combined payment cell', () => {
+    it('joins both axes when both are configured', () => {
+      expect(commercialPaymentLabel(commercial({ timing: 'pay_first', collection: 'offline' })))
+        .toBe('Pay first · Restaurant collects');
+    });
+
+    it('KEEPS PARTIAL CONFIGURATION VISIBLE, naming the half that is missing', () => {
+      // The whole reason this is one cell rather than a boolean. A restaurant with the
+      // service model decided and custody still open is in a real state an operator acts
+      // on, and "Configured" would erase it.
+      expect(commercialPaymentLabel(commercial({ timing: 'pay_first' })))
+        .toBe('Pay first · Collection not configured');
+      expect(commercialPaymentLabel(commercial({ collection: 'psp_online' })))
+        .toBe('Timing not configured · Dinify via PSP');
+    });
+
+    it('says not configured only when NEITHER axis is decided', () => {
+      expect(commercialPaymentLabel(commercial())).toBe('Not configured');
+    });
+
+    it('distinguishes an absent payload from an unconfigured one', () => {
+      // A server that sent no `commercial` object at all has not answered the question.
+      // Rendering that as "Not configured" would manufacture a verdict out of a missing
+      // payload — the same defect class as a dead backend reading "Invalid credentials."
+      expect(commercialPaymentLabel(undefined)).toBe('—');
+      expect(commercialPaymentLabel(null)).toBe('—');
+    });
+  });
+
+  describe('billing interval', () => {
+    it('renders a count of one without the numeral', () => {
+      expect(billingIntervalLabel({ unit: 'month', count: 1 })).toBe('every month');
+      expect(billingIntervalLabel({ unit: 'week', count: 1 })).toBe('every week');
+      expect(billingIntervalLabel({ unit: 'year', count: 1 })).toBe('every year');
+      expect(billingIntervalLabel({ unit: 'day', count: 1 })).toBe('every day');
+    });
+
+    it('PLURALISES a count greater than one', () => {
+      // The count is not assumed to be 1. "every 2 month" is the tell that a formatter
+      // was written for the common case and never tested on the real vocabulary.
+      expect(billingIntervalLabel({ unit: 'month', count: 2 })).toBe('every 2 months');
+      expect(billingIntervalLabel({ unit: 'day', count: 14 })).toBe('every 14 days');
+      expect(billingIntervalLabel({ unit: 'week', count: 3 })).toBe('every 3 weeks');
+      expect(billingIntervalLabel({ unit: 'year', count: 2 })).toBe('every 2 years');
+    });
+
+    it('never invents a plan tier', () => {
+      // The backend stores a generic recurrence and deliberately not a catalogue. An
+      // operator who reads "Basic" will look for a plan definition that does not exist.
+      const labels = [
+        billingIntervalLabel({ unit: 'month', count: 1 }),
+        billingIntervalLabel({ unit: 'year', count: 1 }),
+      ];
+      for (const label of labels) {
+        for (const invented of ['Basic', 'Pro', 'Enterprise', 'Monthly plan', 'Annual plan', 'Trial']) {
+          expect(label).withContext(invented).not.toContain(invented);
+        }
+      }
+    });
+  });
+
+  describe('subscription terms', () => {
+    it('says not configured when no open terms row exists', () => {
+      expect(subscriptionTermsLabel(commercial())).toBe('Not configured');
+    });
+
+    it('states the recorded price and recurrence, not a status', () => {
+      expect(subscriptionTermsLabel(commercial({ terms: {} }))).toBe('UGX 150,000 · every month');
+    });
+
+    it('carries a count greater than one into the cell', () => {
+      const label = subscriptionTermsLabel(
+        commercial({ terms: { recurring_amount: '300000.00', billing_interval: { unit: 'month', count: 2 } } }),
+      );
+      expect(label).toBe('UGX 300,000 · every 2 months');
+    });
+
+    it('renders a ZERO price as a real price, never as free or absent', () => {
+      // Zero is a deliberate recorded fact — a waived period, a pilot — and is a
+      // DIFFERENT fact from having no terms row. Those two must not read alike.
+      const label = subscriptionTermsLabel(commercial({ terms: { recurring_amount: '0.00' } }));
+      expect(label).toBe('UGX 0 · every month');
+      for (const invented of ['Free', 'Trial', 'Waived', 'No subscription', 'Not configured']) {
+        expect(label).withContext(invented).not.toContain(invented);
+      }
+    });
+
+    it('NEVER ROUNDS A STORED FRACTION AWAY', () => {
+      // The amount is a decimal string precisely so no digit is lost between the
+      // database and the screen. Deleting one on the way is the portal asserting
+      // something tidier than what is stored.
+      expect(subscriptionTermsLabel(commercial({ terms: { recurring_amount: '150000.50' } })))
+        .toBe('UGX 150,000.50 · every month');
+    });
+
+    it('does not assume the currency is UGX', () => {
+      // The column has no default and takes any three-letter ISO-4217 code. Relabelling
+      // a different currency as shillings is a quiet corruption of a money value.
+      expect(
+        subscriptionTermsLabel(
+          commercial({ terms: { recurring_amount: '4500.75', currency: 'KES' } }),
+        ),
+      ).toBe('KES 4,500.75 · every month');
+    });
+
+    it('distinguishes an absent payload from an unconfigured one', () => {
+      expect(subscriptionTermsLabel(undefined)).toBe('—');
+      expect(subscriptionTermsLabel(null)).toBe('—');
+    });
+
+    it('degrades rather than crashing if configured and current ever disagree', () => {
+      // The server keeps them consistent. A client that dereferenced `current` on the
+      // strength of the boolean beside it would throw rather than degrade if it stopped.
+      const impossible: CommercialSummary = {
+        ...commercial(),
+        subscription_terms: { configured: true, current: null },
+      };
+      expect(() => subscriptionTermsLabel(impossible)).not.toThrow();
+      expect(subscriptionTermsLabel(impossible)).toBe('Not configured');
+    });
+
+    it('NEVER RENDERS OPEN TERMS AS AN ACCOUNT STATUS', () => {
+      // THE MOST IMPORTANT ASSERTION IN THIS FILE. It replaced
+      // `has_commercial_subscription ? 'Active' : 'Not configured'`. An open terms row
+      // means somebody at Dinify wrote down a price — not that an invoice exists, not
+      // that anything was collected, not that anyone agreed. There is no invoice model
+      // and no collection path on the server at all.
+      const label = subscriptionTermsLabel(commercial({ terms: {} }));
+      for (const invented of [
+        'Active', 'Paid', 'Current', 'Trial', 'In good standing', 'Good standing',
+        'Subscribed', 'Billed', 'Collected', 'Agreed', 'Signed',
+      ]) {
+        expect(label).withContext(invented).not.toContain(invented);
+      }
+    });
+
+    it('warns in prose that terms are not an invoice or a payment', () => {
+      expect(SUBSCRIPTION_TERMS_NOTE).toContain('Recorded terms only');
+      expect(SUBSCRIPTION_TERMS_NOTE).toContain('Not an invoice');
+    });
+  });
+
+  describe('the legacy record', () => {
+    it('humanises the legacy billing method, for the fenced-off block only', () => {
       expect(subscriptionMethodLabel('per_order')).toBe('Per order');
       expect(subscriptionMethodLabel(null)).toBe('—');
+    });
+
+    it('NO LABEL IN THIS MODULE READS THE LEGACY COMMERCIAL FIELDS ANY MORE', () => {
+      // The compatibility fields are frozen on the server — `payment_mode` null,
+      // `has_commercial_subscription` false — while `legacy_validity_flag` still varies
+      // and defaults TRUE. If any of the three were still an input, a restaurant with
+      // canonical state configured would render as unconfigured, and one with nothing
+      // configured could render as Active. Both directions are proved at the page level;
+      // this pins that the vocabulary layer offers no such function to call.
+      const legacy = subscription({ legacy_validity_flag: true, has_commercial_subscription: false });
+      expect(legacy.legacy_validity_flag).toBeTrue();
+
+      const exported = Object.keys(labelModule);
+      expect(exported).withContext('paymentModeLabel is gone').not.toContain('paymentModeLabel');
+      expect(exported).withContext('subscriptionLabel is gone').not.toContain('subscriptionLabel');
     });
   });
 

@@ -1,7 +1,11 @@
+import { formatMoney } from '../formatting/currency';
 import { StatusPillVariant } from '../../ui/status-pill.component';
 import {
   ActivityResult,
   BLOCKER_READINESS_NOT_CONFIGURED,
+  BillingIntervalUnit,
+  CommercialSubscriptionTerms,
+  CommercialSummary,
   LifecycleState,
   OnboardingSource,
   OrderStatus,
@@ -9,9 +13,9 @@ import {
   OwnerControlStatus,
   OwnerInvitationStatus,
   OwnerRelationshipStatus,
-  PaymentModeSummary,
+  PaymentCollectionMode,
+  PaymentTiming,
   ReadinessSummary,
-  SubscriptionSummary,
 } from './restaurant.model';
 
 /**
@@ -31,13 +35,25 @@ import {
  *   tenant. `not_applicable` is not a quiet "ready" either — for an offboarded
  *   restaurant, "ready to go live" has no answer at all.
  *
- *   PAYMENT MODE. There is no field. Not inferred from `require_order_prepayments`
- *   (a diner-checkout toggle) or from anything else.
+ *   COMMERCIAL (Step 3E.1). Three independent facts, and the upgrade pressure runs in
+ *   three different directions. `offline` is a permanent, first-class custody mode and
+ *   must never read as cash-only, degraded or pre-launch. `psp_online` records an
+ *   INTENTION that Dinify initiates payment and proves nothing about a provider being
+ *   connected. And an open subscription-terms row is RECORDED PRICING INTENT — never
+ *   Active, Paid, Current, Trial or In good standing. Dinify has never collected a
+ *   subscription payment through this system, so an operator who reads "Paid" will stop
+ *   chasing an invoice that was never raised.
  *
- *   SUBSCRIPTION. `legacy_validity_flag` is a bare boolean that defaults True and that
- *   nothing maintains. It is NEVER rendered as Active, Paid, Current, Trial or In
- *   good standing — none of those are facts the server can prove, and an operator who
- *   reads "Paid" will stop chasing an invoice that was never raised.
+ *   PARTIAL CONFIGURATION IS A REAL STATE and stays visible. Collapsing "timing decided,
+ *   collection still open" into a single "Configured" or "Not configured" destroys the
+ *   distinction the operator is looking at the column to find.
+ *
+ *   THE LEGACY FIELDS ARE NOT AN INPUT HERE. `payment_mode` is frozen null,
+ *   `has_commercial_subscription` is frozen false, and `legacy_validity_flag` is a bare
+ *   boolean that defaults True and that nothing maintains. Where the legacy fields and
+ *   `commercial` disagree, `commercial` wins — and no function in this file reads the
+ *   legacy three except `subscriptionMethodLabel`, which exists only to label the
+ *   fenced-off legacy reconciliation block.
  *
  *   ONBOARDING (Step 2C). Five separate questions, five separate answers, and the
  *   temptation is to fuse them into one green "Onboarding complete". Structural owner
@@ -142,29 +158,203 @@ const BLOCKER_LABELS: Record<string, string> = {
   [BLOCKER_READINESS_NOT_CONFIGURED]: 'Go-live readiness checks are not configured yet.',
 };
 
-// --- payment mode ------------------------------------------------------------
+// --- commercial: the canonical domain (Step 3E.1) -----------------------------
 
 /**
- * The payment-mode cell. `Not configured` while the server says so, and the mode
- * itself once a field exists to say otherwise — humanised, because whatever that
- * vocabulary turns out to be it will be snake_case.
+ * What an UNCONFIGURED commercial fact is called. One phrase, so a directory cell and a
+ * workspace row cannot describe the same absence in two different ways.
+ *
+ * DISTINCT FROM `NO_VALUE`, and the distinction is load-bearing. "Not configured" says
+ * the server was asked and answered: no decision has been recorded. `NO_VALUE` says the
+ * server did not answer at all. Rendering the second as the first would manufacture a
+ * commercial verdict out of a missing payload — the same defect class as a dead backend
+ * presenting as "Invalid credentials."
  */
-export function paymentModeLabel(payment: PaymentModeSummary): string {
-  if (!payment.payment_mode_configured || !payment.payment_mode) return 'Not configured';
-  return humanise(payment.payment_mode);
+export const NOT_CONFIGURED = 'Not configured';
+
+const PAYMENT_TIMING_LABELS: Record<PaymentTiming, string> = {
+  // WHEN the diner pays, relative to eating. Not a payment method and not a policy
+  // about prepayment enforcement — `require_order_prepayments` is a different toggle
+  // on a different object and is never consulted.
+  pay_first: 'Pay first',
+  pay_after: 'Pay after',
+};
+
+export function paymentTimingLabel(value: PaymentTiming | null): string {
+  if (value === null) return NOT_CONFIGURED;
+  return PAYMENT_TIMING_LABELS[value] ?? humanise(value);
 }
 
-// --- subscription ------------------------------------------------------------
+const PAYMENT_COLLECTION_MODE_LABELS: Record<PaymentCollectionMode, string> = {
+  // WHO takes the diner's money. `offline` means Dinify does not initiate the payment
+  // and the restaurant collects it — through cash, its own card terminal, its own
+  // mobile-money till, an account, anything. NEVER "Cash only": that names one tender
+  // out of many and would misreport a restaurant running its own card machine.
+  // Never "Manual", "Offline payments" or "No online payments" either — each of those
+  // reads as an absence or a degradation, and this is a permanent first-class mode a
+  // restaurant is fully entitled to go live in.
+  offline: 'Restaurant collects',
+  // Dinify initiates the payment through a payment service provider. A statement of the
+  // SERVICE MODEL, not of operational readiness: this platform has no PSP integration,
+  // so there is no provider, no merchant id and nothing connected to report. Never
+  // "Online payments enabled", "PSP connected" or "Dinify collects (live)".
+  psp_online: 'Dinify via PSP',
+};
+
+export function paymentCollectionModeLabel(value: PaymentCollectionMode | null): string {
+  if (value === null) return NOT_CONFIGURED;
+  return PAYMENT_COLLECTION_MODE_LABELS[value] ?? humanise(value);
+}
 
 /**
- * The subscription cell. ALWAYS "Not configured" until a commercial subscription
- * record exists — see the rule at the top of this file.
+ * The one sentence a configured collection mode needs beyond its two words.
+ *
+ * Both are worth stating, for opposite reasons: `offline` is the one most likely to be
+ * read DOWN (as cash-only, or as a restaurant that has not finished setting up), and
+ * `psp_online` is the one most likely to be read UP (as a provider being connected and
+ * payments working). Null while unconfigured — an absence explains itself.
  */
-export function subscriptionLabel(subscription: SubscriptionSummary): string {
-  return subscription.has_commercial_subscription ? 'Active' : 'Not configured';
+export function paymentCollectionModeNote(value: PaymentCollectionMode | null): string | null {
+  switch (value) {
+    case 'offline':
+      return (
+        'Dinify does not initiate the diner payment. The restaurant collects it itself, ' +
+        'through whichever methods it accepts.'
+      );
+    case 'psp_online':
+      return (
+        'Dinify is recorded as initiating the diner payment through a payment service ' +
+        'provider. This does not confirm that a provider is connected.'
+      );
+    default:
+      return null;
+  }
 }
 
-/** `per_order` -> `Per order`. Legacy billing method, labelled as legacy where shown. */
+/**
+ * BOTH SERVICE AXES IN ONE DENSE CELL, for the directory's Payment column.
+ *
+ * The backend has two facts and the directory has seven columns; §15 keeps it dense, so
+ * this composes rather than growing an eighth. What it must NOT do is collapse — a
+ * restaurant with timing decided and collection still open is in a real state that an
+ * operator acts on, and "Configured" / "Not configured" would erase it. So a partial
+ * combination NAMES the half that is missing:
+ *
+ *   both      Pay first · Restaurant collects
+ *   timing    Pay first · Collection not configured
+ *   custody   Timing not configured · Restaurant collects
+ *   neither   Not configured
+ *
+ * A missing `commercial` object returns `NO_VALUE`, never `Not configured` — see
+ * `NOT_CONFIGURED` above.
+ */
+export function commercialPaymentLabel(commercial: CommercialSummary | null | undefined): string {
+  if (!commercial) return NO_VALUE;
+
+  const timing = commercial.payment_timing.value;
+  const collection = commercial.payment_collection_mode.value;
+  if (timing === null && collection === null) return NOT_CONFIGURED;
+
+  const timingPart = timing === null ? 'Timing not configured' : paymentTimingLabel(timing);
+  const collectionPart =
+    collection === null ? 'Collection not configured' : paymentCollectionModeLabel(collection);
+  return `${timingPart} · ${collectionPart}`;
+}
+
+const BILLING_INTERVAL_UNITS: Record<BillingIntervalUnit, readonly [string, string]> = {
+  day: ['day', 'days'],
+  week: ['week', 'weeks'],
+  month: ['month', 'months'],
+  year: ['year', 'years'],
+};
+
+/**
+ * The recurrence, rendered LITERALLY: `every month`, `every 2 months`, `every 14 days`.
+ *
+ * The backend stores a generic recurrence — a unit and a count — and deliberately not a
+ * plan catalogue. So this must never produce "Monthly plan", "Annual plan", "Basic",
+ * "Pro" or "Trial": every one of those invents a product tier the database has no column
+ * for, and an operator reading "Basic" will look for a plan definition that does not
+ * exist.
+ *
+ * THE COUNT IS NOT ASSUMED TO BE 1. A count of 1 drops the numeral because "every 1
+ * month" reads as a translation artefact; anything else keeps it and pluralises.
+ */
+export function billingIntervalLabel(interval: {
+  readonly unit: BillingIntervalUnit;
+  readonly count: number;
+}): string {
+  const forms = BILLING_INTERVAL_UNITS[interval.unit];
+  // A unit outside the closed vocabulary is still rendered rather than dropped — a
+  // server that grows a fifth reads slightly mechanically instead of going blank.
+  const [singular, plural] = forms ?? [interval.unit, `${interval.unit}s`];
+  if (interval.count === 1) return `every ${singular}`;
+  return `every ${interval.count} ${plural}`;
+}
+
+/**
+ * The recorded price on its own: `UGX 150,000`, `UGX 0`, `KES 4,500.75`.
+ *
+ * The currency comes off the SAME record as the amount and is never assumed — see
+ * `formatMoney`. A non-zero fraction survives; an all-zero one does not.
+ */
+export function subscriptionAmountLabel(terms: CommercialSubscriptionTerms): string {
+  return formatMoney(terms.recurring_amount, terms.currency);
+}
+
+/**
+ * THE SUBSCRIPTION-TERMS CELL: `UGX 150,000 · every month`, or `Not configured`.
+ *
+ * ── THE HIGHEST-RISK LABEL IN THIS FILE ──────────────────────────────────────────
+ *
+ * It replaced `has_commercial_subscription ? 'Active' : 'Not configured'`, and the word
+ * it replaced is the point. An open `RestaurantSubscriptionTerms` row means ONE thing:
+ * somebody at Dinify wrote down what this restaurant is to pay. It is not evidence of an
+ * agreement, an invoice, a payment, a collection or any account standing — there is no
+ * invoice model on the server and no collection path, so Dinify has never taken a
+ * subscription payment through this system at all.
+ *
+ * So the cell states THE TERMS THEMSELVES rather than a verdict about them. A price and
+ * a recurrence are facts the database can prove; "Active" is not. There is deliberately
+ * no success treatment either — a recorded price is not an achievement to celebrate.
+ *
+ * Zero is a real price (a waived period, a pilot) and renders as `UGX 0`, never as
+ * "Free", "Trial", "Waived" or "No subscription" — those describe the ABSENCE of a
+ * terms row, which is a different fact with a different label.
+ */
+export function subscriptionTermsLabel(commercial: CommercialSummary | null | undefined): string {
+  if (!commercial) return NO_VALUE;
+
+  // `current` is what is actually rendered, so it — not the boolean beside it — is what
+  // is guarded on. The server keeps the two consistent; a client that dereferenced
+  // `current` on the strength of `configured` would crash rather than degrade if it ever
+  // stopped doing so.
+  const terms = commercial.subscription_terms.current;
+  if (!terms) return NOT_CONFIGURED;
+
+  return `${subscriptionAmountLabel(terms)} · ${billingIntervalLabel(terms.billing_interval)}`;
+}
+
+/**
+ * Said beside recorded terms, every time they are shown.
+ *
+ * The label above states a price and a recurrence, which is honest but is also exactly
+ * the shape an operator pattern-matches to a billing status. This is the sentence that
+ * stops that read.
+ */
+export const SUBSCRIPTION_TERMS_NOTE =
+  'Recorded terms only. Not an invoice, a payment, or evidence of account standing.';
+
+// --- subscription: the LEGACY record -----------------------------------------
+
+/**
+ * `per_order` -> `Per order`.
+ *
+ * TRANSITIONAL. The only reader of a legacy commercial column left in this file, and it
+ * exists solely to label the fenced-off "Legacy record" block on Overview, which an
+ * operator reconciling an old row will want. It is never a fallback for
+ * `commercial.subscription_terms` and never appears outside that block.
+ */
 export function subscriptionMethodLabel(method: string | null): string {
   return method ? humanise(method) : NO_VALUE;
 }

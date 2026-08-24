@@ -48,6 +48,7 @@ export class RestaurantWorkspaceStore {
   private readonly _failure = signal<LoadFailure | null>(null);
   private readonly _loading = signal(false);
   private readonly _mutating = signal(false);
+  private readonly _superseded = signal(false);
 
   /** The restaurant, once read. Null while loading, and after a failure. */
   readonly detail = this._detail.asReadonly();
@@ -82,6 +83,33 @@ export class RestaurantWorkspaceStore {
    */
   readonly mutating = this._mutating.asReadonly();
 
+  /**
+   * True from the moment the loaded projection is KNOWN to be superseded until the
+   * fresh read replacing it has settled.
+   *
+   * ── WHY THIS IS NOT COVERED BY `loading` ─────────────────────────────────────────
+   *
+   * `reload()` leaves the previous detail in place on purpose, so the workspace does not
+   * blank out on a retry. That is right for an ordinary re-read — but after a 409 the
+   * projection on screen is not merely old, it is KNOWN WRONG, and the tab outlet stays
+   * mounted through the loading state (`restaurant-detail.page.ts` renders the outlet in
+   * its `@default` branch). So the commercial panel goes on rendering superseded values
+   * with its controls live.
+   *
+   * Review found the consequence: an operator could reopen an editor before the fresh
+   * GET landed and capture THE SAME STALE TOKEN AGAIN. The server's `expected_current`
+   * still refuses the write, so nothing is silently overwritten — but the recovery
+   * invariant is the point:
+   *
+   *   AFTER A CONFLICT, THE OPERATOR MUST SEE THE FRESHLY RELOADED CANONICAL STATE
+   *   BEFORE BEING ALLOWED TO MAKE ANOTHER COMMERCIAL DECISION.
+   *
+   * A guard built on `loading` alone would also disable controls during every ordinary
+   * retry, which is a different and weaker statement. This flag says the specific thing:
+   * what you are looking at has been replaced.
+   */
+  readonly detailSuperseded = this._superseded.asReadonly();
+
   readonly state = computed<WorkspaceState>(() => {
     if (this._loading()) return 'loading';
     if (this._failure()) return 'error';
@@ -110,6 +138,11 @@ export class RestaurantWorkspaceStore {
       )
       .subscribe((result) => {
         this._loading.set(false);
+        // The read has SETTLED, so whatever is on screen next is current — including on
+        // the failure branch, where the detail is cleared and the workspace renders its
+        // own error state instead of the tabs. Cleared here, at the single settle point,
+        // rather than at each caller.
+        this._superseded.set(false);
         if ('failure' in result) {
           this._detail.set(null);
           this._failure.set(result.failure);
@@ -143,6 +176,21 @@ export class RestaurantWorkspaceStore {
   reload(): void {
     const id = this._id();
     if (id !== null) this.requests.next(id);
+  }
+
+  /**
+   * Re-read because what is loaded has been SUPERSEDED — a 409 conflict, or a target
+   * that has gone away.
+   *
+   * Identical to `reload()` except that it marks the projection superseded for the
+   * duration, so a screen rendering it can refuse to let another decision be taken
+   * against state it already knows is wrong. See `detailSuperseded`.
+   */
+  reloadSuperseded(): void {
+    const id = this._id();
+    if (id === null) return;
+    this._superseded.set(true);
+    this.requests.next(id);
   }
 
   /**

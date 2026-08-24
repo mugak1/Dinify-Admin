@@ -1290,6 +1290,114 @@ describe('RestaurantOverviewTab', () => {
       flush();
     }));
 
+    it('REFUSES A NEW DECISION until the post-conflict reload has landed', fakeAsync(async () => {
+      // THE REGRESSION THIS EXISTS FOR. Handling a 409 releases the write slot and starts
+      // a replacement GET — but the tab outlet stays mounted through the loading state,
+      // so the panel goes on rendering the SUPERSEDED projection. Before this gate an
+      // operator could reopen an editor in that window and capture the same stale token
+      // a second time.
+      //
+      // `expected_current` still refuses that write server-side, so this was never a data
+      // -integrity bypass. The invariant it broke is the recovery one: after a conflict
+      // the operator must SEE the fresh canonical state before deciding again.
+      api.answer = () => of(detail({ commercial: commercial({ timing: 'pay_first' }) }));
+      await loaded();
+
+      api.writeAnswer = () =>
+        throwError(() => ({
+          status: 409,
+          error: {
+            status: 409,
+            message: 'Commercial configuration changed since it was loaded.',
+            code: 'stale_service_configuration',
+          },
+        }));
+
+      // The reload is held open, so the in-flight window is observable rather than
+      // instantaneous — which is precisely the window the defect lived in.
+      const reload = new Subject<RestaurantDetail>();
+      api.answer = () => reload;
+
+      openEditor('Payment timing');
+      chooseAndReason('pay_after');
+      saveButton().click();
+      harness.detectChanges();
+
+      expect(api.writes.length).toBe(1);
+      expect(api.detailCalls.length).withContext('a replacement read was started').toBe(2);
+
+      // MID-RELOAD. The stale projection is still on screen, and the controls are shut.
+      expect(axisValue('payment_timing')).withContext('still the superseded value').toBe(
+        'Pay first',
+      );
+      expect(changeButton('Payment timing')!.disabled).withContext('timing').toBeTrue();
+      expect(changeButton('Collection mode')!.disabled).withContext('collection').toBeTrue();
+
+      changeButton('Payment timing')!.click();
+      harness.detectChanges();
+      expect(editor()).withContext('no editor opens against superseded state').toBeNull();
+      expect(api.writes.length).withContext('and no second write').toBe(1);
+
+      // The copy does not claim a reload that has not happened yet, and says so while
+      // it is happening.
+      const midFlight = commercialPanel()!.textContent ?? '';
+      expect(midFlight).toContain('Review the current value before trying again.');
+      expect(midFlight).toContain('Reloading');
+      expect(midFlight).not.toContain('has been reloaded');
+
+      // The fresh read lands: another operator had moved the axis to pay_after.
+      reload.next(detail({ commercial: commercial({ timing: 'pay_after' }) }));
+      reload.complete();
+      harness.detectChanges();
+
+      expect(axisValue('payment_timing')).withContext('fresh canonical state').toBe('Pay after');
+      expect(changeButton('Payment timing')!.disabled)
+        .withContext('deciding is possible again')
+        .toBeFalse();
+      expect(commercialPanel()!.textContent).not.toContain('Reloading');
+      flush();
+    }));
+
+    it('captures the FRESH token for the edit that follows a conflict', fakeAsync(async () => {
+      // The consequence of the gate, and the reason it is worth having: the next
+      // assertion an operator makes is against the value they were actually shown.
+      api.answer = () => of(detail({ commercial: commercial({ timing: 'pay_first' }) }));
+      await loaded();
+
+      api.writeAnswer = () =>
+        throwError(() => ({
+          status: 409,
+          error: { status: 409, code: 'stale_service_configuration', message: 'stale' },
+        }));
+      // The conflict reload reveals what the other operator actually wrote.
+      api.answer = () => of(detail({ commercial: commercial({ timing: 'pay_after' }) }));
+
+      openEditor('Payment timing');
+      chooseAndReason('pay_after');
+      saveButton().click();
+      harness.detectChanges();
+      tick();
+      harness.detectChanges();
+
+      expect(api.writes[0].body['expected_current'])
+        .withContext('the first attempt asserted what it had loaded')
+        .toBe('pay_first');
+
+      // A fresh, deliberate decision against the reloaded state.
+      api.writeAnswer = () =>
+        of({ changed: true, commercial: commercial({ timing: 'pay_first' }) });
+      openEditor('Payment timing');
+      chooseAndReason('pay_first', 'Reverting after reviewing the conflict');
+      saveButton().click();
+      harness.detectChanges();
+
+      expect(api.writes.length).toBe(2);
+      expect(api.writes[1].body['expected_current'])
+        .withContext('NOT the stale pay_first-era token — the reloaded one')
+        .toBe('pay_after');
+      flush();
+    }));
+
     it('preserves the draft when re-authentication is cancelled', fakeAsync(async () => {
       await loaded();
       api.writeAnswer = () => throwError(() => new ElevationCancelledError());

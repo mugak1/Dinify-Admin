@@ -187,6 +187,68 @@ export interface CommercialSummary {
 }
 
 /**
+ * ══ THE SERVICE-CONFIGURATION WRITE CONTRACT (Step 3E.2) ══════════════════════════
+ *
+ * Two requests, one per axis, mirroring the two named endpoints. They are separate
+ * types for the same reason the endpoints are separate routes: the vocabularies
+ * differ, and a shared `{value: string}` would let a collection mode be posted to the
+ * timing endpoint and be caught only by the server.
+ *
+ * ── `expected_current` IS REQUIRED, AND SEPARATELY NULLABLE ───────────────────────
+ *
+ * This is the whole of the optimistic-concurrency story and the easiest thing in the
+ * slice to get quietly wrong. The field is REQUIRED on the server
+ * (`required=True, allow_null=True`), so:
+ *
+ *   { "expected_current": null }   an ASSERTION — "nobody had configured this when I
+ *                                  loaded it". The only assertion that succeeds
+ *                                  against a fresh restaurant.
+ *   { }                            NO assertion at all. A 400.
+ *
+ * They are not the same request, and TypeScript will not save anyone here: an
+ * `undefined` property is DROPPED by `JSON.stringify`, so a value that arrives as
+ * `undefined` instead of `null` silently becomes the second case. Every producer of
+ * this type must coalesce to `null` explicitly, and a transport test asserts the key
+ * is present with a literal null.
+ *
+ * THE VALUE IS THE EXACT AXIS VALUE THE OPERATOR LOADED — never derived from
+ * `configured`, never from a legacy field, never from the other axis, never from a
+ * form default, and never re-read at submit time. See `restaurant-tabs.pages.ts`.
+ */
+export interface SetPaymentTimingRequest {
+  readonly value: PaymentTiming;
+  readonly expected_current: PaymentTiming | null;
+  readonly reason: string;
+}
+
+export interface SetPaymentCollectionModeRequest {
+  readonly value: PaymentCollectionMode;
+  readonly expected_current: PaymentCollectionMode | null;
+  readonly reason: string;
+}
+
+/**
+ * What a successful service-configuration write returns.
+ *
+ * `commercial` IS THE SAME CANONICAL PROJECTION `GET` RETURNS — the server re-reads it
+ * inside the mutation's own transaction and hands back the state the write actually
+ * produced, rather than an echo of what was asked for. So the client adopts it
+ * wholesale and never manufactures a `set_at`, derives a `configured`, or issues a
+ * second GET to learn what it was just told.
+ *
+ * `changed` DISTINGUISHES A REAL WRITE FROM A NO-OP RETRY, and it is not decoration.
+ * The server deliberately answers a same-state request with success and
+ * `changed: false` — even when `expected_current` has gone stale — so that a lost
+ * response followed by an exact retry does not become a false conflict and does not
+ * re-stamp attribution. Both outcomes are successes; only the operator-facing sentence
+ * differs, and a `changed: false` must never be described as a new decision.
+ */
+export interface CommercialMutationResult {
+  readonly changed: boolean;
+  readonly commercial: CommercialSummary;
+}
+
+/**
  * ══ TRANSITIONAL COMPATIBILITY — NOT THE COMMERCIAL DOMAIN ════════════════════════
  *
  * Everything from here to the end of this section is the pre-Step-3E contract. The

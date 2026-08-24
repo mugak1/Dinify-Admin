@@ -8,6 +8,7 @@ import { TestBed } from '@angular/core/testing';
 
 import { RestaurantHttp } from './restaurant.http';
 import {
+  CommercialMutationResult,
   CommercialSummary,
   DirectoryQuery,
   OnboardingSummary,
@@ -567,6 +568,202 @@ describe('RestaurantHttp', () => {
       expect(row?.subscription.has_commercial_subscription)
         .withContext('the frozen legacy flag is not flipped to match')
         .toBeFalse();
+    });
+  });
+
+  /**
+   * ══ THE SERVICE-CONFIGURATION WRITES (Step 3E.2) ═══════════════════════════════
+   *
+   * TWO NAMED OPERATIONS, TWO NAMED ROUTES. What these assert is that the transport is
+   * a pipe in the write direction too: it posts the caller's exact body to the exact
+   * endpoint, unwraps the envelope, and hands back the canonical projection unchanged.
+   * It defaults nothing, coalesces nothing and reshapes nothing.
+   *
+   * The CSRF header, the bounded refresh-and-replay and the elevation replay are NOT
+   * re-tested here. They belong to the interceptors, which have their own suite, and
+   * duplicating them would create a second place for the same rules to drift.
+   */
+  describe('service-configuration writes', () => {
+    const TIMING_URL = `/api/admin/v1/restaurants/${DETAIL_ID}/commercial/payment-timing/`;
+    const COLLECTION_URL =
+      `/api/admin/v1/restaurants/${DETAIL_ID}/commercial/payment-collection-mode/`;
+
+    /** The success envelope, exactly as `commercial_base.success` builds it. */
+    function envelope(changed: boolean, commercial: CommercialSummary) {
+      return { status: 200, message: 'Payment timing recorded.', data: { changed, commercial } };
+    }
+
+    it('POSTs payment timing to its OWN route, with the exact body', () => {
+      http
+        .setPaymentTiming(DETAIL_ID, {
+          value: 'pay_after',
+          expected_current: 'pay_first',
+          reason: 'Switching to table service',
+        })
+        .subscribe();
+
+      const request = controller.expectOne(TIMING_URL);
+      expect(request.request.method).toBe('POST');
+      expect(request.request.body).toEqual({
+        value: 'pay_after',
+        expected_current: 'pay_first',
+        reason: 'Switching to table service',
+      });
+      request.flush(envelope(true, CONFIGURED_COMMERCIAL));
+    });
+
+    it('POSTs collection mode to its OWN route, with the exact body', () => {
+      http
+        .setPaymentCollectionMode(DETAIL_ID, {
+          value: 'psp_online',
+          expected_current: 'offline',
+          reason: 'Moving to provider-initiated collection',
+        })
+        .subscribe();
+
+      const request = controller.expectOne(COLLECTION_URL);
+      expect(request.request.method).toBe('POST');
+      expect(request.request.body).toEqual({
+        value: 'psp_online',
+        expected_current: 'offline',
+        reason: 'Moving to provider-initiated collection',
+      });
+      request.flush(envelope(true, CONFIGURED_COMMERCIAL));
+    });
+
+    it('TRANSMITS expected_current AS AN ACTUAL JSON NULL, never omitted', () => {
+      // THE MOST IMPORTANT ASSERTION IN THIS BLOCK. The server requires the key and
+      // separately allows it to be null: an explicit null is the assertion "nobody had
+      // configured this when I loaded it", and an OMITTED key is no assertion at all —
+      // a 400. `JSON.stringify` drops an `undefined` property, so the difference between
+      // the two is one coalesce away, and it is invisible at the type level.
+      for (const [label, url, body] of [
+        ['timing', TIMING_URL, { value: 'pay_first', expected_current: null, reason: 'Initial service model setup' }],
+        ['collection', COLLECTION_URL, { value: 'offline', expected_current: null, reason: 'Initial collection setup' }],
+      ] as const) {
+        if (label === 'timing') {
+          http.setPaymentTiming(DETAIL_ID, body as never).subscribe();
+        } else {
+          http.setPaymentCollectionMode(DETAIL_ID, body as never).subscribe();
+        }
+
+        const request = controller.expectOne(url);
+        const sent = request.request.body as Record<string, unknown>;
+
+        expect(Object.keys(sent)).withContext(`${label}: key present`).toContain('expected_current');
+        expect(sent['expected_current']).withContext(`${label}: literal null`).toBeNull();
+        // Serialised, which is where an `undefined` would actually vanish.
+        expect(JSON.stringify(sent))
+          .withContext(`${label}: survives serialisation`)
+          .toContain('"expected_current":null');
+
+        request.flush(envelope(true, UNCONFIGURED_COMMERCIAL));
+      }
+    });
+
+    it('unwraps the envelope to {changed, commercial}', () => {
+      let received: CommercialMutationResult | undefined;
+      http
+        .setPaymentTiming(DETAIL_ID, {
+          value: 'pay_first',
+          expected_current: null,
+          reason: 'Initial service model setup',
+        })
+        .subscribe((value) => (received = value));
+
+      controller.expectOne(TIMING_URL).flush(envelope(true, CONFIGURED_COMMERCIAL));
+
+      expect(received?.changed).toBeTrue();
+      // Passed through UNCHANGED — the write response is the same canonical projection
+      // a GET returns, so the client adopts it rather than rebuilding one.
+      expect(received?.commercial).toEqual(CONFIGURED_COMMERCIAL);
+    });
+
+    it('passes a changed:false no-op through as a SUCCESS', () => {
+      // The server answers a same-state request this way even when the concurrency
+      // assertion has gone stale, so a lost response plus an exact retry is not a false
+      // conflict. The transport must not reinterpret it as anything but a 200.
+      let received: CommercialMutationResult | undefined;
+      let errored = false;
+      http
+        .setPaymentCollectionMode(DETAIL_ID, {
+          value: 'offline',
+          expected_current: null,
+          reason: 'Re-sending after a lost response',
+        })
+        .subscribe({ next: (value) => (received = value), error: () => (errored = true) });
+
+      controller
+        .expectOne(COLLECTION_URL)
+        .flush({ status: 200, message: 'Payment collection mode recorded.', data: { changed: false, commercial: CONFIGURED_COMMERCIAL } });
+
+      expect(errored).toBeFalse();
+      expect(received?.changed).toBeFalse();
+      expect(received?.commercial).toEqual(CONFIGURED_COMMERCIAL);
+    });
+
+    it('surfaces a 409 as an error carrying its status and code', () => {
+      const seen: { status: number; code: unknown }[] = [];
+      http
+        .setPaymentTiming(DETAIL_ID, {
+          value: 'pay_after',
+          expected_current: null,
+          reason: 'Attempting against a stale token',
+        })
+        .subscribe({
+          next: () => fail('a conflict must not produce a value'),
+          error: (error: { status: number; error: { code?: string } }) =>
+            seen.push({ status: error.status, code: error.error?.code }),
+        });
+
+      controller.expectOne(TIMING_URL).flush(
+        {
+          status: 409,
+          message: 'Commercial configuration changed since it was loaded.',
+          code: 'stale_service_configuration',
+        },
+        { status: 409, statusText: 'Conflict' },
+      );
+
+      expect(seen).toEqual([{ status: 409, code: 'stale_service_configuration' }]);
+    });
+
+    it('encodes the restaurant id into the path segment', () => {
+      http
+        .setPaymentTiming('a/../b', {
+          value: 'pay_first',
+          expected_current: null,
+          reason: 'Encoding check for the route helper',
+        })
+        .subscribe();
+
+      // A malformed id must not escape its segment on a WRITE either.
+      controller.expectOne('/api/admin/v1/restaurants/a%2F..%2Fb/commercial/payment-timing/').flush(
+        envelope(true, CONFIGURED_COMMERCIAL),
+      );
+    });
+
+    it('exposes NO generic commercial mutation, and no generic post', () => {
+      // Two named operations, and nothing that takes a URL or a field name. A generic
+      // writer would make "what did this operator change?" a question about an argument
+      // rather than about which operation was called — and would let one future grant of
+      // access reach both axes.
+      const surface = http as unknown as Record<string, unknown>;
+      for (const forbidden of [
+        'post',
+        'write',
+        'mutate',
+        'mutateCommercial',
+        'setCommercialField',
+        'setAxis',
+        'recordSubscriptionTerms',
+        'replaceSubscriptionTerms',
+        'endSubscriptionTerms',
+      ]) {
+        expect(typeof surface[forbidden])
+          .withContext(`${forbidden} must not be part of the public API`)
+          .not.toBe('function');
+      }
     });
   });
 });

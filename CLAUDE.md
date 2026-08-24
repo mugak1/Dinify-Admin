@@ -21,12 +21,13 @@ conventions change.
 ## Current Implementation Status
 
 **Step 0 (scaffold) complete, plus spec §15 STEP 1 (restaurant directory + detail
-workspace), the READ half of STEP 2C (the onboarding and owner-control projection) and
-STEP 3E.1 (the canonical commercial READ migration), both rendered on Overview.** Step 2
-as a whole is NOT complete — nothing in this repo creates a restaurant, adopts one,
-attests owner control or issues an invitation. **Step 3E is NOT complete either: 3E.1 is
-the READ half, and this repo still has no commercial WRITE of any kind.** Steps 3–10 are
-otherwise not built.
+workspace), the READ half of STEP 2C (the onboarding and owner-control projection),
+STEP 3E.1 (the canonical commercial READ migration) and STEP 3E.2 (the
+service-configuration WRITE controls), all rendered on Overview.** Step 2 as a whole is
+NOT complete — nothing in this repo creates a restaurant, adopts one, attests owner
+control or issues an invitation. **Step 3E is NOT complete either: 3E.2 shipped the two
+SERVICE-CONFIGURATION writes, and the SUBSCRIPTION-TERMS writes (3E.3) do not exist.**
+Steps 3–10 are otherwise not built.
 
 - Shell, navigation and routing: ✅ the five §9 destinations, the §9.2 URL scheme,
   URL-backed filters
@@ -59,6 +60,12 @@ otherwise not built.
   payment collection mode and subscription terms. The directory's `Payment` and
   `Subscription terms` columns and Overview's Commercial panel all read it, and NOTHING
   reads the superseded compatibility fields any more. See "The Commercial Projection".
+- **Step 3E.2 service-configuration writes: ✅ BUILT.** The FIRST restaurant-domain
+  writes in this repo. Overview's Commercial panel can change **payment timing** and
+  **payment collection mode** — two separate named endpoints, each elevation-gated,
+  audited, and asserted against the exact axis value the operator loaded. Inline editors,
+  no optimistic UI, one local mutation at a time, 409 reloads and requires review. See
+  "The Service-Configuration Writes" below.
 - **Readiness, Billing, Support and Activity tabs: ❌ still placeholders** with
   written empty states (spec §15 steps 3, 7, 6 and 8).
 - **Restaurant creation, restaurant adoption, owner-control attestation, owner
@@ -623,19 +630,155 @@ Not from `require_order_prepayments`, table configuration, transaction tender,
 lifecycle state, or `is_test`. `is_test` affects portfolio visibility later; it does not
 rewrite the commercial facts a restaurant has recorded.
 
-### THERE ARE NO COMMERCIAL WRITES IN THIS REPO
-No `setPaymentTiming`, no `setPaymentCollectionMode`, no `recordSubscriptionTerms` /
-`replaceSubscriptionTerms` / `endSubscriptionTerms`, no generic `post()`, no generic
-`ApiService` — and no disabled buttons standing in for them. `RestaurantApi` still
-exposes exactly `list()` and `detail()`, and a test asserts Overview ships zero
-`<button>` elements.
+### THE COMMERCIAL WRITES THAT EXIST, AND THE ONES THAT DO NOT
+Step 3E.2 added exactly two: `setPaymentTiming` and `setPaymentCollectionMode`. Still
+absent, and must stay absent until Step 3E.3 owns them: `recordSubscriptionTerms`,
+`replaceSubscriptionTerms`, `endSubscriptionTerms` — and, permanently, any generic
+`post()`, `mutateCommercial`, `setAxis` or `ApiService`.
 
-> **Step 3E.2 is the SERVICE-CONFIGURATION controls** (payment timing, collection mode).
-> **Step 3E.3 is the SUBSCRIPTION-TERMS controls.** Both need elevation, a written
-> reason and 409 handling, none of which exist here. The read already carries their
-> concurrency tokens: `payment_timing.value`, `payment_collection_mode.value` and
-> `subscription_terms.current.id` are what a writer sends back as `expected_*`. The
-> domain facts ARE the tokens — there is deliberately no separate version counter.
+**SUBSCRIPTION TERMS REMAIN STRICTLY READ-ONLY.** No Record, no Replace, no End, and no
+disabled placeholder — a control that cannot work still tells an operator the capability
+is there. A test pins the exact button set on Overview as `['Change', 'Change']`.
+
+## The Service-Configuration Writes — spec §15 step 3E.2
+
+**THE FIRST RESTAURANT-DOMAIN WRITES IN THIS REPO.** An administrator can change one
+canonical service-configuration axis, with a stated reason, against the exact value they
+loaded, through the EXISTING elevation/CSRF machinery, without optimistic UI and without
+silently overwriting somebody else's decision.
+
+```
+POST /api/admin/v1/restaurants/<uuid>/commercial/payment-timing/
+POST /api/admin/v1/restaurants/<uuid>/commercial/payment-collection-mode/
+
+{ "value": "pay_first", "expected_current": null, "reason": "…" }
+      -> 200 { "changed": true, "commercial": { …the canonical projection… } }
+```
+
+### TWO NAMED OPERATIONS, AND THEY STAY TWO
+`RestaurantApi` grew `setPaymentTiming` and `setPaymentCollectionMode` — never
+`setCommercialField(field, …)`, `mutateCommercial`, `setAxis` or a generic `post()`.
+Payment timing is a SERVICE-MODEL decision and collection mode is a CUSTODY decision:
+different vocabularies, different consequences, plausibly different future write
+authority. A parameterised route or method would make "what did this operator change?" a
+question about an argument, and would let one grant of access reach both.
+
+`RestaurantHttp`'s envelope-unwrapping helper is a REAL `#private` method, not a
+TypeScript `private` one — the latter is erased and leaves a generic `write(route, body)`
+on the instance, which is the exact surface this slice is supposed not to have.
+
+### `expected_current` IS REQUIRED, AND SEPARATELY NULLABLE
+This is the whole optimistic-concurrency story and the easiest thing here to get quietly
+wrong.
+
+| body | meaning |
+|---|---|
+| `{"expected_current": null}` | "nobody had configured this when I loaded it" — the ONLY assertion that succeeds against a fresh restaurant |
+| `{}` | no assertion at all — a 400 |
+
+They are not the same request, **and TypeScript will not save anyone**: `JSON.stringify`
+DROPS an `undefined` property, so a value arriving as `undefined` instead of `null`
+silently becomes the second case. Every producer coalesces to `null` explicitly, and
+three tests pin the literal `"expected_current":null` on the wire — including one through
+the elevation replay.
+
+**THE TOKEN IS CAPTURED WHEN THE EDITOR OPENS**, into a plain signal and deliberately NOT
+a computed. The operator is asserting "this is the value I reviewed"; a computed would
+track a background store change and turn an ordinary-looking Save into an assertion about
+a value nobody saw. It is never derived from `configured`, a legacy field, the other
+axis, lifecycle, or a form default, and never re-read at submit time.
+
+### ELEVATION IS THE EXISTING MACHINERY, UNTOUCHED
+The component reads no CSRF cookie, calls no `/auth/elevate/`, inspects no elevation
+clock and preflights nothing. The POST goes through the ordinary `HttpClient` stack:
+
+```
+Save -> POST -> 403 elevation-required -> errorClassifierInterceptor case 3
+     -> ONE dialog -> /auth/elevate/ -> THE ORIGINAL HttpRequest replayed once
+```
+
+**The replay carries the original body**, which is what makes the concurrency token
+survive re-authentication. A component that rebuilt the request after elevation would
+assert a token nobody reviewed — and would do it silently, with the conflict check
+passing. `error.interceptor.spec.ts` pins both the populated and the explicit-null case.
+
+### NO OPTIMISTIC UI, AND ONE MUTATION AT A TIME
+The row keeps showing what the server last confirmed until a 200 arrives; §16 forbids
+optimistic UI for consequential writes, and a write is real once its `AdminAuditLog` row
+commits. Only then is `response.commercial` adopted, the editor closed and the draft
+cleared.
+
+**ONLY ONE AXIS EDITOR IS OPEN AND ONLY ONE WRITE IS IN FLIGHT.** Each successful write
+returns the WHOLE canonical object, so two concurrent writes from this panel could land
+out of order and the older snapshot would repaint the other axis. That is a race this
+client would be doing to itself; it is NOT a substitute for server concurrency, which
+`expected_current` and the 409 still own.
+
+### THE OUTCOMES ARE GENUINELY DIFFERENT
+| outcome | what happens |
+|---|---|
+| `changed: true` | adopt, close, "Payment timing recorded." |
+| `changed: false` | adopt, close, "…was already set to that value. Nothing was changed." |
+| 400 | form and draft STAY OPEN, server's field errors beside the field they name |
+| 409 | no auto-retry, editor discarded, `reload()`, "review the current value" |
+| 404 | editor discarded, `reload()` — the established not-found path takes the screen |
+| elevation cancelled | draft KEPT, "Nothing was changed." |
+| elevation abandoned | draft kept, global auth/outage state stays authoritative |
+| 5xx / status 0 | INDETERMINATE — never claims it failed to commit, draft kept for a deliberate retry |
+
+**`changed: false` IS A SUCCESS.** The server answers a same-state request that way even
+when `expected_current` has gone stale, so a lost response followed by an exact retry is
+not a false conflict and does not re-stamp attribution. Nothing manufactures a fresh
+`set_at` for it, and it is never described as a new decision.
+
+**A 409 IS NEVER RETRIED AUTOMATICALLY.** Replaying with a fresh token would overwrite
+whatever the other operator just decided — the precise thing `expected_current` exists to
+prevent. The operator gets a fresh choice, a fresh reason and a fresh token.
+
+### THE COPY MUST NOT OVERSTATE WHAT THESE WRITES DO
+`offline` is "Restaurant collects" — never cash-only, never degraded, fallback or
+pre-launch. `psp_online` is "Dinify via PSP", recorded as INITIATING the diner payment
+through a licensed provider on the restaurant's behalf; the RESTAURANT remains merchant
+of record, funds settle directly to it, and Dinify takes custody of diner money in
+neither mode.
+
+**`psp_online` IS SELECTABLE AND MUST STAY SELECTABLE.** It is a legitimate commercial
+decision; the safety mechanism is fail-closed readiness later, not a control that refuses
+to record what an operator decided. Selecting it shows a warning that it connects no
+provider, creates no merchant account, and cannot satisfy future go-live readiness yet.
+
+Payment timing records a service model and claims NO runtime consequence — nothing in the
+order or kitchen path consumes the value yet, so no copy promises that changing it alters
+current order behaviour.
+
+### THE REASON IS THE OPERATOR'S
+Required, trimmed, minimum 10 characters (`MIN_REASON_LENGTH`, mirroring the server), max
+1000. The client bar is ADVISORY and the server stays authoritative — a 400 from it still
+renders. Nothing generates a reason: no "Admin update", no "Changed via portal".
+
+### MOCK MODE RUNS THE REAL INTERACTION
+`MockRestaurantApi` implements both writes with the server's own rules in the server's own
+order — vocabulary, reason, then concurrency, with same-state checked BEFORE the
+assertion. A successful write overlays the fixture so later reads (workspace AND
+directory) reflect it. **There is no mock-only UI path** and no simulated elevation: that
+machinery has its own tests, and a second implementation in a fixture would prove nothing
+about the real one.
+
+```js
+// Review the conflict UI. Fires once, then disarms so the whole
+// conflict -> reload -> fresh token -> retry path can be walked.
+sessionStorage.setItem('dinify-admin.mock-commercial', 'stale')
+```
+
+### THE DIRECTORY STAYS READ-ONLY
+No write controls on `/restaurants`. Writes belong inside the workspace, where the
+restaurant's identity and context stay visible while the change is made. The directory's
+stub API THROWS on both write methods, so a control added there fails a test rather than
+quietly working.
+
+> **Step 3E.3 is the SUBSCRIPTION-TERMS controls** — record, replace, end. Its
+> concurrency token is `subscription_terms.current.id` rather than a value, and its
+> exact-retry rules differ from an axis's. Not built.
 
 ## The Onboarding Projection — spec §15 step 2C, READ ONLY
 

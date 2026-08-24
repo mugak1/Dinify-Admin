@@ -1,6 +1,10 @@
-import { ChangeDetectionStrategy, Component, computed, inject } from '@angular/core';
+import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@angular/core';
 import { RouterLink } from '@angular/router';
 
+import { AdminServiceStatus } from '../core/api/service-status';
+import { extractErrorMessage, extractFieldErrors } from '../core/api/error-message';
+import { classifyTransportFailure, extractRequestId } from '../core/api/transport-failure';
+import { ElevationAbandonedError, ElevationCancelledError } from '../core/auth/elevation.service';
 import { formatEat } from '../core/formatting/time';
 import {
   activityActionLabel,
@@ -29,9 +33,21 @@ import {
   subscriptionMethodLabel,
   subscriptionTermsLabel,
 } from '../core/restaurants/restaurant.labels';
-import { CommercialAxis } from '../core/restaurants/restaurant.model';
+import { RESTAURANT_API } from '../core/restaurants/restaurant.api';
+import {
+  CommercialAxis,
+  CommercialSummary,
+  PaymentCollectionMode,
+  PaymentTiming,
+} from '../core/restaurants/restaurant.model';
 import { RestaurantWorkspaceStore } from '../core/restaurants/restaurant-workspace.store';
 import { StatusPillComponent } from '../ui/status-pill.component';
+import { AdminButtonComponent } from '../ui/button.component';
+import {
+  CommercialAxisEditorComponent,
+  CommercialAxisOption,
+  CommercialAxisSubmission,
+} from './commercial-axis-editor.component';
 
 /**
  * The five restaurant-detail tabs.
@@ -77,10 +93,24 @@ function setAtLabel(axis: CommercialAxis<unknown> | undefined): string | null {
   return formatEat(axis.set_at);
 }
 
+/**
+ * The HTTP status of a failed write, or null.
+ *
+ * DUCK-TYPED, for the same reason `classifyTransportFailure` is: the development mock
+ * throws `MockHttpError`, not `HttpErrorResponse`, so an `instanceof` check here would
+ * make the 409 and 404 branches dead code in the one mode this work is reviewed in
+ * before a deploy exists. Mirrors `load-failure.ts`.
+ */
+function readStatus(error: unknown): number | null {
+  if (typeof error !== 'object' || error === null) return null;
+  const value = (error as Record<string, unknown>)['status'];
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
 @Component({
   selector: 'app-restaurant-overview-tab',
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink, StatusPillComponent],
+  imports: [RouterLink, StatusPillComponent, AdminButtonComponent, CommercialAxisEditorComponent],
   template: `
     @if (restaurant(); as data) {
       <div class="space-y-4">
@@ -272,30 +302,54 @@ function setAtLabel(axis: CommercialAxis<unknown> | undefined): string | null {
           <section [class]="panel" aria-labelledby="commercial-heading">
             <h2 id="commercial-heading" class="text-admin-section text-ink">Commercial</h2>
             <dl class="mt-3 space-y-1.5">
-              <!-- WHEN the diner pays, relative to eating. A service-model fact. -->
+              <!-- WHEN the diner pays, relative to eating. A service-model fact.
+
+                   THE ROW IS NOT REPAINTED WHILE A WRITE IS IN FLIGHT (§16: no
+                   optimistic UI). It goes on showing the value the server last
+                   confirmed, and changes only when a 200 hands back the canonical
+                   projection — a write is real once its audit row commits, and a row
+                   that moved early has told the operator something that may not be
+                   true. -->
               <div class="flex items-baseline justify-between gap-4">
                 <dt [class]="term">Payment timing</dt>
-                <dd class="text-right">
-                  <span [class]="definition">{{ paymentTiming() }}</span>
-                  @if (paymentTimingSetAt(); as when) {
-                    <!-- WHEN THE DECISION WAS RECORDED — named precisely, because this
-                         is not when the terms took effect and not when anything was
-                         agreed. -->
-                    <span class="block text-admin-meta text-ink-subtle">Set {{ when }}</span>
-                  }
+                <dd class="flex items-baseline justify-end gap-3 text-right">
+                  <span [class]="definition" data-axis-value="payment_timing">{{
+                    paymentTiming()
+                  }}</span>
+                  <app-admin-button
+                    variant="ghost"
+                    [disabled]="changeDisabled()"
+                    (pressed)="openEditor('timing')"
+                    >Change</app-admin-button
+                  >
                 </dd>
               </div>
+              @if (paymentTimingSetAt(); as when) {
+                <!-- WHEN THE DECISION WAS RECORDED — named precisely, because this is
+                     not when the terms took effect and not when anything was agreed. -->
+                <div class="text-right text-admin-meta text-ink-subtle">Set {{ when }}</div>
+              }
 
-              <!-- WHO takes the money. A custody fact, independent of the row above. -->
+              <!-- WHO initiates the payment. A custody fact, independent of the row
+                   above — the two axes are separate decisions with separate lifetimes,
+                   and each has its own control for exactly that reason. -->
               <div class="flex items-baseline justify-between gap-4">
                 <dt [class]="term">Collection mode</dt>
-                <dd class="text-right">
-                  <span [class]="definition">{{ collectionMode() }}</span>
-                  @if (collectionModeSetAt(); as when) {
-                    <span class="block text-admin-meta text-ink-subtle">Set {{ when }}</span>
-                  }
+                <dd class="flex items-baseline justify-end gap-3 text-right">
+                  <span [class]="definition" data-axis-value="payment_collection_mode">{{
+                    collectionMode()
+                  }}</span>
+                  <app-admin-button
+                    variant="ghost"
+                    [disabled]="changeDisabled()"
+                    (pressed)="openEditor('collection')"
+                    >Change</app-admin-button
+                  >
                 </dd>
               </div>
+              @if (collectionModeSetAt(); as when) {
+                <div class="text-right text-admin-meta text-ink-subtle">Set {{ when }}</div>
+              }
 
               <!-- WHAT DINIFY HAS WRITTEN DOWN that this restaurant pays it. The price
                    and the recurrence themselves — never a status word. -->
@@ -331,6 +385,60 @@ function setAtLabel(axis: CommercialAxis<unknown> | undefined): string | null {
 
             @if (hasSubscriptionTerms()) {
               <p [class]="note">{{ termsNote }}</p>
+            }
+
+            <!-- ONE EDITOR AT A TIME (Step 3E.2), rendered below the rows it changes.
+
+                 That is not only layout. Each successful axis write returns the WHOLE
+                 canonical commercial object, so two writes in flight from this panel
+                 could land out of order and the older snapshot would repaint the other
+                 axis. One open editor and one in-flight request makes that race
+                 unrepresentable rather than unlikely. It is not a substitute for server
+                 concurrency — expected_current and the 409 handle other operators. -->
+            @if (editing() === 'timing') {
+              <app-commercial-axis-editor
+                axisId="payment-timing"
+                heading="Payment timing"
+                [options]="timingOptions"
+                [current]="timingValue()"
+                [pending]="pending()"
+                [errorMessage]="writeError()"
+                [fieldErrors]="writeFieldErrors()"
+                (save)="saveTiming($event)"
+                (cancelled)="closeEditor()"
+              />
+            }
+
+            @if (editing() === 'collection') {
+              <app-commercial-axis-editor
+                axisId="payment-collection-mode"
+                heading="Collection mode"
+                [options]="collectionOptions"
+                [current]="collectionValue()"
+                [pending]="pending()"
+                [errorMessage]="writeError()"
+                [fieldErrors]="writeFieldErrors()"
+                (save)="saveCollection($event)"
+                (cancelled)="closeEditor()"
+              />
+            }
+
+            @if (writeError(); as message) {
+              @if (editing() === null) {
+                <!-- A failure the editor is no longer open to carry — a conflict, or a
+                     restaurant that disappeared. It stays on the panel until the next
+                     deliberate edit. -->
+                <p class="mt-3 max-w-prose text-admin-body text-admin-warning" data-commercial-panel-error>
+                  {{ message }}
+                </p>
+              }
+            }
+
+            @if (confirmation(); as message) {
+              <!-- Restrained by design. A recorded configuration is not an achievement,
+                   and §10 asks a completed state to recede — so this is one quiet line
+                   that says exactly what happened, including when nothing did. -->
+              <p [class]="note" data-commercial-confirmation>{{ message }}</p>
             }
 
             <!-- THE LEGACY BLOCK, BELOW A LITERAL FENCE. Kept because an operator
@@ -637,6 +745,283 @@ export class RestaurantOverviewTab {
     const at = this.terms()?.recorded_at;
     return at ? formatEat(at) : null;
   });
+
+  // --- service-configuration writes (Step 3E.2) -----------------------------------
+  //
+  // TWO AXES, TWO NAMED API CALLS, ONE SHARED OUTCOME PATH. `saveTiming` and
+  // `saveCollection` differ in exactly the two places that matter — which endpoint they
+  // call and which value type they assert — and share everything downstream, because
+  // "what does a 409 mean" is not a per-axis question.
+  //
+  // NOTHING HERE TOUCHES ELEVATION. No CSRF read, no /auth/elevate/ call, no inspection
+  // of the client's elevation clock, no preflight. The POST goes through the ordinary
+  // HttpClient stack; when the server answers 403 for stale elevation the existing
+  // interceptor opens ONE dialog and replays THE ORIGINAL REQUEST once, so the replayed
+  // body carries the same value, the same expected_current and the same reason. A
+  // component that rebuilt the request after elevation would defeat exactly that.
+
+  private readonly api = inject(RESTAURANT_API);
+  private readonly serviceStatus = inject(AdminServiceStatus);
+
+  /** Which axis is being edited, or none. Never both — see the template comment. */
+  protected readonly editing = signal<'timing' | 'collection' | null>(null);
+  protected readonly pending = signal(false);
+  protected readonly writeError = signal<string | null>(null);
+  protected readonly writeFieldErrors = signal<Record<string, readonly string[]>>({});
+  protected readonly confirmation = signal<string | null>(null);
+
+  /**
+   * THE CONCURRENCY TOKEN, CAPTURED WHEN THE EDITOR OPENED.
+   *
+   * A plain signal and deliberately NOT a computed. The operator is asserting "this is
+   * the value I reviewed"; if this recomputed from the store it would silently track a
+   * background change, and a Save that looked like an ordinary edit would be asserting
+   * against a value the operator never saw. Captured once, held for the attempt, and
+   * replaced only by a fresh deliberate edit.
+   */
+  private readonly expectedCurrent = signal<string | null>(null);
+
+  protected readonly timingValue = computed(() => this.commercial()?.payment_timing.value ?? null);
+  protected readonly collectionValue = computed(
+    () => this.commercial()?.payment_collection_mode.value ?? null,
+  );
+
+  /** While a write is in flight, neither axis may start another. */
+  protected readonly changeDisabled = computed(() => this.pending());
+
+  protected readonly timingOptions: readonly CommercialAxisOption[] = [
+    {
+      value: 'pay_first',
+      label: 'Pay first',
+      note: 'Settlement is expected before the kitchen fires the order.',
+    },
+    {
+      value: 'pay_after',
+      label: 'Pay after',
+      note: 'The order can proceed before settlement, and the tab is settled afterwards.',
+    },
+  ];
+
+  protected readonly collectionOptions: readonly CommercialAxisOption[] = [
+    {
+      value: 'offline',
+      // NEVER "Cash only": that names one tender out of many and misreports a
+      // restaurant running its own card machine or mobile-money till. A permanent,
+      // first-class mode — not a fallback, not degraded, not pre-launch.
+      label: 'Restaurant collects',
+      note:
+        'Dinify does not initiate the diner payment. The restaurant collects it itself, ' +
+        'through cash, its own mobile-money till, its own card terminal or another ' +
+        'external mechanism.',
+    },
+    {
+      value: 'psp_online',
+      label: 'Dinify via PSP',
+      // INITIATES, never collects or holds. The restaurant stays merchant of record and
+      // funds settle directly to it; Dinify takes no custody of diner money in either
+      // mode.
+      note:
+        'Dinify is recorded as initiating the diner payment through a licensed provider ' +
+        'on the restaurant’s behalf. The restaurant remains merchant of record and funds ' +
+        'settle directly to it.',
+      // Selectable, and deliberately so. The value is a legitimate commercial decision;
+      // the safety mechanism is fail-closed readiness later, not a control that refuses
+      // to record what an operator decided.
+      warning:
+        'This records the intended collection mode only. It connects no provider and ' +
+        'creates no merchant account. Provider readiness is not available yet, so a ' +
+        'restaurant configured this way cannot satisfy future go-live readiness until ' +
+        'provider-authoritative readiness exists.',
+    },
+  ];
+
+  /**
+   * Open one editor, capturing the token the operator is looking at.
+   *
+   * Opening the other axis closes this one and discards its draft: only one local
+   * service-configuration change may be in progress at a time.
+   */
+  protected openEditor(axis: 'timing' | 'collection'): void {
+    if (this.pending()) return;
+    this.clearOutcome();
+    this.expectedCurrent.set(axis === 'timing' ? this.timingValue() : this.collectionValue());
+    this.editing.set(axis);
+  }
+
+  protected closeEditor(): void {
+    if (this.pending()) return;
+    this.editing.set(null);
+    this.expectedCurrent.set(null);
+    this.clearOutcome();
+  }
+
+  protected saveTiming(submission: CommercialAxisSubmission): void {
+    const id = this.restaurant()?.id;
+    if (id === undefined || this.pending()) return;
+
+    this.beginWrite();
+    this.api
+      .setPaymentTiming(id, {
+        value: submission.value as PaymentTiming,
+        // EXPLICIT NULL, never undefined — `JSON.stringify` drops an undefined property
+        // and the server treats an omitted assertion as a 400, not as "was unconfigured".
+        expected_current: this.expectedCurrent() as PaymentTiming | null,
+        reason: submission.reason,
+      })
+      .subscribe({
+        next: (result) => this.onWritten(result.changed, result.commercial, 'Payment timing'),
+        error: (error: unknown) => this.onWriteFailed(error),
+      });
+  }
+
+  protected saveCollection(submission: CommercialAxisSubmission): void {
+    const id = this.restaurant()?.id;
+    if (id === undefined || this.pending()) return;
+
+    this.beginWrite();
+    this.api
+      .setPaymentCollectionMode(id, {
+        value: submission.value as PaymentCollectionMode,
+        expected_current: this.expectedCurrent() as PaymentCollectionMode | null,
+        reason: submission.reason,
+      })
+      .subscribe({
+        next: (result) => this.onWritten(result.changed, result.commercial, 'Collection mode'),
+        error: (error: unknown) => this.onWriteFailed(error),
+      });
+  }
+
+  private beginWrite(): void {
+    this.pending.set(true);
+    this.writeError.set(null);
+    this.writeFieldErrors.set({});
+    this.confirmation.set(null);
+  }
+
+  private clearOutcome(): void {
+    this.writeError.set(null);
+    this.writeFieldErrors.set({});
+    this.confirmation.set(null);
+  }
+
+  /**
+   * A 200. Adopt the canonical projection the server returned and say what happened.
+   *
+   * `changed: false` IS A SUCCESS, not a failure and not a conflict — the server answers
+   * a same-state request that way so a lost response followed by an exact retry does not
+   * become a false conflict or re-stamp attribution. The canonical state is adopted
+   * either way; only the sentence differs, and a no-op must never be described as a new
+   * decision.
+   */
+  private onWritten(changed: boolean, commercial: CommercialSummary, axisLabel: string): void {
+    this.workspace.adoptCommercial(commercial);
+    this.pending.set(false);
+    this.editing.set(null);
+    this.expectedCurrent.set(null);
+    this.writeError.set(null);
+    this.writeFieldErrors.set({});
+    this.confirmation.set(
+      changed
+        ? `${axisLabel} recorded.`
+        : `${axisLabel} was already set to that value. Nothing was changed.`,
+    );
+    // The server answered, so the control plane is reachable. Mock mode runs no
+    // interceptor, so without this a mocked outage would never clear.
+    this.serviceStatus.markReachable();
+  }
+
+  /**
+   * Every failure that can reach a service-configuration write, told apart.
+   *
+   * The order matters: the two elevation outcomes are client-side objects with no HTTP
+   * status, and a conflict is a well-formed answer rather than a defect.
+   */
+  private onWriteFailed(error: unknown): void {
+    this.pending.set(false);
+
+    // Re-authentication dismissed. NOTHING was sent, so the draft and the reason are
+    // kept and the editor stays open — wiping an operator's typed reason because they
+    // cancelled a prompt would make them retype it to do the thing they already decided.
+    if (error instanceof ElevationCancelledError) {
+      this.writeError.set('Re-authentication was cancelled. Nothing was changed.');
+      return;
+    }
+
+    // Re-authentication could not complete — the service did not answer, or the session
+    // ended underneath it. Nobody chose this, so it is not relabelled a validation
+    // failure; the global auth and outage state stays authoritative for the rest.
+    if (error instanceof ElevationAbandonedError) {
+      this.writeError.set(
+        'Re-authentication could not be completed, so nothing was changed. Try again once the admin service is reachable.',
+      );
+      return;
+    }
+
+    const status = readStatus(error);
+
+    // THE CONCURRENCY OUTCOME. Another write moved this axis after this screen took its
+    // token. Not validation, not an outage, not a defect — and emphatically NOT retried
+    // automatically: replaying with a fresh token would overwrite whatever the other
+    // operator just decided, which is the exact thing expected_current exists to stop.
+    if (status === 409) {
+      this.serviceStatus.markReachable();
+      this.discardStaleEditor();
+      this.writeError.set(
+        'Configuration changed since you loaded it. The restaurant has been reloaded; review the current value before trying again.',
+      );
+      // The workspace owns what happens next, including if the reload itself fails.
+      this.workspace.reload();
+      return;
+    }
+
+    // The restaurant is gone — deleted after this screen loaded it. Presenting an
+    // editable stale tenant would invite a write against something that no longer
+    // exists, so the editor is discarded and the established not-found path takes the
+    // screen.
+    if (status === 404) {
+      this.serviceStatus.markReachable();
+      this.discardStaleEditor();
+      this.workspace.reload();
+      return;
+    }
+
+    // Validation. Keep the form and the draft open so the operator can fix it, and put
+    // the server's own words beside the field it named.
+    if (status === 400) {
+      this.serviceStatus.markReachable();
+      this.writeFieldErrors.set(extractFieldErrors(error));
+      this.writeError.set(extractErrorMessage(error, 'The request could not be applied.'));
+      return;
+    }
+
+    // No usable answer: status 0, any 5xx. The outcome is INDETERMINATE — the write may
+    // or may not have committed — so nothing claims it failed to commit, the draft is
+    // preserved, and the operator can deliberately retry the same request. An exact
+    // retry of a write that did land answers `changed: false`, which is precisely why
+    // the backend supports same-state retry.
+    if (classifyTransportFailure(error) === 'unavailable') {
+      this.serviceStatus.reportUnavailable(extractRequestId(error));
+      this.writeError.set(
+        'The admin service did not answer, so it is not known whether this change was recorded. Check the current value before trying again.',
+      );
+      return;
+    }
+
+    // A 401 is owned by the global classifier, which clears the session and routes to
+    // /login; anything else unexpected reaches the defect machinery through the same
+    // interceptor. Either way the pending state is already cleared above, and the
+    // operator is told something rather than left looking at a form that went quiet.
+    this.serviceStatus.markReachable();
+    this.writeError.set(extractErrorMessage(error, 'The change could not be applied.'));
+  }
+
+  /** A conflict or a vanished restaurant invalidates the token this editor captured. */
+  private discardStaleEditor(): void {
+    this.editing.set(null);
+    this.expectedCurrent.set(null);
+    this.writeFieldErrors.set({});
+    this.confirmation.set(null);
+  }
 
   /** Always EAT-labelled (§16) — never the browser's clock, never an unlabelled one. */
   protected readonly legacyExpiry = computed(() =>

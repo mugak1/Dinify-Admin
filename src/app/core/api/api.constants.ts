@@ -50,6 +50,53 @@ export const RESTAURANT_ROUTES = {
 } as const;
 
 /**
+ * The COMMERCIAL SERVICE-CONFIGURATION write routes (Phase 1, Step 3E.2) —
+ * `platform_admin_app/urls.py`.
+ *
+ * TWO ROUTES, NOT ONE, and deliberately no `<field>` segment between them. The
+ * backend's own reasoning, kept here so this side cannot quietly collapse them: these
+ * are two different decisions — a SERVICE-MODEL fact (must settlement be recorded
+ * before the kitchen may fire?) and a CUSTODY fact (does Dinify initiate the diner
+ * payment at all?) — with different consequences and plausibly different future write
+ * authority. A single parameterised route would make "what did this operator change?"
+ * a question about a URL segment, and would let one grant of access reach both.
+ *
+ * BOTH ARE UNSAFE METHODS, and that is what makes them different from every route
+ * above: each POST carries `X-CSRFToken` (added by `csrfInterceptor`) and each is
+ * elevation-gated by `IsRecentlyElevated`, so a 403 carrying
+ * `ELEVATION_REQUIRED_DETAIL` is an EXPECTED step in the normal flow rather than an
+ * error — `errorClassifierInterceptor` case 3 opens one dialog and replays the
+ * original request once.
+ *
+ * Spelled here for the same reason the read routes are, and encoded for the same
+ * reason: a malformed id must not escape its segment.
+ */
+export const COMMERCIAL_ROUTES = {
+  paymentTiming: (id: string): string =>
+    `/restaurants/${encodeURIComponent(id)}/commercial/payment-timing/`,
+  paymentCollectionMode: (id: string): string =>
+    `/restaurants/${encodeURIComponent(id)}/commercial/payment-collection-mode/`,
+} as const;
+
+/**
+ * The house reason bar, MIRRORING `platform_admin_app.delegation.MIN_REASON_LENGTH`.
+ *
+ * ADVISORY, exactly like `ELEVATION_MAX_AGE_MS`. The server trims, refuses blank and
+ * enforces this minimum itself, and a 400 from it must still render properly — this
+ * exists only so an operator is told before they submit rather than after. If the two
+ * ever drift, the worst outcome must be a form that asks for slightly more than the
+ * server needs, never one that lets through less.
+ *
+ * `restaurants_app.controllers.lifecycle` and the delegation surface already mirror
+ * the same constant. A reason is a reason; a second standard on a third surface is how
+ * they start disagreeing.
+ */
+export const MIN_REASON_LENGTH = 10;
+
+/** The server's `MAX_REASON_LENGTH` — a bound on the audit row, not a product rule. */
+export const MAX_REASON_LENGTH = 1000;
+
+/**
  * CSRF cookie name — `platform_admin_app` carries its OWN, NOT Django's default
  * `csrftoken` (which belongs to the customer plane). Declared in
  * `dinify_backend/settings_admin.py`; the `__Host-` prefix is a browser contract

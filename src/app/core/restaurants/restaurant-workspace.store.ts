@@ -5,7 +5,7 @@ import { catchError, of, Subject, switchMap, tap } from 'rxjs';
 import { AdminServiceStatus } from '../api/service-status';
 import { LoadFailure, reportReadReachable, toLoadFailure } from './load-failure';
 import { RESTAURANT_API } from './restaurant.api';
-import { RestaurantDetail } from './restaurant.model';
+import { CommercialSummary, RestaurantDetail } from './restaurant.model';
 
 /** What the workspace is currently able to show. Four states, never collapsed. */
 export type WorkspaceState = 'idle' | 'loading' | 'loaded' | 'error';
@@ -115,5 +115,34 @@ export class RestaurantWorkspaceStore {
   reload(): void {
     const id = this._id();
     if (id !== null) this.requests.next(id);
+  }
+
+  /**
+   * Adopt the canonical `commercial` projection a successful WRITE returned (Step 3E.2).
+   *
+   * ── WHY THIS EXISTS RATHER THAN A REFETCH ─────────────────────────────────────────
+   *
+   * The service-configuration endpoints re-read the projection INSIDE the mutation's own
+   * transaction and hand back the state the write actually produced. That is strictly
+   * better than a follow-up GET: it is the same canonical shape, it cannot race the
+   * write, and it costs no second round trip. So the response is adopted, and a screen
+   * that fetched again merely to learn what it had just been told would be adding a
+   * request and a window in which the two answers could differ.
+   *
+   * ── WHY IT IS DELIBERATELY NARROW ─────────────────────────────────────────────────
+   *
+   * It replaces ONLY `commercial`. Every other field of the loaded detail — the owner,
+   * the onboarding projection, operations, recent activity, the legacy compatibility
+   * block — is preserved untouched, because the write response does not carry them and
+   * a merge that guessed at them would quietly discard state the workspace still holds.
+   *
+   * A no-op when nothing is loaded: there is no detail to attach a projection to, and
+   * synthesising one from a partial response would produce a restaurant object whose
+   * other halves were invented.
+   */
+  adoptCommercial(commercial: CommercialSummary): void {
+    const current = this._detail();
+    if (current === null) return;
+    this._detail.set({ ...current, commercial });
   }
 }

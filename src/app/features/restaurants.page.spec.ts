@@ -7,6 +7,7 @@ import { Observable, Subject, of, throwError } from 'rxjs';
 import { AdminServiceStatus } from '../core/api/service-status';
 import { RESTAURANT_API, RestaurantApi } from '../core/restaurants/restaurant.api';
 import {
+  CommercialMutationResult,
   CommercialSubscriptionTerms,
   CommercialSummary,
   DirectoryQuery,
@@ -146,6 +147,18 @@ class StubApi implements RestaurantApi {
 
   detail(): Observable<RestaurantDetail> {
     throw new Error('the directory must not read a detail');
+  }
+
+  // THE DIRECTORY IS READ-ONLY, and these throw rather than returning something
+  // harmless so that any future write control added to `/restaurants` fails a test
+  // instead of silently working. Writes belong inside the workspace, where the
+  // restaurant's identity and context stay visible while the change is made.
+  setPaymentTiming(): Observable<CommercialMutationResult> {
+    throw new Error('the directory must not write commercial state');
+  }
+
+  setPaymentCollectionMode(): Observable<CommercialMutationResult> {
+    throw new Error('the directory must not write commercial state');
   }
 }
 

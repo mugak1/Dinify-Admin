@@ -1,7 +1,14 @@
 import { InjectionToken } from '@angular/core';
 import { Observable } from 'rxjs';
 
-import { DirectoryQuery, RestaurantDetail, RestaurantDirectoryPage } from './restaurant.model';
+import {
+  CommercialMutationResult,
+  DirectoryQuery,
+  RestaurantDetail,
+  RestaurantDirectoryPage,
+  SetPaymentCollectionModeRequest,
+  SetPaymentTimingRequest,
+} from './restaurant.model';
 
 /**
  * The restaurant READ port — two routes, and nothing else.
@@ -16,25 +23,34 @@ import { DirectoryQuery, RestaurantDetail, RestaurantDirectoryPage } from './res
  * the set of endpoints this repo can call stays enumerable; a generic client that
  * takes a URL makes every future screen free to invent its own contract.
  *
- * IT IS STILL A READ PORT, AND STEP 3E.1 DELIBERATELY LEFT IT ONE. That step migrated
- * this application onto the backend's canonical `commercial` object — payment timing,
- * payment collection mode and subscription terms — but added no way to CHANGE any of
- * them. Reading the authoritative domain correctly comes first; exposing writes against
- * that exact truth comes second, which is the whole reason the two are separate steps.
+ * IT GREW EXACTLY TWO WRITES IN STEP 3E.2, AND THE SHAPE OF THAT GROWTH IS THE POINT.
+ * Step 3E.1 migrated this application onto the backend's canonical `commercial` object
+ * and deliberately added no way to change it; reading the authoritative domain
+ * correctly comes first, and exposing writes against that exact truth comes second.
  *
- * So there is no `setPaymentTiming`, no `setPaymentCollectionMode`, no
- * `recordSubscriptionTerms` / `replaceSubscriptionTerms` / `endSubscriptionTerms`, no
- * generic `post()` and no generic `ApiService` — and there must not be one until the
- * step that owns it lands:
+ * The two writes are NAMED, SEPARATE OPERATIONS, mirroring the two named endpoints —
+ * not `setCommercialField(field, ...)`, not `mutateCommercial`, not `setAxis`, and
+ * emphatically not a generic `post(url, body)`. Payment timing is a SERVICE-MODEL
+ * decision and payment collection mode is a CUSTODY decision; they have different
+ * vocabularies, different consequences and plausibly different future write authority,
+ * and a parameterised method would make "what did this operator change?" a question
+ * about an argument rather than about which operation was called.
  *
- *   Step 3E.2  the service-configuration controls (timing, collection mode)
- *   Step 3E.3  the subscription-terms controls
+ * STILL ABSENT, and must stay absent until the step that owns them:
+ *
+ *   Step 3E.3  `recordSubscriptionTerms` / `replaceSubscriptionTerms` /
+ *              `endSubscriptionTerms` — the terms row has its own concurrency token
+ *              (`subscription_terms.current.id`) and its own exact-retry rules
  *   Step 4     the lifecycle transition
  *
- * Each needs things this slice does not have: elevation, a written reason, and the
- * optimistic-concurrency assertion the read already carries the tokens for
- * (`payment_timing.value`, `payment_collection_mode.value`,
- * `subscription_terms.current.id` are what a writer sends back as `expected_*`).
+ * ── WHAT THE PORT DELIBERATELY DOES NOT DO ────────────────────────────────────────
+ *
+ * It does not read the CSRF cookie, set `X-CSRFToken`, call `/auth/elevate/`, inspect
+ * the client's elevation timestamp or preflight anything. Those POSTs go through the
+ * ordinary `HttpClient` stack, so the existing interceptors supply CSRF, the bounded
+ * refresh-and-replay, 401 handling, ONE elevation prompt and ONE replay of the
+ * ORIGINAL request. A second, commercial-specific re-authentication path would be a
+ * second thing to keep correct, and the server is authoritative either way.
  */
 export interface RestaurantApi {
   /** The directory page for `query`. Only `KNOWN_PARAMS` are ever sent. */
@@ -42,6 +58,39 @@ export interface RestaurantApi {
 
   /** One restaurant: the workspace header and Overview. 404 when missing or deleted. */
   detail(id: string): Observable<RestaurantDetail>;
+
+  /**
+   * Record this restaurant's PAYMENT TIMING — `pay_first` | `pay_after`.
+   *
+   * A service-model decision: must settlement be recorded before the kitchen may fire
+   * the order, or does the order fire immediately and the tab settle at the end? It
+   * says nothing about custody, tender or provider.
+   *
+   * Elevation-gated, audited, and asserted against `request.expected_current`. Answers
+   * 409 when the axis moved since it was loaded, and success with `changed: false` when
+   * the requested value is already stored.
+   */
+  setPaymentTiming(
+    restaurantId: string,
+    request: SetPaymentTimingRequest,
+  ): Observable<CommercialMutationResult>;
+
+  /**
+   * Record this restaurant's PAYMENT COLLECTION MODE — `offline` | `psp_online`.
+   *
+   * A custody decision: does Dinify initiate the diner payment through a licensed
+   * provider on the restaurant's behalf, or does the restaurant collect it itself?
+   *
+   * `psp_online` PERFORMS EXACTLY ONE COMMERCIAL CONFIGURATION MUTATION. It contacts no
+   * provider, creates no merchant record, validates no onboarding, initiates no payment
+   * and proves no readiness — there is no PSP integration on the platform at all.
+   *
+   * Same gating, audit, concurrency and same-state semantics as the timing write.
+   */
+  setPaymentCollectionMode(
+    restaurantId: string,
+    request: SetPaymentCollectionModeRequest,
+  ): Observable<CommercialMutationResult>;
 }
 
 export const RESTAURANT_API = new InjectionToken<RestaurantApi>('RESTAURANT_API');

@@ -2,13 +2,16 @@ import { HttpClient, HttpParams } from '@angular/common/http';
 import { inject, Injectable } from '@angular/core';
 import { map, Observable } from 'rxjs';
 
-import { apiUrl, RESTAURANT_ROUTES } from '../api/api.constants';
+import { apiUrl, COMMERCIAL_ROUTES, RESTAURANT_ROUTES } from '../api/api.constants';
 import { RestaurantApi } from './restaurant.api';
 import {
+  CommercialMutationResult,
   DEFAULT_PAGE_SIZE,
   DirectoryQuery,
   RestaurantDetail,
   RestaurantDirectoryPage,
+  SetPaymentCollectionModeRequest,
+  SetPaymentTimingRequest,
 } from './restaurant.model';
 
 /** The admin plane wraps every success as `{status, message, data}`. */
@@ -60,6 +63,55 @@ export class RestaurantHttp implements RestaurantApi {
   detail(id: string): Observable<RestaurantDetail> {
     return this.http
       .get<Envelope<RestaurantDetail>>(apiUrl(RESTAURANT_ROUTES.detail(id)))
+      .pipe(map((response) => response.data));
+  }
+
+  // --- service-configuration writes (Step 3E.2) ---------------------------------
+  //
+  // TWO NAMED METHODS, TWO NAMED ROUTES. The private `write` helper below is envelope
+  // unwrapping and nothing else — it takes a fully-formed route and body, so it can
+  // neither choose an endpoint nor reshape a request, and the public surface stays two
+  // operations a reader can enumerate.
+  //
+  // THE REQUEST OBJECT IS PASSED THROUGH VERBATIM. Nothing here defaults
+  // `expected_current`, coalesces it, drops it when null, trims the reason or adds a
+  // field. A transport that "helpfully" filled in a missing concurrency assertion would
+  // hand the caller an assertion it never made — which is precisely the overwrite this
+  // whole mechanism exists to prevent.
+
+  setPaymentTiming(
+    restaurantId: string,
+    request: SetPaymentTimingRequest,
+  ): Observable<CommercialMutationResult> {
+    return this.#write(COMMERCIAL_ROUTES.paymentTiming(restaurantId), request);
+  }
+
+  setPaymentCollectionMode(
+    restaurantId: string,
+    request: SetPaymentCollectionModeRequest,
+  ): Observable<CommercialMutationResult> {
+    return this.#write(COMMERCIAL_ROUTES.paymentCollectionMode(restaurantId), request);
+  }
+
+  /**
+   * POST one already-built commercial request and unwrap the envelope.
+   *
+   * Ordinary `HttpClient`, so the whole existing security stack applies without being
+   * restated: `csrfInterceptor` adds `X-CSRFToken` from the `__Host-` cookie, and
+   * `errorClassifierInterceptor` owns the 401, the bounded CSRF refresh-and-replay and
+   * — the one that matters most here — the 403 that means "elevate first", which opens
+   * ONE dialog and replays THIS EXACT request once on success. Rebuilding the body
+   * after elevation is impossible from here, which is the point.
+   *
+   * A REAL `#private` method, not a TypeScript `private` one. The latter is erased at
+   * compile time and leaves a generic `write(route, body)` sitting on the instance —
+   * which is exactly the generic mutation surface this slice is supposed not to have. A
+   * hash-private method is unreachable at runtime, so the public API really is two named
+   * operations rather than two named operations plus an unadvertised third.
+   */
+  #write<T>(route: string, body: T): Observable<CommercialMutationResult> {
+    return this.http
+      .post<Envelope<CommercialMutationResult>>(apiUrl(route), body)
       .pipe(map((response) => response.data));
   }
 }

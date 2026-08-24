@@ -55,7 +55,7 @@ Unchanged from v2.2 §8. `RestaurantSubscription` + `SubscriptionInvoice` + `Sub
 
 v2.2 listed features without saying how they compose. This section fixes that, and it is the most consequential addition in v2.3.
 
-**One dominant object: the restaurant.** Nearly every Phase 1 task is restaurant-scoped — readiness, lifecycle, owner claim, payment mode, subscription, invoices, support issues, delegation, QR provisioning, audit history. If those become top-level destinations the portal fragments immediately.
+**One dominant object: the restaurant.** Nearly every Phase 1 task is restaurant-scoped — readiness, lifecycle, owner claim, commercial configuration, subscription terms, invoices, support issues, delegation, QR provisioning, audit history. If those become top-level destinations the portal fragments immediately.
 
 **Global navigation is five destinations and nothing more:**
 
@@ -80,7 +80,7 @@ The most important screen in the portal. A persistent header carrying state, the
 
 Kampala Bistro                                    [Primary action]
 Kololo, Kampala · REST-0018
-● ONBOARDING    Cash only    Trial    [TEST if applicable]
+● ONBOARDING    [TEST if applicable]
 
 Overview | Readiness | Billing | Support | Activity
 ```
@@ -89,7 +89,7 @@ Overview | Readiness | Billing | Support | Activity
 
 Consequential, infrequent actions live in an overflow menu — go live, suspend, offboard — with **emergency freeze visually and interactionally separated** from ordinary suspension, per §6's insistence that they are different operations.
 
-**Overview** shows: a needs-attention block if anything blocks go-live; owner and claim status; payment mode; subscription and trial end; operational summary (last order, tables, dining areas); and the three or four most recent activity entries with a link to the full tab.
+**Overview** shows: a needs-attention block if anything blocks go-live; owner and claim status; the commercial state — payment timing, payment collection mode and the current recorded subscription terms, each reported separately; operational summary (last order, tables, dining areas); and the three or four most recent activity entries with a link to the full tab.
 
 ### 9.2 URL scheme
 
@@ -116,9 +116,9 @@ Meaningful, deep-linkable, refreshable, with working browser Back:
 
 **Ownership** — owner account **claimed** (not merely invited); owner **go-live approval** recorded.
 
-**Commercial** — subscription record created; payment mode confirmed.
+**Commercial** — payment timing recorded; payment collection mode recorded; current subscription terms recorded. These are three independent decisions, and readiness names whichever is missing rather than reporting one combined commercial verdict.
 
-**Conditional** — if `vat_registered` is true, TIN is required. If payment mode is `psp_live`, PSP merchant onboarding must be complete; if `cash_only`, PSP status is irrelevant and must not appear as a blocker. The engine evaluates applicability before evaluating satisfaction.
+**Conditional** — if `vat_registered` is true, TIN is required. Payment collection mode decides whether a payment provider is in scope at all: where the restaurant collects the diner payment itself, provider readiness is *not applicable* and must never appear as a blocker it could not clear; where Dinify is recorded as collecting through a provider, provider-authoritative merchant readiness is required — and until a real integration exists to answer for it, that requirement is *required but unavailable*: nothing can satisfy it, so it **blocks** rather than being waived. Readiness fails closed here as everywhere — a restaurant must not go live having selected a collection path that cannot yet take a payment. The engine evaluates applicability before evaluating satisfaction.
 
 All are **hard, server-side** blockers enforced by `check_go_live_readiness()` at the `onboarding → live` transition. Soft warnings — missing imagery, additional staff not provisioned, optional training — surface but do not block.
 
@@ -178,7 +178,7 @@ This lives on the restaurant's Readiness tab, where the blocker it satisfies als
 
 **0. Scaffold** — `mugak1/Dinify-Admin`, tokens, shell with the §9 navigation, auth against `/api/admin/v1/auth/*`, table/status/button primitives. Deploy (S3 + OIDC + SSM, per §3) is **0C** and is deliberately not part of the scaffold PR.
 
-**1. Restaurant directory + detail workspace shell** — the §9.1 structure with Overview populated. Directory columns: restaurant, lifecycle, **readiness**, payment mode, subscription, open issues, last activity. Filters: All / Needs attention / Onboarding, plus status and search. No bulk actions or saved views — nothing legitimate happens in bulk across tenants.
+**1. Restaurant directory + detail workspace shell** — the §9.1 structure with Overview populated. Directory columns: restaurant, lifecycle, **readiness**, payment, subscription terms, open issues, last activity. Filters: All / Needs attention / Onboarding, plus status and search. No bulk actions or saved views — nothing legitimate happens in bulk across tenants.
 
 **2. Create restaurant shell + owner invitation** (§14).
 
@@ -208,7 +208,7 @@ This lives on the restaurant's Readiness tab, where the blocker it satisfies als
 
 **Time is East Africa Time, explicitly.** `15:42 EAT · 19 Aug 2026`, optionally with relative time alongside. Administration may happen from another timezone; "yesterday at 23:50" must never be ambiguous.
 
-**Currency is `UGX 150,000`** — no decimals, no faux precision.
+**Currency: whole-unit values render without trailing zero decimals** — `UGX 150,000`, not `UGX 150,000.00`. No faux precision. But if the backend has recorded a genuine non-zero fractional amount, that fraction is preserved exactly rather than rounded or truncated: money is never altered on screen merely to satisfy a visual convention, and the currency shown is always the one stored with the amount.
 
 **No optimistic UI for consequential writes.** Lifecycle transitions, go-live, offboard, mark-paid and incident resolution remain visibly pending until the server has committed and audited them.
 

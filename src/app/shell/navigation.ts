@@ -4,7 +4,7 @@
  * ── THE RULE, NOT A NOTE ──────────────────────────────────────────────────────────
  *
  * One object dominates this portal: THE RESTAURANT. Nearly every Phase 1 task is
- * restaurant-scoped — readiness, lifecycle, owner claim, payment mode, subscription,
+ * restaurant-scoped — readiness, lifecycle, owner claim, commercial configuration,
  * invoices, support issues, delegation, QR provisioning, audit history. If each of
  * those became a top-level destination the portal would fragment immediately, and the
  * operator would spend their day asking "which screen was that on" instead of doing

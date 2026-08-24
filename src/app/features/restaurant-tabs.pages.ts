@@ -679,10 +679,20 @@ export class RestaurantOverviewTab {
       <p class="mt-2 max-w-prose text-admin-body text-ink-muted">
         Collection mode decides whether a payment provider is in scope at all. Where the
         restaurant collects the diner payment itself, provider readiness is NOT APPLICABLE rather
-        than a blocker it could never clear. Where Dinify is recorded as collecting through a
-        provider, provider-authoritative merchant readiness becomes a requirement — but only once
-        a real integration exists to answer for it. There is none today, so there is no provider,
-        no merchant identity and no readiness verdict for this portal to report.
+        than a blocker it could never clear — that mode is permanent and first-class, and the
+        first commercial restaurant has to be able to go live in it.
+      </p>
+      <p class="mt-2 max-w-prose text-admin-body text-ink-muted">
+        <!-- FAIL CLOSED, deliberately. An earlier draft of this paragraph said merchant readiness
+             became a requirement "only once a real integration exists", which reads as a WAIVER:
+             it would let a restaurant go live having chosen a collection path that cannot take a
+             payment. The backend states the intended answer as "required but unavailable", which
+             is a blocker, and readiness fails closed everywhere else in this system. -->
+        Where Dinify is recorded as collecting through a provider, provider-authoritative merchant
+        readiness is REQUIRED — and with no integration built, that requirement is required but
+        UNAVAILABLE: nothing can satisfy it, so it blocks rather than being waived. There is still
+        no provider, no merchant identity and no readiness verdict for this portal to report; what
+        the engine will report is that the question cannot yet be answered.
       </p>
       <p class="mt-2 max-w-prose text-admin-body text-ink-muted">
         The owner-invitation state machine lives here too, beside the blocker it satisfies.

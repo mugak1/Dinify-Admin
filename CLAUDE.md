@@ -748,6 +748,28 @@ not a false conflict and does not re-stamp attribution. Nothing manufactures a f
 whatever the other operator just decided — the precise thing `expected_current` exists to
 prevent. The operator gets a fresh choice, a fresh reason and a fresh token.
 
+**AND NO NEW DECISION IS POSSIBLE UNTIL THE REPLACEMENT READ HAS LANDED.** Handling the
+conflict releases the write slot and starts a GET, but `reload()` deliberately leaves the
+previous detail in place and the tab outlet stays mounted through the loading state
+(`restaurant-detail.page.ts` renders it in its `@default` branch) — so the panel goes on
+rendering the SUPERSEDED projection. Review found that an operator could reopen an editor
+in that window and capture the same stale token again. `expected_current` still refused
+the write, so nothing was silently overwritten; what broke was the recovery invariant:
+
+> after a conflict, the operator must SEE the freshly reloaded canonical state before
+> being allowed to make another commercial decision.
+
+`RestaurantWorkspaceStore.reloadSuperseded()` marks `detailSuperseded` for the duration
+and the panel's Change controls read it alongside `mutating`. A guard built on `loading`
+alone would be weaker AND broader — it would also shut the controls during every ordinary
+retry, while saying nothing about the projection being known wrong. The 404 path uses the
+same call for the same reason: until the re-read lands, the panel is still showing a
+tenant that no longer exists.
+
+The conflict copy stops at what is true — "Review the current value before trying again."
+— and a "Reloading…" clause is appended only while the read is genuinely in flight. It
+previously claimed the restaurant "has been reloaded" at a moment when it had not.
+
 ### THE COPY MUST NOT OVERSTATE WHAT THESE WRITES DO
 `offline` is "Restaurant collects" — never cash-only, never degraded, fallback or
 pre-launch. `psp_online` is "Dinify via PSP", recorded as INITIATING the diner payment

@@ -429,7 +429,7 @@ function readStatus(error: unknown): number | null {
                      restaurant that disappeared. It stays on the panel until the next
                      deliberate edit. -->
                 <p class="mt-3 max-w-prose text-admin-body text-admin-warning" data-commercial-panel-error>
-                  {{ message }}
+                  {{ panelMessage() }}
                 </p>
               }
             }
@@ -780,6 +780,20 @@ export class RestaurantOverviewTab {
   protected readonly confirmation = signal<string | null>(null);
 
   /**
+   * The panel-level failure message, with a progress clause while the replacement read
+   * is genuinely in flight.
+   *
+   * The base sentence is true at every moment; the suffix is added only while it is.
+   * The alternative — one sentence claiming the restaurant "has been reloaded" — is
+   * false for the whole window this fix is about.
+   */
+  protected readonly panelMessage = computed(() => {
+    const message = this.writeError();
+    if (message === null) return null;
+    return this.workspace.detailSuperseded() ? `${message} Reloading…` : message;
+  });
+
+  /**
    * THE CONCURRENCY TOKEN, CAPTURED WHEN THE EDITOR OPENED.
    *
    * A plain signal and deliberately NOT a computed. The operator is asserting "this is
@@ -796,10 +810,20 @@ export class RestaurantOverviewTab {
   );
 
   /**
-   * While a write is in flight ANYWHERE IN THIS WORKSPACE, neither axis may start
-   * another — including on a freshly rebuilt Overview after a tab round-trip.
+   * No axis may start a change while a write is in flight ANYWHERE IN THIS WORKSPACE —
+   * including on a freshly rebuilt Overview after a tab round-trip — OR while what is on
+   * screen is known to have been superseded.
+   *
+   * The second half is the post-conflict recovery invariant: after a 409 the operator
+   * must SEE the freshly reloaded canonical state before being allowed to decide again.
+   * Without it there is a window — the conflict is handled, the write slot is released,
+   * but the replacement GET has not landed — in which the panel still renders the stale
+   * projection with live controls, and reopening an editor captures the same stale token
+   * a second time.
    */
-  protected readonly changeDisabled = computed(() => this.workspace.mutating());
+  protected readonly changeDisabled = computed(
+    () => this.workspace.mutating() || this.workspace.detailSuperseded(),
+  );
 
   protected readonly timingOptions: readonly CommercialAxisOption[] = [
     {
@@ -854,7 +878,9 @@ export class RestaurantOverviewTab {
    * service-configuration change may be in progress at a time.
    */
   protected openEditor(axis: 'timing' | 'collection'): void {
-    if (this.workspace.mutating()) return;
+    // The same gate the button reads, enforced here too: a disabled button is a
+    // presentation, and the token capture below is the thing that actually matters.
+    if (this.changeDisabled()) return;
     this.clearOutcome();
     this.expectedCurrent.set(axis === 'timing' ? this.timingValue() : this.collectionValue());
     this.editing.set(axis);
@@ -986,11 +1012,15 @@ export class RestaurantOverviewTab {
     if (status === 409) {
       this.serviceStatus.markReachable();
       this.discardStaleEditor();
+      // NOT "has been reloaded" — the read has not happened yet at this point, and this
+      // panel spends the rest of its existence refusing to claim things prematurely.
+      // The transient progress half is appended by `panelMessage` while it is true.
       this.writeError.set(
-        'Configuration changed since you loaded it. The restaurant has been reloaded; review the current value before trying again.',
+        'Configuration changed since you loaded it. Review the current value before trying again.',
       );
-      // The workspace owns what happens next, including if the reload itself fails.
-      this.workspace.reload();
+      // Marks the projection superseded for the duration, so no second decision can be
+      // taken against it. The workspace owns what happens next, including a failed read.
+      this.workspace.reloadSuperseded();
       return;
     }
 
@@ -1001,7 +1031,10 @@ export class RestaurantOverviewTab {
     if (status === 404) {
       this.serviceStatus.markReachable();
       this.discardStaleEditor();
-      this.workspace.reload();
+      // Superseded for the same reason, and it matters for the same window: until the
+      // re-read lands and the workspace takes the screen with its not-found state, the
+      // panel is still rendering a tenant that no longer exists.
+      this.workspace.reloadSuperseded();
       return;
     }
 

@@ -688,11 +688,12 @@ export class RestaurantOverviewTab {
              it would let a restaurant go live having chosen a collection path that cannot take a
              payment. The backend states the intended answer as "required but unavailable", which
              is a blocker, and readiness fails closed everywhere else in this system. -->
-        Where Dinify is recorded as collecting through a provider, provider-authoritative merchant
-        readiness is REQUIRED — and with no integration built, that requirement is required but
-        UNAVAILABLE: nothing can satisfy it, so it blocks rather than being waived. There is still
-        no provider, no merchant identity and no readiness verdict for this portal to report; what
-        the engine will report is that the question cannot yet be answered.
+        Where Dinify is recorded as initiating the diner payment through a provider,
+        provider-authoritative merchant readiness is REQUIRED — and with no integration built,
+        that requirement is required but UNAVAILABLE: nothing can satisfy it, so it blocks rather
+        than being waived. There is still no provider, no merchant identity and no readiness
+        verdict for this portal to report; what the engine will report is that the question
+        cannot yet be answered.
       </p>
       <p class="mt-2 max-w-prose text-admin-body text-ink-muted">
         The owner-invitation state machine lives here too, beside the blocker it satisfies.

@@ -68,8 +68,16 @@ export const BLOCKER_READINESS_NOT_CONFIGURED = 'readiness_not_configured';
 /**
  * ══ THE CANONICAL COMMERCIAL CONTRACT (Step 3E.1) ═════════════════════════════════
  *
- * `commercial` is the authoritative answer to what a restaurant has commercially
- * agreed with Dinify. It arrives on BOTH the directory row and the detail payload —
+ * `commercial` is the authoritative answer to a restaurant's RECORDED commercial
+ * configuration and terms.
+ *
+ * Recorded, not AGREED. An administrator writing down a price is not the owner accepting
+ * one, and this projection carries no owner consent of any kind — see the terms note
+ * below. Owner go-live approval is a separate concept that will bind to these exact
+ * facts later; describing the read as what a restaurant has "agreed" would quietly
+ * promote a platform-side entry into a two-sided agreement.
+ *
+ * It arrives on BOTH the directory row and the detail payload —
  * `restaurant_reads` calls `commercial_reads.commercial_summary` on each — so the two
  * screens are structurally incapable of disagreeing, and this application models it on
  * the shared shape below rather than as a detail-only extra.

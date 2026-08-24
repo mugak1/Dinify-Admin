@@ -23,7 +23,7 @@ import {
  * ── THESE ARE NOT RICHER THAN THE BACKEND ─────────────────────────────────────────
  *
  * The temptation with fixtures is to invent the product you wish existed — a
- * subscription that is Paid, a payment mode that is Cash only, an owner who has
+ * subscription that is Paid, a collection mode that reads Cash only, an owner who has
  * Claimed. Every one of those would make the review pleasant and the screen a lie,
  * and the first real deploy would then look broken by comparison.
  *

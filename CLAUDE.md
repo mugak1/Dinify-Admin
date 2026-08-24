@@ -530,8 +530,12 @@ failure mode is a word that reads fine until an operator acts on it.
 
 ## The Commercial Projection — spec §15 step 3E.1, READ ONLY
 
-`commercial` is the CANONICAL answer to what a restaurant has commercially agreed with
-Dinify. It arrives on **BOTH** `GET /restaurants/` rows and the detail payload — the
+`commercial` is the CANONICAL answer to a restaurant's **recorded** commercial
+configuration and terms — recorded, never *agreed*. An administrator writing down a price
+is not an owner accepting one, and nothing in this projection carries owner consent.
+(Owner go-live approval is a separate concept and will bind to these exact facts later.)
+
+It arrives on **BOTH** `GET /restaurants/` rows and the detail payload — the
 backend computes it once in `commercial_reads.commercial_summary` and hands the same
 object to each read — so it lives on the SHARED shape (`RestaurantCommon`), not as a
 detail-only extra. No new endpoint, no second store, no second request.

@@ -226,8 +226,10 @@ class StubApi implements RestaurantApi {
  *   route back; a backend that is down is a different fact and must not be navigated
  *   to a "not found" that blames the link.
  *
- *   THE PORTAL SAYS ONLY WHAT THE SERVER SAID. Payment mode, subscription and the
- *   owner's claim state are each reported as unconfigured or untracked, and the raw
+ *   THE PORTAL SAYS ONLY WHAT THE SERVER SAID. The three canonical commercial facts —
+ *   payment timing, payment collection mode and subscription terms — are each reported
+ *   exactly as the server reports them, including when only some of them are configured;
+ *   onboarding state is reported as tracked or not rather than guessed at; and the raw
  *   `readiness_not_configured` code never reaches the operator.
  */
 describe('RestaurantDetailPage', () => {

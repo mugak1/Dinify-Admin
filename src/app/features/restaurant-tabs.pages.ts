@@ -663,10 +663,26 @@ export class RestaurantOverviewTab {
       <p class="mt-2 max-w-prose text-admin-body text-ink-muted">
         This tab will show the real checklist: restaurant setup (a published available item, an
         enabled table with a current QR, a completed test order), ownership (owner account
-        claimed and go-live approval recorded), and commercial (subscription record, payment
-        mode). Conditional rules apply before satisfaction is evaluated — a TIN is required only
-        when the restaurant is VAT-registered, and PSP onboarding is irrelevant to a cash-only
-        restaurant rather than a blocker it can never clear.
+        claimed and go-live approval recorded), and commercial.
+      </p>
+      <p class="mt-2 max-w-prose text-admin-body text-ink-muted">
+        <!-- Rewritten for Step 3E.1. This described the commercial half as "subscription record,
+             payment mode" and spoke of a cash-only restaurant — vocabulary that predates the
+             commercial domain and that the portal no longer uses anywhere else. It names the
+             three canonical facts instead, and states the offline consequence without turning
+             either collection mode into a claim the platform cannot support. -->
+        The commercial half evaluates the three facts Overview already reports, separately:
+        payment timing recorded, payment collection mode recorded, and current subscription terms
+        recorded. Conditional rules apply before satisfaction is evaluated — a TIN is required
+        only when the restaurant is VAT-registered.
+      </p>
+      <p class="mt-2 max-w-prose text-admin-body text-ink-muted">
+        Collection mode decides whether a payment provider is in scope at all. Where the
+        restaurant collects the diner payment itself, provider readiness is NOT APPLICABLE rather
+        than a blocker it could never clear. Where Dinify is recorded as collecting through a
+        provider, provider-authoritative merchant readiness becomes a requirement — but only once
+        a real integration exists to answer for it. There is none today, so there is no provider,
+        no merchant identity and no readiness verdict for this portal to report.
       </p>
       <p class="mt-2 max-w-prose text-admin-body text-ink-muted">
         The owner-invitation state machine lives here too, beside the blocker it satisfies.
@@ -686,13 +702,27 @@ export class RestaurantReadinessTab {
     <section [class]="panel">
       <h2 class="text-admin-section text-ink">Billing</h2>
       <p class="mt-1 max-w-prose text-admin-body text-ink-muted">
-        Will show this restaurant's subscription and its invoices. The commercial subscription
-        models do not exist yet, which is why Overview reports the subscription as not configured
-        and shows the legacy columns as legacy.
+        Will show what this restaurant is invoiced for its Dinify subscription, and whether those
+        invoices have been paid.
       </p>
       <p class="mt-2 max-w-prose text-admin-body text-ink-muted">
-        Manual mark-paid is the only write, and it is a consequential one — visibly pending until
-        the server has committed and audited it.
+        <!-- This used to say the subscription models did not exist. They do now, so the copy
+             would have been a false statement about the platform sitting on the tab that most
+             invites an operator to ask about money. What is still missing is narrower and worth
+             naming precisely. -->
+        The recorded subscription TERMS already exist and are shown on Overview — the recorded
+        price and how often it recurs. Terms are only what Dinify has written down. They are not
+        an invoice, not a payment, not evidence of account standing, and not proof that the owner
+        agreed to them.
+      </p>
+      <p class="mt-2 max-w-prose text-admin-body text-ink-muted">
+        What this tab needs is the part that does not exist yet: there is no invoice, no
+        receivable and no collection path anywhere on the platform, so no restaurant has ever
+        been billed for a subscription through this system.
+      </p>
+      <p class="mt-2 max-w-prose text-admin-body text-ink-muted">
+        Manual mark-paid arrives with them, and it is a consequential write — visibly pending
+        until the server has committed and audited it.
       </p>
       <p class="mt-3 text-admin-meta text-ink-subtle">Spec §8 — arrives with step 7.</p>
     </section>

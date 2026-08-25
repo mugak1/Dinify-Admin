@@ -2286,6 +2286,170 @@ describe('RestaurantOverviewTab', () => {
     }));
   });
 
+  // ── RESPONSIVE REACHABILITY OF COMMERCIAL ACTIONS ────────────────────────────────
+  //
+  // THE DEFECT THESE EXIST FOR, reproduced in a real browser during live UAT:
+  //
+  //   At a 814x1000 viewport, on a restaurant with open subscription terms, the
+  //   Commercial card was 259px wide and its terms row needed 320px. `End terms` laid
+  //   out at x 519→576 while the card ended at x 515 — four pixels past the edge,
+  //   painted under the neighbouring card, with `document.scrollingElement` reporting NO
+  //   horizontal overflow to scroll to it and `elementFromPoint` at the button's own
+  //   centre returning a different element entirely. The action was in the DOM and the
+  //   operator could not press it.
+  //
+  //   Sweeping the range showed it was never about one button or one width: every
+  //   viewport from 768px to 949px stranded at least one control, and at 768px even a
+  //   single 69px `Change` button on a service axis did not fit.
+  //
+  // TWO THINGS CHANGED, and each covers a different failure:
+  //
+  //   The card grid goes two-column at `lg` (1024px) rather than `md` (768px), because
+  //   a 236–327px card cannot hold a commercial row at all. That is the root cause.
+  //
+  //   The three control-bearing rows WRAP. That is the guarantee: a row that can wrap
+  //   cannot strand a control no matter how long a value, a currency code or a future
+  //   control label becomes. Without it the fix would hold only for today's strings.
+  //
+  // KARMA HAS NO LAYOUT ENGINE — `getBoundingClientRect` in a detached test fixture
+  // measures nothing meaningful — so these pin the STRUCTURE that makes single-line
+  // overflow unrepresentable, not the pixels. The pixels were verified in Chromium at
+  // the widths named above, before and after.
+
+  describe('commercial actions at constrained widths', () => {
+    /** The row container and the actions container for one commercial term. */
+    function containers(term: string): { row: HTMLElement; actions: HTMLElement } {
+      const panel = el().querySelector('[aria-labelledby="commercial-heading"]')!;
+      const dt = [...panel.querySelectorAll('dt')].find((n) => n.textContent?.trim() === term)!;
+      return { row: dt.parentElement as HTMLElement, actions: dt.nextElementSibling as HTMLElement };
+    }
+
+    /** Every commercial row that carries a control, whatever the terms state. */
+    function controlBearingTerms(): string[] {
+      const panel = el().querySelector('[aria-labelledby="commercial-heading"]')!;
+      return [...panel.querySelectorAll('dt')]
+        .filter((dt) => dt.nextElementSibling?.querySelector('button'))
+        .map((dt) => dt.textContent!.trim());
+    }
+
+    it('goes two-column only at lg, never at md', fakeAsync(async () => {
+      // THE ROOT CAUSE. At `md` each card is 236–327px and a commercial row needs more
+      // than that, so the surplus overflowed the card — Tailwind's columns are
+      // `minmax(0, 1fr)`, which will not grow to contain their content.
+      await loaded();
+
+      const grid = el().querySelector('[aria-labelledby="commercial-heading"]')!.closest('.grid')!;
+      expect(grid.className).toContain('lg:grid-cols-2');
+      expect(grid.className).withContext('md is where the cards are too narrow').not.toContain(
+        'md:grid-cols-2',
+      );
+      flush();
+    }));
+
+    /** Every control-bearing row carries the wrap, whatever state the panel is in. */
+    function expectEveryRowWraps(): void {
+      const terms = controlBearingTerms();
+      expect(terms).withContext('all three rows offer a control').toEqual([
+        'Payment timing',
+        'Collection mode',
+        'Subscription terms',
+      ]);
+      for (const term of terms) {
+        const { row, actions } = containers(term);
+        expect(row.className).withContext(`${term}: row wraps`).toContain('flex-wrap');
+        expect(actions.className).withContext(`${term}: actions wrap`).toContain('flex-wrap');
+      }
+    }
+
+    it('lets EVERY control-bearing row wrap — no open terms', fakeAsync(async () => {
+      // Asserted per row rather than on the terms row alone: the sweep found the service
+      // axes stranded their own `Change` button at 768px, so all three carry the
+      // guarantee. `flex` without `flex-wrap` is what forced one unbounded line.
+      await loaded();
+      expectEveryRowWraps();
+      flush();
+    }));
+
+    it('lets EVERY control-bearing row wrap — open terms', fakeAsync(async () => {
+      // The reproduced case: two controls beside a three-line value is the widest a
+      // commercial row ever gets, and is the one that stranded End terms.
+      api.answer = () => of(detail({ commercial: commercial({ terms: {} }) }));
+      await loaded();
+      expectEveryRowWraps();
+      flush();
+    }));
+
+    it('keeps the actions right-aligned and space-filling, so wide desktop is unchanged', fakeAsync(async () => {
+      // `grow` + `justify-end` reproduces exactly what `justify-between` did while the
+      // line fits — measured byte-identical at 1280px and 1500px, before and after. The
+      // second line only ever appears where the alternative was an unreachable control.
+      api.answer = () => of(detail({ commercial: commercial({ terms: {} }) }));
+      await loaded();
+
+      const { actions } = containers('Subscription terms');
+      expect(actions.className).toContain('grow');
+      expect(actions.className).toContain('justify-end');
+      expect(actions.className).toContain('text-right');
+      flush();
+    }));
+
+    function labels(term: string): (string | undefined)[] {
+      return [...containers(term).actions.querySelectorAll('button')].map((b) =>
+        b.textContent?.trim(),
+      );
+    }
+
+    /** One Change per axis — not two, and not a hidden duplicate for a breakpoint. */
+    function expectOneChangePerAxis(): void {
+      for (const axis of ['Payment timing', 'Collection mode']) {
+        expect(labels(axis)).withContext(axis).toEqual(['Change']);
+      }
+    }
+
+    it('still offers exactly the right controls — no open terms', fakeAsync(async () => {
+      // The layout change must not have touched the state machine, and must not have
+      // duplicated a control by rendering a second responsive copy of it.
+      await loaded();
+      expect(labels('Subscription terms')).toEqual(['Record terms']);
+      expectOneChangePerAxis();
+      flush();
+    }));
+
+    it('still offers exactly the right controls — open terms', fakeAsync(async () => {
+      api.answer = () => of(detail({ commercial: commercial({ terms: {} }) }));
+      await loaded();
+      expect(labels('Subscription terms')).toEqual(['Replace terms', 'End terms']);
+      expectOneChangePerAxis();
+      flush();
+    }));
+
+    it('leaves the editor and mutation semantics untouched', fakeAsync(async () => {
+      // A layout fix that quietly changed which editor opens, or let two open at once,
+      // would be a far worse defect than the one it fixed.
+      api.answer = () => of(detail({ commercial: commercial({ terms: {} }) }));
+      await loaded();
+      const panel = () => el().querySelector('[aria-labelledby="commercial-heading"]')!;
+
+      const replace = [...containers('Subscription terms').actions.querySelectorAll('button')].find(
+        (b) => b.textContent?.trim() === 'Replace terms',
+      )!;
+      replace.click();
+      harness.detectChanges();
+      expect(panel().querySelectorAll('[data-commercial-editor]').length).toBe(1);
+
+      const change = containers('Payment timing').actions.querySelector('button')!;
+      change.click();
+      harness.detectChanges();
+      expect(panel().querySelectorAll('[data-commercial-editor]').length)
+        .withContext('still one editor, not one per breakpoint')
+        .toBe(1);
+      expect(panel().querySelector('[data-terms-editor]'))
+        .withContext('opening the axis replaced the terms editor')
+        .toBeNull();
+      flush();
+    }));
+  });
+
   it('shows the operational counts', fakeAsync(async () => {
     await loaded();
 

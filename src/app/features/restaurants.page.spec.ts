@@ -149,8 +149,8 @@ class StubApi implements RestaurantApi {
     throw new Error('the directory must not read a detail');
   }
 
-  // THE DIRECTORY IS READ-ONLY, and these throw rather than returning something
-  // harmless so that any future write control added to `/restaurants` fails a test
+  // THE DIRECTORY IS READ-ONLY — all FIVE commercial writes throw rather than returning
+  // something harmless, so that any write control added to `/restaurants` fails a test
   // instead of silently working. Writes belong inside the workspace, where the
   // restaurant's identity and context stay visible while the change is made.
   setPaymentTiming(): Observable<CommercialMutationResult> {
@@ -158,6 +158,18 @@ class StubApi implements RestaurantApi {
   }
 
   setPaymentCollectionMode(): Observable<CommercialMutationResult> {
+    throw new Error('the directory must not write commercial state');
+  }
+
+  recordSubscriptionTerms(): Observable<CommercialMutationResult> {
+    throw new Error('the directory must not write commercial state');
+  }
+
+  replaceSubscriptionTerms(): Observable<CommercialMutationResult> {
+    throw new Error('the directory must not write commercial state');
+  }
+
+  endSubscriptionTerms(): Observable<CommercialMutationResult> {
     throw new Error('the directory must not write commercial state');
   }
 }

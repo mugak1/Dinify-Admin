@@ -228,6 +228,90 @@ export interface SetPaymentCollectionModeRequest {
 }
 
 /**
+ * ══ THE SUBSCRIPTION-TERMS WRITE CONTRACT (Step 3E.3) ═════════════════════════════
+ *
+ * Three requests, one per named operation, because the three are materially different
+ * decisions rather than three modes of one.
+ *
+ * ── THE AMOUNT IS A STRING, AND THAT IS ENFORCED AT BOTH ENDS ────────────────────
+ *
+ * The backend's `StrictDecimalStringField` REFUSES a JSON number outright — not a
+ * `CharField`, which would coerce `150000` to `"150000"` and silently bypass the very
+ * contract it exists to hold. `"0.00"` versus `0.0` is exactly the distinction that
+ * would be lost. So nothing on this side may call `Number()`, `parseFloat()` or `+` on
+ * an amount on its way to the wire; a form collects a string and a string is sent.
+ *
+ * ── THE MOMENTS MUST CARRY AN EXPLICIT OFFSET ────────────────────────────────────
+ *
+ * `effective_from` and `ended_at` go through `AwareDateTimeField`, which refuses a
+ * naive value rather than assuming a zone for it. `eatWallTimeToIso` is how this
+ * application produces one — see `core/formatting/time.ts` for why the browser's own
+ * timezone must never be the interpreter.
+ *
+ * ── NEITHER MOMENT MAY BE IN THE FUTURE ──────────────────────────────────────────
+ *
+ * The domain records terms that are ALREADY in effect and does not schedule future
+ * changes (`future_effective_terms_not_supported`). Backdating is ordinary and
+ * truthful, subject to the monotonic timeline rules the writer owns.
+ */
+
+/**
+ * RECORD — the restaurant's first (or, after an end, its next) open terms.
+ *
+ * THERE IS DELIBERATELY NO `expected_terms_id`, and adding one would be inventing a
+ * concurrency field the contract does not have. The precondition is ABSENCE — "record
+ * these only if none are open" — and the backend enforces it under the restaurant
+ * lock: identical open terms are a safe no-op, different ones are a 409
+ * `subscription_terms_already_open`.
+ */
+export interface RecordSubscriptionTermsRequest {
+  readonly recurring_amount: string;
+  readonly currency: string;
+  readonly billing_interval_unit: BillingIntervalUnit;
+  readonly billing_interval_count: number;
+  readonly effective_from: string;
+  readonly reason: string;
+}
+
+/**
+ * REPLACE — supersede the exact currently-open row.
+ *
+ * ONE atomic close-then-insert on the server: the outgoing row's `ended_at` is set to
+ * exactly the replacement's `effective_from`, so the history has no gap and no overlap.
+ * TERMS ROWS ARE IMMUTABLE — this is not an edit, and the superseded row stays in
+ * history where a future invoice or owner approval can still reference it by id.
+ *
+ * `expected_terms_id` is `commercial.subscription_terms.current.id`, captured when the
+ * editor opened. Required, non-null, and never derived from anything else.
+ */
+export interface ReplaceSubscriptionTermsRequest {
+  readonly expected_terms_id: string;
+  readonly recurring_amount: string;
+  readonly currency: string;
+  readonly billing_interval_unit: BillingIntervalUnit;
+  readonly billing_interval_count: number;
+  readonly effective_from: string;
+  readonly reason: string;
+}
+
+/**
+ * END — close the exact currently-open row, leaving the restaurant with none.
+ *
+ * Carries NO commercial facts: ending terms states a boundary, not a price. Nothing is
+ * auto-created to fill the gap, and the historical rows are retained — "ended" is not
+ * "deleted".
+ *
+ * `ended_at` is REQUIRED and never defaulted to now. The operator is recording when the
+ * terms stopped applying, which is frequently not the moment they got round to typing
+ * it.
+ */
+export interface EndSubscriptionTermsRequest {
+  readonly expected_terms_id: string;
+  readonly ended_at: string;
+  readonly reason: string;
+}
+
+/**
  * What a successful service-configuration write returns.
  *
  * `commercial` IS THE SAME CANONICAL PROJECTION `GET` RETURNS — the server re-reads it

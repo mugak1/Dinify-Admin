@@ -8,6 +8,9 @@ import {
   CommercialMutationResult,
   DEFAULT_PAGE_SIZE,
   DirectoryQuery,
+  EndSubscriptionTermsRequest,
+  RecordSubscriptionTermsRequest,
+  ReplaceSubscriptionTermsRequest,
   RestaurantDetail,
   RestaurantDirectoryPage,
   SetPaymentCollectionModeRequest,
@@ -21,7 +24,9 @@ interface Envelope<T> {
 }
 
 /**
- * The real restaurant transport. Two routes; no other endpoint is reachable from here.
+ * The real restaurant transport. Seven named operations; no other endpoint is reachable
+ * from here — two reads, two service-configuration writes and three subscription-terms
+ * writes.
  *
  * Same-origin and relative, so the `__Host-` session cookie rides automatically and
  * `withCredentials` is deliberately absent. It goes through the ordinary `HttpClient`
@@ -109,6 +114,27 @@ export class RestaurantHttp implements RestaurantApi {
    * hash-private method is unreachable at runtime, so the public API really is two named
    * operations rather than two named operations plus an unadvertised third.
    */
+  recordSubscriptionTerms(
+    restaurantId: string,
+    request: RecordSubscriptionTermsRequest,
+  ): Observable<CommercialMutationResult> {
+    return this.#write(COMMERCIAL_ROUTES.recordSubscriptionTerms(restaurantId), request);
+  }
+
+  replaceSubscriptionTerms(
+    restaurantId: string,
+    request: ReplaceSubscriptionTermsRequest,
+  ): Observable<CommercialMutationResult> {
+    return this.#write(COMMERCIAL_ROUTES.replaceSubscriptionTerms(restaurantId), request);
+  }
+
+  endSubscriptionTerms(
+    restaurantId: string,
+    request: EndSubscriptionTermsRequest,
+  ): Observable<CommercialMutationResult> {
+    return this.#write(COMMERCIAL_ROUTES.endSubscriptionTerms(restaurantId), request);
+  }
+
   #write<T>(route: string, body: T): Observable<CommercialMutationResult> {
     return this.http
       .post<Envelope<CommercialMutationResult>>(apiUrl(route), body)

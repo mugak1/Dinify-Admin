@@ -76,6 +76,22 @@ export const COMMERCIAL_ROUTES = {
     `/restaurants/${encodeURIComponent(id)}/commercial/payment-timing/`,
   paymentCollectionMode: (id: string): string =>
     `/restaurants/${encodeURIComponent(id)}/commercial/payment-collection-mode/`,
+
+  // The SUBSCRIPTION-TERMS writes (Step 3E.3). THREE routes, and never one with an
+  // `action` segment — the backend's own words: recording first terms, superseding the
+  // open ones and closing them "have different preconditions, different concurrency
+  // tokens and different histories left behind", and a path parameter would make "what
+  // did this operator do?" a question about a URL segment.
+  //
+  // These are the recurring SOFTWARE-SUBSCRIPTION terms a restaurant pays DINIFY —
+  // restaurant → Dinify money, entirely separate from the diner → restaurant payments
+  // the two axes above describe.
+  recordSubscriptionTerms: (id: string): string =>
+    `/restaurants/${encodeURIComponent(id)}/commercial/subscription-terms/`,
+  replaceSubscriptionTerms: (id: string): string =>
+    `/restaurants/${encodeURIComponent(id)}/commercial/subscription-terms/replace/`,
+  endSubscriptionTerms: (id: string): string =>
+    `/restaurants/${encodeURIComponent(id)}/commercial/subscription-terms/end/`,
 } as const;
 
 /**

@@ -4,6 +4,9 @@ import { Observable } from 'rxjs';
 import {
   CommercialMutationResult,
   DirectoryQuery,
+  EndSubscriptionTermsRequest,
+  RecordSubscriptionTermsRequest,
+  ReplaceSubscriptionTermsRequest,
   RestaurantDetail,
   RestaurantDirectoryPage,
   SetPaymentCollectionModeRequest,
@@ -11,7 +14,10 @@ import {
 } from './restaurant.model';
 
 /**
- * The restaurant READ port — two routes, and nothing else.
+ * The restaurant port — a BOUNDED, ENUMERABLE set of operations.
+ *
+ * Two reads, two service-configuration writes (Step 3E.2) and three subscription-terms
+ * writes (Step 3E.3). Seven named operations, and a reader can list them.
  *
  * The second seam in this application that talks to a server, and it is shaped like
  * the first (`ADMIN_AUTH`) on purpose. A port plus a token is what keeps `npm start`
@@ -38,9 +44,6 @@ import {
  *
  * STILL ABSENT, and must stay absent until the step that owns them:
  *
- *   Step 3E.3  `recordSubscriptionTerms` / `replaceSubscriptionTerms` /
- *              `endSubscriptionTerms` — the terms row has its own concurrency token
- *              (`subscription_terms.current.id`) and its own exact-retry rules
  *   Step 4     the lifecycle transition
  *
  * ── WHAT THE PORT DELIBERATELY DOES NOT DO ────────────────────────────────────────
@@ -90,6 +93,58 @@ export interface RestaurantApi {
   setPaymentCollectionMode(
     restaurantId: string,
     request: SetPaymentCollectionModeRequest,
+  ): Observable<CommercialMutationResult>;
+
+  // --- subscription terms (Step 3E.3) ------------------------------------------
+  //
+  // THREE NAMED OPERATIONS, mirroring three named routes. Never
+  // `mutateSubscriptionTerms(action, …)`, never `setSubscriptionTerms`, never an
+  // `action` argument: recording first terms, superseding the open ones and closing
+  // them have different preconditions, different concurrency tokens and different
+  // histories left behind, and the method called is what makes an audit trail readable.
+  //
+  // These record the recurring SOFTWARE-SUBSCRIPTION terms a restaurant pays DINIFY.
+  // Recording them charges nobody, raises no invoice, and proves nothing about the
+  // owner having accepted them.
+
+  /**
+   * Record the restaurant's terms, when it has none open.
+   *
+   * NO CONCURRENCY TOKEN, deliberately — the precondition is ABSENCE, enforced under
+   * the restaurant lock. Identical open terms answer success with `changed: false`; any
+   * difference is a 409 `subscription_terms_already_open`.
+   *
+   * Also the route for reopening after a previous set was ended, subject to the
+   * monotonic timeline rule: terms may not begin before the previous set ended.
+   */
+  recordSubscriptionTerms(
+    restaurantId: string,
+    request: RecordSubscriptionTermsRequest,
+  ): Observable<CommercialMutationResult>;
+
+  /**
+   * Supersede the exact currently-open terms named by `expected_terms_id`.
+   *
+   * NOT AN EDIT. The outgoing row is closed at exactly the replacement's
+   * `effective_from` and a new immutable row becomes current; the superseded row stays
+   * in history. A replacement whose four commercial facts are unchanged is a no-op —
+   * re-dating unchanged terms is a different, out-of-scope correction.
+   */
+  replaceSubscriptionTerms(
+    restaurantId: string,
+    request: ReplaceSubscriptionTermsRequest,
+  ): Observable<CommercialMutationResult>;
+
+  /**
+   * Close the exact currently-open terms, leaving the restaurant with none.
+   *
+   * Creates no replacement and deletes no history. An exact retry is a no-op ONLY while
+   * nothing has been opened since — if it has, the server answers 409, because the
+   * operation's stated postcondition no longer holds.
+   */
+  endSubscriptionTerms(
+    restaurantId: string,
+    request: EndSubscriptionTermsRequest,
   ): Observable<CommercialMutationResult>;
 }
 

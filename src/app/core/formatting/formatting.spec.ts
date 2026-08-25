@@ -1,5 +1,12 @@
 import { formatAmount, formatMoney, formatUGX, NO_AMOUNT } from './currency';
-import { formatEat, formatEatDate, formatEatTime, formatRelativeToServer, NO_TIME } from './time';
+import {
+  eatWallTimeToIso,
+  formatEat,
+  formatEatDate,
+  formatEatTime,
+  formatRelativeToServer,
+  NO_TIME,
+} from './time';
 
 describe('formatUGX', () => {
   it('renders the spec form: UGX 150,000', () => {
@@ -178,5 +185,66 @@ describe('formatRelativeToServer', () => {
     // server anchor exists to avoid.
     expect(formatRelativeToServer('2026-08-19T11:56:00+00:00', null)).toBeNull();
     expect(formatRelativeToServer(null, NOW)).toBeNull();
+  });
+});
+
+/**
+ * WRITING a commercial moment (Step 3E.3).
+ *
+ * The failure this guards is silent: `new Date('2026-08-25T15:00').toISOString()`
+ * reads the wall time in the BROWSER'S zone, so an operator in London would send
+ * 15:00 BST — 17:00 EAT — on a field that decides which terms were in force. The
+ * backend refuses naive timestamps, so the bug would not surface as a 400; it would
+ * surface as a well-formed request carrying the wrong instant.
+ */
+describe('eatWallTimeToIso', () => {
+  it('carries an EXPLICIT offset, never a naive value', () => {
+    expect(eatWallTimeToIso('2026-08-25T15:00')).toBe('2026-08-25T15:00:00+03:00');
+    // The backend's own accepted shape.
+    expect(eatWallTimeToIso('2026-08-25T15:00')).toMatch(/[+-]\d{2}:\d{2}$/);
+  });
+
+  it('keeps the stated wall time, whatever the browser timezone is', () => {
+    // THE POINT OF THE HELPER. Whether this suite runs in Kampala, London or UTC, the
+    // operator typed 15:00 EAT and 15:00 EAT is what goes on the wire. The assertion
+    // is the same in every zone precisely because the browser's is never consulted.
+    const iso = eatWallTimeToIso('2026-08-25T15:00');
+    expect(iso).toBe('2026-08-25T15:00:00+03:00');
+
+    // And it denotes the instant it should: 15:00+03:00 is 12:00Z.
+    expect(new Date(iso as string).toISOString()).toBe('2026-08-25T12:00:00.000Z');
+  });
+
+  it('is NOT the naive-plus-browser-zone answer', () => {
+    // Written as an explicit contrast so the test states what it is protecting
+    // against. These agree only when the browser happens to be on EAT.
+    const naive = new Date('2026-08-25T15:00').toISOString();
+    const correct = new Date(eatWallTimeToIso('2026-08-25T15:00') as string).toISOString();
+    const browserIsEat = new Date('2026-08-25T15:00').getTimezoneOffset() === -180;
+    if (browserIsEat) {
+      expect(naive).toBe(correct);
+    } else {
+      expect(naive).not.toBe(correct);
+    }
+  });
+
+  it('accepts an explicit seconds component', () => {
+    expect(eatWallTimeToIso('2026-08-25T15:00:30')).toBe('2026-08-25T15:00:30+03:00');
+  });
+
+  it('refuses anything that is not a complete wall time', () => {
+    // Null rather than a guess: the caller renders a field error instead of sending a
+    // moment the operator did not state.
+    for (const bad of ['', '   ', '2026-08-25', '15:00', 'not a time', '2026-08-25T15']) {
+      expect(eatWallTimeToIso(bad)).withContext(bad).toBeNull();
+    }
+    expect(eatWallTimeToIso(null)).toBeNull();
+    expect(eatWallTimeToIso(undefined)).toBeNull();
+  });
+
+  it('round-trips through the EAT reader', () => {
+    // What the operator typed is what they are shown back.
+    const iso = eatWallTimeToIso('2026-08-25T15:00') as string;
+    expect(formatEat(iso)).toBe('15:00 EAT · 25 Aug 2026');
   });
 });

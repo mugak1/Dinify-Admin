@@ -19,9 +19,12 @@ import {
   CommercialMutationResult,
   CommercialSubscriptionTerms,
   CommercialSummary,
+  EndSubscriptionTermsRequest,
   OnboardingSummary,
   PaymentCollectionMode,
   PaymentTiming,
+  RecordSubscriptionTermsRequest,
+  ReplaceSubscriptionTermsRequest,
   RestaurantDetail,
   RestaurantDirectoryPage,
   SetPaymentCollectionModeRequest,
@@ -207,7 +210,7 @@ function detail(overrides: Partial<RestaurantDetail> = {}): RestaurantDetail {
 
 /** One recorded write, so a test can assert the EXACT body that was sent. */
 interface RecordedWrite {
-  readonly axis: 'timing' | 'collection';
+  readonly operation: 'timing' | 'collection' | 'record' | 'replace' | 'end';
   readonly restaurantId: string;
   readonly body: Record<string, unknown>;
 }
@@ -216,7 +219,7 @@ class StubApi implements RestaurantApi {
   detailCalls: string[] = [];
   answer: () => Observable<RestaurantDetail> = () => of(detail());
 
-  /** Every service-configuration write attempted, in order. */
+  /** Every commercial write attempted, in order — axes and terms alike. */
   readonly writes: RecordedWrite[] = [];
   /** How the next write answers. Defaults to a successful, changed mutation. */
   writeAnswer: () => Observable<CommercialMutationResult> = () =>
@@ -235,8 +238,9 @@ class StubApi implements RestaurantApi {
     request: SetPaymentTimingRequest,
   ): Observable<CommercialMutationResult> {
     // Captured as a plain record so a test can assert on KEY PRESENCE — `expected_current`
-    // being present-and-null is a different request from it being absent.
-    this.writes.push({ axis: 'timing', restaurantId, body: { ...request } });
+    // being present-and-null is a different request from it being absent, and
+    // `expected_terms_id` being absent from a RECORD body is the contract itself.
+    this.writes.push({ operation: 'timing', restaurantId, body: { ...request } });
     return this.writeAnswer();
   }
 
@@ -244,7 +248,31 @@ class StubApi implements RestaurantApi {
     restaurantId: string,
     request: SetPaymentCollectionModeRequest,
   ): Observable<CommercialMutationResult> {
-    this.writes.push({ axis: 'collection', restaurantId, body: { ...request } });
+    this.writes.push({ operation: 'collection', restaurantId, body: { ...request } });
+    return this.writeAnswer();
+  }
+
+  recordSubscriptionTerms(
+    restaurantId: string,
+    request: RecordSubscriptionTermsRequest,
+  ): Observable<CommercialMutationResult> {
+    this.writes.push({ operation: 'record', restaurantId, body: { ...request } });
+    return this.writeAnswer();
+  }
+
+  replaceSubscriptionTerms(
+    restaurantId: string,
+    request: ReplaceSubscriptionTermsRequest,
+  ): Observable<CommercialMutationResult> {
+    this.writes.push({ operation: 'replace', restaurantId, body: { ...request } });
+    return this.writeAnswer();
+  }
+
+  endSubscriptionTerms(
+    restaurantId: string,
+    request: EndSubscriptionTermsRequest,
+  ): Observable<CommercialMutationResult> {
+    this.writes.push({ operation: 'end', restaurantId, body: { ...request } });
     return this.writeAnswer();
   }
 }
@@ -593,10 +621,10 @@ describe('RestaurantOverviewTab', () => {
     const terms = Array.from(commercialPanel()?.querySelectorAll('dt') ?? []);
     const dt = terms.find((node) => node.textContent?.trim() === term);
     const dd = dt?.nextElementSibling;
-    // The two editable axes carry a Change control inside their `dd`, so the VALUE is
-    // read off its own element. Falling back to the whole `dd` keeps this working for
-    // the rows that have no control (subscription terms, readiness).
-    const value = dd?.querySelector('[data-axis-value]');
+    // Every editable row carries its controls inside the same `dd`, so the VALUE is read
+    // off its own element. Falling back to the whole `dd` keeps this working for the
+    // rows that have no control at all (readiness).
+    const value = dd?.querySelector('[data-axis-value], [data-terms-value]');
     return (value ?? dd)?.textContent?.trim() ?? '';
   }
 
@@ -897,11 +925,20 @@ describe('RestaurantOverviewTab', () => {
   describe('service-configuration controls', () => {
     const REASON = 'Switching to table service';
 
-    /** The Change button for one axis, addressed through its row. */
-    function changeButton(term: string): HTMLButtonElement | null {
+    /** The controls offered on one row, in order, by their labels. */
+    function rowControls(term: string): HTMLButtonElement[] {
       const terms = Array.from(commercialPanel()?.querySelectorAll('dt') ?? []);
       const dt = terms.find((node) => node.textContent?.trim() === term);
-      return dt?.nextElementSibling?.querySelector('button') ?? null;
+      return Array.from(dt?.nextElementSibling?.querySelectorAll('button') ?? []);
+    }
+
+    function controlLabels(term: string): (string | undefined)[] {
+      return rowControls(term).map((button) => button.textContent?.trim());
+    }
+
+    /** The Change button for one axis, addressed through its row. */
+    function changeButton(term: string): HTMLButtonElement | null {
+      return rowControls(term)[0] ?? null;
     }
 
     function editor(): Element | null {
@@ -941,14 +978,15 @@ describe('RestaurantOverviewTab', () => {
 
     // --- what the panel offers ----------------------------------------------------
 
-    it('offers a control on each service axis, and NONE on subscription terms', fakeAsync(async () => {
-      // Subscription terms are Step 3E.3. Not a disabled placeholder either — a control
-      // that cannot work still tells an operator the capability is there.
+    it('offers one control per service axis, and the terms controls the state allows', fakeAsync(async () => {
+      // This asserted `changeButton('Subscription terms')` was NULL at Step 3E.2, when
+      // terms were read-only. 3E.3 gives them their three operations — but never all
+      // three at once: this fixture has no open terms, so Record is the only one.
       await loaded();
 
-      expect(changeButton('Payment timing')).withContext('timing').not.toBeNull();
-      expect(changeButton('Collection mode')).withContext('collection').not.toBeNull();
-      expect(changeButton('Subscription terms')).withContext('terms').toBeNull();
+      expect(controlLabels('Payment timing')).toEqual(['Change']);
+      expect(controlLabels('Collection mode')).toEqual(['Change']);
+      expect(controlLabels('Subscription terms')).toEqual(['Record terms']);
       flush();
     }));
 
@@ -1023,7 +1061,7 @@ describe('RestaurantOverviewTab', () => {
 
       expect(api.writes.length).toBe(1);
       const [write] = api.writes;
-      expect(write.axis).toBe('timing');
+      expect(write.operation).toBe('timing');
       expect(write.restaurantId).toBe(ID);
       expect(write.body).toEqual({
         value: 'pay_after',
@@ -1513,7 +1551,737 @@ describe('RestaurantOverviewTab', () => {
       harness.detectChanges();
 
       expect(commercialRow('Subscription terms')).toContain('UGX 150,000 · every month');
-      expect(changeButton('Subscription terms')).toBeNull();
+      // The axis write touched ONE endpoint. Terms are a separate decision with a
+      // separate token, and nothing about changing a service axis writes them.
+      expect(api.writes.map((write) => write.operation)).toEqual(['timing']);
+      // And the row still offers the operations its state allows — no more, no fewer.
+      expect(controlLabels('Subscription terms')).toEqual(['Replace terms', 'End terms']);
+      flush();
+    }));
+  });
+
+  // ── SUBSCRIPTION TERMS: RECORD, REPLACE, END (spec §15 step 3E.3) ─────────────────
+  //
+  // What this block defends, in one sentence each:
+  //
+  //   THE CONTROLS FOLLOW THE STATE. Record only with none open, Replace and End only
+  //   with one open, and none at all when the server sent no projection.
+  //
+  //   THE TOKEN IS A ROW IDENTITY. `expected_terms_id` is the UUID the read published,
+  //   captured when the editor opened — and Record deliberately has none.
+  //
+  //   THE AMOUNT IS A STRING FROM THE KEYSTROKE TO THE WIRE, and the boundary is an EAT
+  //   wall time serialised against Africa/Kampala rather than against the browser.
+  //
+  //   NOT ONE WORD IMPLIES MONEY MOVED. There is no invoice model, no receivable and no
+  //   collection path behind any of these operations.
+
+  describe('subscription-terms controls', () => {
+    const TERMS_ID = '5d6e7f80-9a1b-4c2d-8e3f-000000000001';
+    const REASON = 'Recording the price agreed at signing';
+
+    /** The commercial state of a restaurant with the default open terms. */
+    function withTerms(overrides: Partial<CommercialSubscriptionTerms> = {}): CommercialSummary {
+      return commercial({ terms: overrides });
+    }
+
+    function control(term: string, label: string): HTMLButtonElement | null {
+      const terms = Array.from(commercialPanel()?.querySelectorAll('dt') ?? []);
+      const dt = terms.find((node) => node.textContent?.trim() === term);
+      return (
+        Array.from(dt?.nextElementSibling?.querySelectorAll('button') ?? []).find(
+          (button) => button.textContent?.trim() === label,
+        ) ?? null
+      );
+    }
+
+    function open(label: string): void {
+      control('Subscription terms', label)!.click();
+      harness.detectChanges();
+    }
+
+    function editor(): HTMLElement | null {
+      return commercialPanel()?.querySelector('[data-commercial-editor]') ?? null;
+    }
+
+    function set(hook: string, value: string): void {
+      const field = editor()!.querySelector<HTMLInputElement | HTMLTextAreaElement>(`[${hook}]`)!;
+      field.value = value;
+      field.dispatchEvent(new Event('input'));
+      harness.detectChanges();
+    }
+
+    function fieldValue(hook: string): string {
+      return editor()!.querySelector<HTMLInputElement>(`[${hook}]`)!.value;
+    }
+
+    function submit(label: string): HTMLButtonElement {
+      return Array.from(editor()!.querySelectorAll('button')).find(
+        (button) => button.textContent?.trim() === label,
+      )!;
+    }
+
+    /** Fill the record/replace form completely. Every field is stated; none is defaulted. */
+    function fillTerms(
+      overrides: {
+        amount?: string;
+        currency?: string;
+        count?: string;
+        unit?: string;
+        effectiveFrom?: string;
+        reason?: string;
+      } = {},
+    ): void {
+      set('data-terms-amount', overrides.amount ?? '175000.00');
+      set('data-terms-currency', overrides.currency ?? 'UGX');
+      set('data-terms-count', overrides.count ?? '1');
+      const unit = editor()!.querySelector<HTMLSelectElement>('[data-terms-unit]')!;
+      unit.value = overrides.unit ?? 'month';
+      unit.dispatchEvent(new Event('change'));
+      set('data-terms-effective-from', overrides.effectiveFrom ?? '2026-08-01T00:00');
+      set('data-commercial-reason', overrides.reason ?? REASON);
+    }
+
+    function lastBody(): Record<string, unknown> {
+      return api.writes[api.writes.length - 1].body;
+    }
+
+    // --- what the form collects, and what it refuses to invent ---------------------
+
+    it('states every commercial fact and DEFAULTS none of them', fakeAsync(async () => {
+      // No silent UGX, and no "now". The backend has no currency default either, and a
+      // moment the client filled in would be Dinify recording a commercial term nobody
+      // chose — in the one field that decides which terms were in force.
+      await loaded();
+      open('Record terms');
+
+      expect(fieldValue('data-terms-amount')).withContext('amount').toBe('');
+      expect(fieldValue('data-terms-currency')).withContext('currency').toBe('');
+      expect(fieldValue('data-terms-effective-from')).withContext('effective from').toBe('');
+      expect(submit('Record terms').disabled).withContext('nothing stated yet').toBeTrue();
+      flush();
+    }));
+
+    it('keeps Save unavailable until every fact AND a substantive reason are stated', fakeAsync(async () => {
+      await loaded();
+      open('Record terms');
+
+      fillTerms({ reason: 'too short' });
+      expect(submit('Record terms').disabled).withContext('reason below the bar').toBeTrue();
+
+      fillTerms({ effectiveFrom: '', reason: REASON });
+      expect(submit('Record terms').disabled).withContext('no boundary').toBeTrue();
+
+      fillTerms({ count: '0' });
+      expect(submit('Record terms').disabled).withContext('interval below 1').toBeTrue();
+
+      fillTerms();
+      expect(submit('Record terms').disabled).withContext('complete').toBeFalse();
+      flush();
+    }));
+
+    it('labels the boundary EAT and serialises it against Africa/Kampala', fakeAsync(async () => {
+      // THE DEFECT THIS DESIGNS OUT: `new Date('2026-08-01T00:00').toISOString()` reads
+      // the wall time in the BROWSER'S zone, so an operator administering from London
+      // would silently send 22:00 the previous day. The backend refuses naive timestamps,
+      // so the bug arrives as a well-formed request with the wrong instant — not a 400.
+      await loaded();
+      open('Record terms');
+      expect(editor()!.textContent).toContain('Effective from (EAT)');
+
+      fillTerms({ effectiveFrom: '2026-08-01T00:00' });
+      submit('Record terms').click();
+      harness.detectChanges();
+
+      expect(lastBody()['effective_from']).toBe('2026-08-01T00:00:00+03:00');
+      flush();
+    }));
+
+    // --- the request ---------------------------------------------------------------
+
+    it('RECORD sends the five facts and a reason, and NO expected_terms_id', fakeAsync(async () => {
+      await loaded();
+      open('Record terms');
+      fillTerms({ amount: '150000.00' });
+      submit('Record terms').click();
+      harness.detectChanges();
+
+      expect(api.writes.map((write) => write.operation)).toEqual(['record']);
+      expect(lastBody()).toEqual({
+        recurring_amount: '150000.00',
+        currency: 'UGX',
+        billing_interval_unit: 'month',
+        billing_interval_count: 1,
+        effective_from: '2026-08-01T00:00:00+03:00',
+        reason: REASON,
+      });
+      // The operation means "record terms only if none are open" — a token here would be
+      // a field nothing consults.
+      expect(Object.keys(lastBody())).not.toContain('expected_terms_id');
+      flush();
+    }));
+
+    it('sends the amount as the STRING that was typed, never parsed', fakeAsync(async () => {
+      // A stored `"150000.50"` is a real recorded digit. `Number()` anywhere on this path
+      // reintroduces the float the backend's strict field exists to refuse, and
+      // `"0.00"` versus `0.0` is exactly the distinction that would be lost.
+      await loaded();
+      open('Record terms');
+      fillTerms({ amount: '  150000.50  ' });
+      submit('Record terms').click();
+      harness.detectChanges();
+
+      expect(lastBody()['recurring_amount']).toBe('150000.50');
+      expect(typeof lastBody()['recurring_amount']).toBe('string');
+      expect(JSON.stringify(lastBody())).toContain('"recurring_amount":"150000.50"');
+      flush();
+    }));
+
+    it('REPLACE prefills the four immutable facts and NOT the boundary', fakeAsync(async () => {
+      // Only what genuinely changes has to be retyped — but the boundary is a NEW
+      // decision every time, and prefilling it would invite an operator to accept a date
+      // they never chose.
+      // A NON-DEFAULT interval, deliberately: with `month` and `1` the assertions would
+      // pass against a form that prefilled nothing and merely kept its own defaults.
+      api.answer = () =>
+        of(
+          detail({
+            commercial: withTerms({
+              recurring_amount: '1800000.00',
+              currency: 'KES',
+              billing_interval: { unit: 'year', count: 2 },
+            }),
+          }),
+        );
+      await loaded();
+      open('Replace terms');
+
+      expect(fieldValue('data-terms-amount')).toBe('1800000.00');
+      expect(fieldValue('data-terms-currency')).toBe('KES');
+      expect(fieldValue('data-terms-count')).toBe('2');
+      expect(
+        editor()!.querySelector<HTMLSelectElement>('[data-terms-unit]')!.value,
+      ).withContext('the select really moved').toBe('year');
+      expect(fieldValue('data-terms-effective-from')).withContext('never prefilled').toBe('');
+      flush();
+    }));
+
+    it('REPLACE sends the loaded row id as expected_terms_id', fakeAsync(async () => {
+      api.answer = () => of(detail({ commercial: withTerms() }));
+      await loaded();
+      open('Replace terms');
+      fillTerms({ amount: '175000.00', reason: 'Uplift agreed for the new quarter' });
+      submit('Replace terms').click();
+      harness.detectChanges();
+
+      expect(api.writes.map((write) => write.operation)).toEqual(['replace']);
+      expect(lastBody()['expected_terms_id']).toBe(TERMS_ID);
+      expect(typeof lastBody()['expected_terms_id']).toBe('string');
+      flush();
+    }));
+
+    it('REPLACE refuses a submission whose commercial facts are unchanged', fakeAsync(async () => {
+      // The backend compares FOUR facts and deliberately excludes `effective_from`, so a
+      // replacement changing only the date is a silent `changed: false`. Re-dating an
+      // unchanged price is a separate correction the domain does not offer, and the form
+      // says so rather than encouraging the request.
+      api.answer = () => of(detail({ commercial: withTerms() }));
+      await loaded();
+      open('Replace terms');
+
+      set('data-terms-effective-from', '2026-08-20T09:00');
+      set('data-commercial-reason', 'Correcting the effective date on the record');
+      expect(submit('Replace terms').disabled).withContext('only the date differs').toBeTrue();
+      expect(editor()!.querySelector('[data-terms-unchanged]')?.textContent).toContain(
+        'Change the amount, currency or interval',
+      );
+
+      set('data-terms-amount', '175000.00');
+      expect(submit('Replace terms').disabled).withContext('a real change').toBeFalse();
+      expect(editor()!.querySelector('[data-terms-unchanged]')).toBeNull();
+      flush();
+    }));
+
+    it('END sends exactly the token, the boundary and the reason', fakeAsync(async () => {
+      api.answer = () => of(detail({ commercial: withTerms() }));
+      await loaded();
+      open('End terms');
+
+      expect(editor()!.textContent).toContain('End time (EAT)');
+      expect(fieldValue('data-terms-ended-at')).withContext('never defaulted to now').toBe('');
+
+      set('data-terms-ended-at', '2026-08-20T09:00');
+      set('data-commercial-reason', 'Restaurant is leaving the platform');
+      submit('End terms').click();
+      harness.detectChanges();
+
+      expect(api.writes.map((write) => write.operation)).toEqual(['end']);
+      expect(lastBody()).toEqual({
+        expected_terms_id: TERMS_ID,
+        ended_at: '2026-08-20T09:00:00+03:00',
+        reason: 'Restaurant is leaving the platform',
+      });
+      flush();
+    }));
+
+    it('shows WHICH terms are being ended', fakeAsync(async () => {
+      // The row the captured token names, as it read when the form opened — so the
+      // operator is not trusting that the panel above still describes the same row.
+      api.answer = () => of(detail({ commercial: withTerms() }));
+      await loaded();
+      open('End terms');
+
+      expect(editor()!.querySelector('[data-terms-end-subject]')?.textContent).toContain(
+        'UGX 150,000 · every month',
+      );
+      flush();
+    }));
+
+    // --- one editor, one flight, across ALL FIVE commercial writes -------------------
+
+    it('shares ONE editor slot with the service axes', fakeAsync(async () => {
+      api.answer = () => of(detail({ commercial: withTerms() }));
+      await loaded();
+
+      control('Payment timing', 'Change')!.click();
+      harness.detectChanges();
+      expect(commercialPanel()!.querySelectorAll('[data-commercial-editor]').length).toBe(1);
+
+      open('Replace terms');
+      expect(commercialPanel()!.querySelectorAll('[data-commercial-editor]').length).toBe(1);
+      expect(editor()!.hasAttribute('data-terms-editor')).toBeTrue();
+
+      open('End terms');
+      expect(commercialPanel()!.querySelectorAll('[data-commercial-editor]').length).toBe(1);
+      expect(editor()!.hasAttribute('data-terms-end-editor')).toBeTrue();
+
+      control('Collection mode', 'Change')!.click();
+      harness.detectChanges();
+      expect(commercialPanel()!.querySelectorAll('[data-commercial-editor]').length).toBe(1);
+      expect(editor()!.hasAttribute('data-terms-end-editor')).toBeFalse();
+      flush();
+    }));
+
+    it('shuts every commercial control while a terms write is in flight', fakeAsync(async () => {
+      // Each of the five returns the WHOLE canonical object, so two in flight could land
+      // out of order and the older snapshot would repaint the other. One slot makes that
+      // unrepresentable rather than unlikely.
+      const pending = new Subject<CommercialMutationResult>();
+      api.answer = () => of(detail({ commercial: withTerms() }));
+      await loaded();
+      api.writeAnswer = () => pending;
+
+      open('Replace terms');
+      fillTerms({ amount: '175000.00' });
+      submit('Replace terms').click();
+      harness.detectChanges();
+
+      expect(control('Payment timing', 'Change')!.disabled).withContext('timing').toBeTrue();
+      expect(control('Collection mode', 'Change')!.disabled).withContext('collection').toBeTrue();
+      expect(control('Subscription terms', 'Replace terms')!.disabled).withContext('replace').toBeTrue();
+      expect(control('Subscription terms', 'End terms')!.disabled).withContext('end').toBeTrue();
+
+      control('Subscription terms', 'End terms')!.click();
+      harness.detectChanges();
+      expect(editor()!.hasAttribute('data-terms-editor'))
+        .withContext('the pending editor is still the one open')
+        .toBeTrue();
+      expect(api.writes.length).withContext('still exactly one request').toBe(1);
+
+      pending.next({ changed: true, commercial: withTerms({ recurring_amount: '175000.00' }) });
+      pending.complete();
+      harness.detectChanges();
+      flush();
+    }));
+
+    it('does NOT repaint the terms row while the write is in flight', fakeAsync(async () => {
+      const pending = new Subject<CommercialMutationResult>();
+      api.answer = () => of(detail({ commercial: withTerms() }));
+      await loaded();
+      api.writeAnswer = () => pending;
+
+      open('Replace terms');
+      fillTerms({ amount: '175000.00' });
+      submit('Replace terms').click();
+      harness.detectChanges();
+
+      // §16: a write is real once its audit row commits.
+      expect(commercialRow('Subscription terms')).toContain('UGX 150,000');
+      expect(submit('Replace terms').disabled).withContext('duplicate submit impossible').toBeTrue();
+
+      pending.next({ changed: true, commercial: withTerms({ recurring_amount: '175000.00' }) });
+      pending.complete();
+      harness.detectChanges();
+
+      expect(commercialRow('Subscription terms')).toContain('UGX 175,000');
+      flush();
+    }));
+
+    // --- outcomes -------------------------------------------------------------------
+
+    it('adopts the canonical response, closes the editor and confirms, per operation', fakeAsync(async () => {
+      api.answer = () => of(detail({ commercial: withTerms() }));
+      await loaded();
+
+      api.writeAnswer = () =>
+        of({ changed: true, commercial: withTerms({ recurring_amount: '175000.00' }) });
+      open('Replace terms');
+      fillTerms({ amount: '175000.00' });
+      submit('Replace terms').click();
+      harness.detectChanges();
+
+      expect(editor()).withContext('editor closed').toBeNull();
+      expect(commercialRow('Subscription terms')).toContain('UGX 175,000 · every month');
+      expect(commercialText()).toContain('Subscription terms replaced.');
+      // No second GET merely to learn what the write already returned.
+      expect(api.detailCalls.length).toBe(1);
+      flush();
+    }));
+
+    it('treats changed:false as a SUCCESS that decided nothing', fakeAsync(async () => {
+      // The lost-response retry. The server answers a same-state request this way even
+      // when the token has gone stale, so an exact resend is not a false conflict — and
+      // must never be described as a second write.
+      api.answer = () => of(detail({ commercial: commercial() }));
+      await loaded();
+      const settled = withTerms();
+      api.writeAnswer = () => of({ changed: false, commercial: settled });
+
+      open('Record terms');
+      fillTerms({ amount: '150000.00' });
+      submit('Record terms').click();
+      harness.detectChanges();
+
+      expect(commercialRow('Subscription terms')).toContain('UGX 150,000 · every month');
+      expect(commercialText()).toContain('Nothing was changed.');
+      expect(commercialText()).not.toContain('Subscription terms recorded.');
+      flush();
+    }));
+
+    it('keeps the form and the draft open on a 400, with the field error', fakeAsync(async () => {
+      await loaded();
+      api.writeAnswer = () =>
+        throwError(() => ({
+          status: 400,
+          error: {
+            status: 400,
+            message: 'The request could not be applied.',
+            code: 'invalid_subscription_terms',
+            errors: {
+              recurring_amount: [
+                'recurring_amount carries more precision than the stored scale of two decimal places.',
+              ],
+            },
+          },
+        }));
+
+      open('Record terms');
+      fillTerms({ amount: '150000.005' });
+      submit('Record terms').click();
+      harness.detectChanges();
+
+      expect(editor()).withContext('form stays open').not.toBeNull();
+      expect(fieldValue('data-terms-amount')).withContext('draft preserved').toBe('150000.005');
+      expect(editor()!.textContent).toContain('more precision than the stored scale');
+      flush();
+    }));
+
+    it('shows a 400 the form has no field for, rather than refusing silently', fakeAsync(async () => {
+      // A 400 naming `expected_terms_id` is the server telling the operator something
+      // real about their request. There is no input to hang it on, and dropping it would
+      // leave a form that refuses with no explanation.
+      api.answer = () => of(detail({ commercial: withTerms() }));
+      await loaded();
+      api.writeAnswer = () =>
+        throwError(() => ({
+          status: 400,
+          error: {
+            status: 400,
+            message: 'The request could not be applied.',
+            errors: { expected_terms_id: ['Enter a valid UUID.'] },
+          },
+        }));
+
+      open('Replace terms');
+      fillTerms({ amount: '175000.00' });
+      submit('Replace terms').click();
+      harness.detectChanges();
+
+      expect(editor()!.textContent).toContain('Enter a valid UUID.');
+      flush();
+    }));
+
+    it('does NOT auto-retry a 409, and states the SERVER’S reason for it', fakeAsync(async () => {
+      // FOUR DISTINCT CONFLICTS, and only the server can tell them apart. "This restaurant
+      // already has different open subscription terms" and "has no open subscription
+      // terms" call for opposite next actions; one generic sentence would drop the
+      // operator's remedy.
+      api.answer = () => of(detail({ commercial: commercial() }));
+      await loaded();
+      expect(api.detailCalls.length).toBe(1);
+
+      api.writeAnswer = () =>
+        throwError(() => ({
+          status: 409,
+          error: {
+            status: 409,
+            message: 'This restaurant already has different open subscription terms.',
+            code: 'subscription_terms_already_open',
+          },
+        }));
+
+      open('Record terms');
+      fillTerms({ amount: '150000.00' });
+      submit('Record terms').click();
+      harness.detectChanges();
+
+      // Exactly ONE attempt. Replaying would overwrite whatever the other operator just
+      // decided — the thing the concurrency check exists to prevent.
+      expect(api.writes.length).toBe(1);
+      expect(editor()).withContext('the stale editor is discarded').toBeNull();
+      expect(commercialText()).toContain('already has different open subscription terms');
+      expect(commercialText()).toContain('Review the current value before trying again.');
+      expect(api.detailCalls.length).withContext('reload requested').toBe(2);
+      tick();
+      flush();
+    }));
+
+    it('REFUSES A NEW TERMS DECISION until the post-conflict reload has landed', fakeAsync(async () => {
+      // The same recovery invariant the axes have, and it matters more here: the token is
+      // a ROW ID, so an editor reopened against the superseded projection would capture a
+      // row that has already been superseded.
+      api.answer = () => of(detail({ commercial: withTerms() }));
+      await loaded();
+
+      api.writeAnswer = () =>
+        throwError(() => ({
+          status: 409,
+          error: {
+            status: 409,
+            message: 'These are no longer the current subscription terms.',
+            code: 'stale_subscription_terms',
+          },
+        }));
+      const reload = new Subject<RestaurantDetail>();
+      api.answer = () => reload;
+
+      open('Replace terms');
+      fillTerms({ amount: '175000.00' });
+      submit('Replace terms').click();
+      harness.detectChanges();
+
+      expect(control('Subscription terms', 'Replace terms')!.disabled).toBeTrue();
+      expect(control('Subscription terms', 'End terms')!.disabled).toBeTrue();
+      control('Subscription terms', 'Replace terms')!.click();
+      harness.detectChanges();
+      expect(editor()).withContext('no editor opens against superseded state').toBeNull();
+      expect(api.writes.length).withContext('and no second write').toBe(1);
+      expect(commercialPanel()!.textContent).toContain('Reloading');
+
+      const replacement = '9a8b7c60-1d2e-4f30-8a1b-000000000002';
+      reload.next(
+        detail({ commercial: withTerms({ id: replacement, recurring_amount: '200000.00' }) }),
+      );
+      reload.complete();
+      harness.detectChanges();
+
+      expect(commercialRow('Subscription terms')).toContain('UGX 200,000');
+      expect(control('Subscription terms', 'Replace terms')!.disabled)
+        .withContext('deciding is possible again')
+        .toBeFalse();
+      flush();
+    }));
+
+    it('captures the FRESH row id for the edit that follows a conflict', fakeAsync(async () => {
+      const replacement = '9a8b7c60-1d2e-4f30-8a1b-000000000002';
+      api.answer = () => of(detail({ commercial: withTerms() }));
+      await loaded();
+
+      api.writeAnswer = () =>
+        throwError(() => ({
+          status: 409,
+          error: { status: 409, code: 'stale_subscription_terms', message: 'stale' },
+        }));
+      api.answer = () => of(detail({ commercial: withTerms({ id: replacement }) }));
+
+      open('Replace terms');
+      fillTerms({ amount: '175000.00' });
+      submit('Replace terms').click();
+      harness.detectChanges();
+      tick();
+      harness.detectChanges();
+
+      expect(api.writes[0].body['expected_terms_id'])
+        .withContext('the first attempt asserted the row it had loaded')
+        .toBe(TERMS_ID);
+
+      api.writeAnswer = () =>
+        of({ changed: true, commercial: withTerms({ id: replacement, recurring_amount: '175000.00' }) });
+      open('Replace terms');
+      fillTerms({ amount: '175000.00', reason: 'Re-applying after reviewing the conflict' });
+      submit('Replace terms').click();
+      harness.detectChanges();
+
+      expect(api.writes.length).toBe(2);
+      expect(api.writes[1].body['expected_terms_id'])
+        .withContext('NOT the superseded row — the reloaded one')
+        .toBe(replacement);
+      flush();
+    }));
+
+    it('discards the editor and re-reads on a 404', fakeAsync(async () => {
+      api.answer = () => of(detail({ commercial: withTerms() }));
+      await loaded();
+      api.writeAnswer = () =>
+        throwError(() => ({ status: 404, error: { status: 404, message: 'Restaurant not found.' } }));
+
+      open('End terms');
+      set('data-terms-ended-at', '2026-08-20T09:00');
+      set('data-commercial-reason', 'Restaurant is leaving the platform');
+      submit('End terms').click();
+      harness.detectChanges();
+
+      // Presenting an editable stale tenant would invite a write against something that
+      // no longer exists.
+      expect(editor()).toBeNull();
+      expect(api.detailCalls.length).withContext('reload requested').toBe(2);
+      tick();
+      flush();
+    }));
+
+    it('preserves the draft when re-authentication is cancelled', fakeAsync(async () => {
+      await loaded();
+      api.writeAnswer = () => throwError(() => new ElevationCancelledError());
+
+      open('Record terms');
+      fillTerms({ amount: '150000.00' });
+      submit('Record terms').click();
+      harness.detectChanges();
+
+      // Nothing was sent, so nothing was decided — and a five-field form is exactly the
+      // one an operator would least like to retype for having cancelled a prompt.
+      expect(editor()).withContext('form stays open').not.toBeNull();
+      expect(fieldValue('data-terms-amount')).toBe('150000.00');
+      expect(fieldValue('data-terms-effective-from')).toBe('2026-08-01T00:00');
+      expect(editor()!.textContent).toContain('Re-authentication was cancelled');
+      flush();
+    }));
+
+    it('does not claim an indeterminate outage failed to commit', fakeAsync(async () => {
+      await loaded();
+      api.writeAnswer = () =>
+        throwError(() => ({ status: 0, error: null, message: 'Http failure response' }));
+
+      open('Record terms');
+      fillTerms({ amount: '150000.00' });
+      submit('Record terms').click();
+      harness.detectChanges();
+
+      // The write MAY have committed. An exact retry of one that landed answers
+      // changed:false, which is precisely why the backend supports same-state retry.
+      expect(editor()!.textContent).toContain('not known whether this change was recorded');
+      expect(fieldValue('data-terms-amount')).withContext('draft preserved').toBe('150000.00');
+      flush();
+    }));
+
+    // --- the state machine, end to end ----------------------------------------------
+
+    it('offers Record again once the terms have been ended', fakeAsync(async () => {
+      // Ending leaves the restaurant with NO current terms. Nothing is auto-created to
+      // fill the gap — deciding the next terms is a separate decision somebody has to
+      // make — so the row goes back to offering exactly one control.
+      api.answer = () => of(detail({ commercial: withTerms() }));
+      await loaded();
+      api.writeAnswer = () => of({ changed: true, commercial: commercial() });
+
+      open('End terms');
+      set('data-terms-ended-at', '2026-08-20T09:00');
+      set('data-commercial-reason', 'Restaurant is leaving the platform');
+      submit('End terms').click();
+      harness.detectChanges();
+
+      expect(commercialText()).toContain('Subscription terms ended.');
+      expect(commercialRow('Subscription terms')).toBe('Not configured');
+      expect(controlLabelsFor('Subscription terms')).toEqual(['Record terms']);
+      flush();
+    }));
+
+    function controlLabelsFor(term: string): (string | undefined)[] {
+      const terms = Array.from(commercialPanel()?.querySelectorAll('dt') ?? []);
+      const dt = terms.find((node) => node.textContent?.trim() === term);
+      return Array.from(dt?.nextElementSibling?.querySelectorAll('button') ?? []).map((button) =>
+        button.textContent?.trim(),
+      );
+    }
+
+    // --- truthfulness ----------------------------------------------------------------
+
+    it('states what ending terms does, and claims nothing it cannot support', fakeAsync(async () => {
+      api.answer = () => of(detail({ commercial: withTerms() }));
+      await loaded();
+      open('End terms');
+      // The PROSE, without the button row — `Cancel` is the form's own dismiss control
+      // and says nothing about what ending terms does.
+      const copy = Array.from(editor()!.querySelectorAll('h3, p'))
+        .map((node) => node.textContent ?? '')
+        .join(' ')
+        .toLowerCase();
+
+      expect(copy).toContain('leaves the restaurant with no current subscription terms');
+      expect(copy).toContain('historical terms are retained.');
+      // There is no invoice model, no receivable and no collection path behind any of
+      // these words. Dinify has never taken a subscription payment through this system.
+      for (const invented of [
+        'cancel',
+        'stops billing',
+        'refund',
+        'revoke',
+        'deactivate',
+        'suspend',
+        'charge',
+        'unsubscribe',
+        'delete',
+      ]) {
+        expect(copy).withContext(invented).not.toContain(invented);
+      }
+      flush();
+    }));
+
+    it('never turns recorded terms into an account status, in any editor', fakeAsync(async () => {
+      api.answer = () => of(detail({ commercial: withTerms() }));
+      await loaded();
+
+      for (const label of ['Replace terms', 'End terms']) {
+        open(label);
+        const copy = editor()!.textContent ?? '';
+        for (const verdict of ['Active', 'Paid', 'Current', 'Trial', 'In good standing', 'Invoice']) {
+          expect(copy).withContext(`${label}: ${verdict}`).not.toContain(verdict);
+        }
+      }
+      flush();
+    }));
+
+    it('says terms are recorded, not agreed', fakeAsync(async () => {
+      // An administrator writing down a price is not an owner accepting one, and nothing
+      // in this projection carries owner consent.
+      await loaded();
+      open('Record terms');
+      const copy = editor()!.textContent ?? '';
+
+      expect(copy).toContain('not an invoice, a payment, or proof that the owner agreed');
+      // The negatives are about OWNER CONSENT specifically. "a future moment is not
+      // accepted" is a true statement about the boundary field, so a bare "accepted"
+      // would fail a correct sentence about a different fact.
+      for (const overclaim of [
+        'agreed price',
+        'owner accepted',
+        'accepted by',
+        'signed by',
+        'countersigned',
+        'approved by',
+      ]) {
+        expect(copy).withContext(overclaim).not.toContain(overclaim);
+      }
       flush();
     }));
   });
@@ -2138,20 +2906,19 @@ describe('RestaurantOverviewTab — onboarding', () => {
     }));
   });
 
-  // ── EXACTLY TWO WRITES, AND NO OTHERS ────────────────────────────────────────────
+  // ── EXACTLY FIVE COMMERCIAL WRITES, AND NO OTHERS ────────────────────────────────
 
-  it('offers the two service-configuration controls and NOTHING else', fakeAsync(async () => {
+  it('offers the commercial controls for the state it is in, and NOTHING else', fakeAsync(async () => {
     await loadedWith(onboarding({ source: 'admin_created', invitation: { status: 'pending' } }));
 
-    // This assertion used to be `toEqual([])`. Step 3E.2 deliberately gave Overview its
-    // first two consequential actions, so the honest replacement is not a weaker check
-    // but a SHARPER one: the exact set, in place of a count that has stopped being true.
+    // This assertion was `toEqual([])` at Step 2C and `['Change', 'Change']` at 3E.2.
+    // Each time the honest replacement has been a SHARPER check rather than a weaker
+    // one: the exact set, in place of a count that has stopped being true.
     //
-    // Everything the onboarding and billing domains might tempt a future slice into
-    // adding is still absent — and, specifically, subscription terms have no control at
-    // all, not even a disabled one. Those are Step 3E.3.
+    // THIS FIXTURE HAS NO OPEN TERMS, so the terms row offers Record and nothing else.
+    // Replace and End would be two controls whose only possible outcome is a 409.
     const buttons = Array.from(el().querySelectorAll('button')).map((b) => b.textContent?.trim());
-    expect(buttons).toEqual(['Change', 'Change']);
+    expect(buttons).toEqual(['Change', 'Change', 'Record terms']);
     for (const fake of [
       'Adopt',
       'Attest',
@@ -2160,13 +2927,47 @@ describe('RestaurantOverviewTab — onboarding', () => {
       'Send invitation',
       'Create restaurant',
       'Assign owner',
-      'Record terms',
       'Replace terms',
       'End terms',
       'Edit subscription',
       'Edit commercial',
+      // The four words this domain does not have. A control offering any of them would
+      // promise a capability with no model, no receivable and no collection path behind
+      // it — see `TERMS_COPY` in `restaurant-tabs.pages.ts`.
+      'Cancel subscription',
+      'Issue invoice',
+      'Take payment',
+      'Mark paid',
     ]) {
       expect(text()).withContext(fake).not.toContain(fake);
+    }
+    flush();
+  }));
+
+  it('offers Replace and End — and NOT Record — once terms are open', fakeAsync(async () => {
+    await loadedWith(onboarding(), { commercial: commercial({ terms: {} }) });
+
+    const buttons = Array.from(el().querySelectorAll('button')).map((b) => b.textContent?.trim());
+    expect(buttons).toEqual(['Change', 'Change', 'Replace terms', 'End terms']);
+    // Recording BESIDE open terms would suggest a second concurrent set is possible.
+    // The database's partial unique index says it is not.
+    expect(text()).not.toContain('Record terms');
+    flush();
+  }));
+
+  it('offers NO terms control at all when the server sent no commercial object', fakeAsync(async () => {
+    // ABSENCE IS NOT "NOT CONFIGURED". Without a projection this screen does not know
+    // whether terms are open, and a control that guesses is a control that acts on a
+    // guess — the same defect class as a dead backend presenting as "Invalid credentials."
+    await loadedWith(onboarding(), { commercial: undefined });
+
+    const buttons = Array.from(el().querySelectorAll('button')).map((b) => b.textContent?.trim());
+    expect(buttons).withContext('the axes keep their controls; terms offer none').toEqual([
+      'Change',
+      'Change',
+    ]);
+    for (const control of ['Record terms', 'Replace terms', 'End terms']) {
+      expect(text()).withContext(control).not.toContain(control);
     }
     flush();
   }));

@@ -372,6 +372,76 @@ describe('errorClassifierInterceptor', () => {
       replay.flush({ status: 200, data: { changed: true, commercial: {} } });
     });
 
+    it('replays a SUBSCRIPTION-TERMS write with its row token and its decimal intact', () => {
+      // THE SAME REGRESSION, ONE STEP SHARPER (Step 3E.3). A terms write asserts
+      // `expected_terms_id` — a ROW IDENTITY rather than a value, so it cannot be
+      // reconstructed from anything on screen. A replay that rebuilt the request would
+      // have nothing correct to put there.
+      //
+      // And `recurring_amount` is a decimal STRING. A rebuild that round-tripped it
+      // through a number would send `150000.5` for a stored `150000.50`, which the
+      // backend's strict field refuses outright — after the operator has already
+      // re-authenticated.
+      const route = apiUrl('/restaurants/abc/commercial/subscription-terms/replace/');
+      const original = {
+        expected_terms_id: '5d6e7f80-9a1b-4c2d-8e3f-000000000001',
+        recurring_amount: '150000.50',
+        currency: 'UGX',
+        billing_interval_unit: 'month',
+        billing_interval_count: 1,
+        effective_from: '2026-08-01T00:00:00+03:00',
+        reason: 'Uplift agreed for the new quarter',
+      };
+
+      http.post(route, original).subscribe();
+
+      backend
+        .expectOne(route)
+        .flush({ detail: ELEVATION_REQUIRED_DETAIL }, { status: 403, statusText: 'Forbidden' });
+      elevation.succeed();
+
+      const replay = backend.expectOne(route);
+      expect(replay.request.body).toEqual(original);
+      // Serialised, which is where a rebuilt body would actually lose the digit and the
+      // explicit offset.
+      const wire = JSON.stringify(replay.request.body);
+      expect(wire).toContain('"recurring_amount":"150000.50"');
+      expect(wire).toContain('"effective_from":"2026-08-01T00:00:00+03:00"');
+      expect(wire).toContain('"expected_terms_id":"5d6e7f80-9a1b-4c2d-8e3f-000000000001"');
+      replay.flush({ status: 200, data: { changed: true, commercial: {} } });
+    });
+
+    it('replays a RECORD terms write without inventing a token it never had', () => {
+      // `record` deliberately carries NO `expected_terms_id`: the operation means "record
+      // terms only if none are open", enforced under the restaurant lock. A replay that
+      // rebuilt the body from a client-side notion of "the current terms" would add one —
+      // and the server would then be checking an assertion the operator never made.
+      const route = apiUrl('/restaurants/abc/commercial/subscription-terms/');
+      const original = {
+        recurring_amount: '0.00',
+        currency: 'UGX',
+        billing_interval_unit: 'year',
+        billing_interval_count: 2,
+        effective_from: '2026-08-01T00:00:00+03:00',
+        reason: 'Recording the internal pilot terms',
+      };
+
+      http.post(route, original).subscribe();
+
+      backend
+        .expectOne(route)
+        .flush({ detail: ELEVATION_REQUIRED_DETAIL }, { status: 403, statusText: 'Forbidden' });
+      elevation.succeed();
+
+      const replay = backend.expectOne(route);
+      expect(replay.request.body).toEqual(original);
+      expect(Object.keys(replay.request.body as object)).not.toContain('expected_terms_id');
+      // A zero price is a real, deliberate price — and `"0.00"` versus `0` is exactly the
+      // distinction a rebuilt body would lose.
+      expect(JSON.stringify(replay.request.body)).toContain('"recurring_amount":"0.00"');
+      replay.flush({ status: 200, data: { changed: true, commercial: {} } });
+    });
+
     it('opens ONE prompt for concurrent refusals and replays them all', () => {
       const done: string[] = [];
       http.post(apiUrl('/a/'), {}).subscribe(() => done.push('a'));

@@ -743,12 +743,279 @@ describe('RestaurantHttp', () => {
       );
     });
 
-    it('exposes NO generic commercial mutation, and no generic post', () => {
-      // Two named operations, and nothing that takes a URL or a field name. A generic
-      // writer would make "what did this operator change?" a question about an argument
-      // rather than about which operation was called — and would let one future grant of
-      // access reach both axes.
+    // ── SUBSCRIPTION TERMS (Step 3E.3) ─────────────────────────────────────────────
+
+    const RECORD_URL = `/api/admin/v1/restaurants/${DETAIL_ID}/commercial/subscription-terms/`;
+    const REPLACE_URL =
+      `/api/admin/v1/restaurants/${DETAIL_ID}/commercial/subscription-terms/replace/`;
+    const END_URL = `/api/admin/v1/restaurants/${DETAIL_ID}/commercial/subscription-terms/end/`;
+
+    const TERMS_ID = '5d6e7f80-9a1b-4c2d-8e3f-000000000001';
+
+    /** The five commercial facts, exactly as a form would state them. */
+    const FACTS = {
+      recurring_amount: '150000.00',
+      currency: 'UGX',
+      billing_interval_unit: 'month',
+      billing_interval_count: 1,
+      effective_from: '2026-08-01T00:00:00+03:00',
+    } as const;
+
+    it('POSTs each terms operation to its OWN route — three routes, never one', () => {
+      // THREE EXPLICIT ROUTES, not one with an `action`. Recording first terms,
+      // superseding the open ones and closing them are materially different decisions
+      // with different preconditions and different concurrency tokens; a shared path
+      // segment would make "what did this operator do?" a question about an argument.
+      http
+        .recordSubscriptionTerms(DETAIL_ID, { ...FACTS, reason: 'Recording the signed price' })
+        .subscribe();
+      expect(controller.expectOne(RECORD_URL).request.method).toBe('POST');
+      controller.expectNone(REPLACE_URL);
+      controller.expectNone(END_URL);
+      controller.verify();
+
+      http
+        .replaceSubscriptionTerms(DETAIL_ID, {
+          expected_terms_id: TERMS_ID,
+          ...FACTS,
+          reason: 'Uplift agreed for the new quarter',
+        })
+        .subscribe();
+      expect(controller.expectOne(REPLACE_URL).request.method).toBe('POST');
+      controller.expectNone(RECORD_URL);
+      controller.expectNone(END_URL);
+      controller.verify();
+
+      http
+        .endSubscriptionTerms(DETAIL_ID, {
+          expected_terms_id: TERMS_ID,
+          ended_at: '2026-09-01T00:00:00+03:00',
+          reason: 'Restaurant is leaving the platform',
+        })
+        .subscribe();
+      expect(controller.expectOne(END_URL).request.method).toBe('POST');
+      controller.expectNone(RECORD_URL);
+      controller.expectNone(REPLACE_URL);
+    });
+
+    it('sends RECORD with the five facts and a reason — and NO expected_terms_id', () => {
+      // THE CONTRACT. `record` means "record terms only if none are open", which the
+      // server enforces under the restaurant lock. A token here would be a field the
+      // caller has to supply and nothing would check — so its ABSENCE is the assertion.
+      http
+        .recordSubscriptionTerms(DETAIL_ID, { ...FACTS, reason: 'Recording the signed price' })
+        .subscribe();
+
+      const sent = controller.expectOne(RECORD_URL).request.body as Record<string, unknown>;
+      expect(sent).toEqual({ ...FACTS, reason: 'Recording the signed price' });
+      expect(Object.keys(sent)).not.toContain('expected_terms_id');
+      expect(JSON.stringify(sent)).not.toContain('expected_terms_id');
+    });
+
+    it('sends the amount as a decimal STRING, never a JSON number', () => {
+      // The backend's `StrictDecimalStringField` refuses a JSON number outright, and
+      // `"0.00"` versus `0.0` is precisely the distinction that would be lost. A single
+      // `Number()` anywhere on this path reintroduces the float the whole round trip
+      // exists to keep out.
+      for (const amount of ['150000.00', '0.00', '150000.50']) {
+        http
+          .recordSubscriptionTerms(DETAIL_ID, {
+            ...FACTS,
+            recurring_amount: amount,
+            reason: 'Checking the decimal survives the wire',
+          })
+          .subscribe();
+
+        const sent = controller.expectOne(RECORD_URL).request.body as Record<string, unknown>;
+        expect(typeof sent['recurring_amount']).withContext(amount).toBe('string');
+        expect(sent['recurring_amount']).withContext(amount).toBe(amount);
+        expect(JSON.stringify(sent))
+          .withContext(amount)
+          .toContain(`"recurring_amount":"${amount}"`);
+        controller.verify();
+      }
+    });
+
+    it('sends REPLACE with the token FIRST-CLASS, as the UUID string the read published', () => {
+      // A UUID, not a value — the difference from an axis's `expected_current`. The
+      // backend refuses a JSON number here for a specific reason: DRF's `UUIDField` would
+      // turn `42` into a well-formed UUID no row has ever carried, and the request would
+      // come back as a 409 saying the terms changed when nothing had.
+      http
+        .replaceSubscriptionTerms(DETAIL_ID, {
+          expected_terms_id: TERMS_ID,
+          ...FACTS,
+          recurring_amount: '175000.00',
+          reason: 'Uplift agreed for the new quarter',
+        })
+        .subscribe();
+
+      const sent = controller.expectOne(REPLACE_URL).request.body as Record<string, unknown>;
+      expect(sent['expected_terms_id']).toBe(TERMS_ID);
+      expect(typeof sent['expected_terms_id']).toBe('string');
+      expect(sent).toEqual({
+        expected_terms_id: TERMS_ID,
+        ...FACTS,
+        recurring_amount: '175000.00',
+        reason: 'Uplift agreed for the new quarter',
+      });
+    });
+
+    it('sends END with exactly three fields — token, boundary and reason', () => {
+      // Ending terms changes ONE thing: when they stopped applying. There is no amount
+      // to restate, and a body carrying the commercial facts would invite a server that
+      // read them.
+      http
+        .endSubscriptionTerms(DETAIL_ID, {
+          expected_terms_id: TERMS_ID,
+          ended_at: '2026-09-01T00:00:00+03:00',
+          reason: 'Restaurant is leaving the platform',
+        })
+        .subscribe();
+
+      const sent = controller.expectOne(END_URL).request.body as Record<string, unknown>;
+      expect(sent).toEqual({
+        expected_terms_id: TERMS_ID,
+        ended_at: '2026-09-01T00:00:00+03:00',
+        reason: 'Restaurant is leaving the platform',
+      });
+      for (const absent of ['recurring_amount', 'currency', 'billing_interval_unit', 'value']) {
+        expect(Object.keys(sent)).withContext(absent).not.toContain(absent);
+      }
+    });
+
+    it('transmits both timestamps with an EXPLICIT offset, never naive', () => {
+      // The backend's `AwareDateTimeField` refuses a naive value rather than assuming
+      // one, and Step 3C refuses it again underneath. The difference between midnight
+      // EAT and midnight UTC is three hours of "which terms were in force", and an
+      // operator in another timezone would never see the substitution happen.
+      const aware = /(Z|[+-]\d{2}:\d{2})$/;
+
+      http
+        .recordSubscriptionTerms(DETAIL_ID, { ...FACTS, reason: 'Recording the signed price' })
+        .subscribe();
+      const recorded = controller.expectOne(RECORD_URL).request.body as Record<string, string>;
+      expect(recorded['effective_from']).toMatch(aware);
+      controller.verify();
+
+      http
+        .endSubscriptionTerms(DETAIL_ID, {
+          expected_terms_id: TERMS_ID,
+          ended_at: '2026-09-01T12:00:00Z',
+          reason: 'Restaurant is leaving the platform',
+        })
+        .subscribe();
+      const ended = controller.expectOne(END_URL).request.body as Record<string, string>;
+      expect(ended['ended_at']).toMatch(aware);
+    });
+
+    it('unwraps each terms envelope to {changed, commercial}', () => {
+      // Every one of them returns the WHOLE canonical projection, exactly as the axis
+      // writes and the GET do — which is what lets the client adopt rather than rebuild.
+      for (const [url, call] of [
+        [RECORD_URL, () => http.recordSubscriptionTerms(DETAIL_ID, { ...FACTS, reason: 'Recording the signed price' })],
+        [REPLACE_URL, () => http.replaceSubscriptionTerms(DETAIL_ID, { expected_terms_id: TERMS_ID, ...FACTS, reason: 'Uplift agreed for the new quarter' })],
+        [END_URL, () => http.endSubscriptionTerms(DETAIL_ID, { expected_terms_id: TERMS_ID, ended_at: '2026-09-01T00:00:00+03:00', reason: 'Restaurant is leaving the platform' })],
+      ] as const) {
+        let received: CommercialMutationResult | undefined;
+        call().subscribe((value) => (received = value));
+        controller
+          .expectOne(url)
+          .flush({ status: 200, message: 'ok', data: { changed: true, commercial: CONFIGURED_COMMERCIAL } });
+
+        expect(received?.changed).withContext(url).toBeTrue();
+        expect(received?.commercial).withContext(url).toEqual(CONFIGURED_COMMERCIAL);
+      }
+    });
+
+    it('passes a terms changed:false no-op through as a SUCCESS', () => {
+      let received: CommercialMutationResult | undefined;
+      let errored = false;
+      http
+        .recordSubscriptionTerms(DETAIL_ID, { ...FACTS, reason: 'Re-sending after a lost response' })
+        .subscribe({ next: (value) => (received = value), error: () => (errored = true) });
+
+      controller
+        .expectOne(RECORD_URL)
+        .flush({ status: 200, message: 'Subscription terms recorded.', data: { changed: false, commercial: CONFIGURED_COMMERCIAL } });
+
+      expect(errored).toBeFalse();
+      expect(received?.changed).toBeFalse();
+      expect(received?.commercial).toEqual(CONFIGURED_COMMERCIAL);
+    });
+
+    it('surfaces each terms 409 with its own code intact', () => {
+      // FOUR DISTINCT CONFLICTS, and they are not interchangeable: "already has different
+      // open terms" and "has no open terms" call for opposite next actions. The transport
+      // must not flatten them.
+      for (const [url, call, code] of [
+        [RECORD_URL, () => http.recordSubscriptionTerms(DETAIL_ID, { ...FACTS, reason: 'Recording against a stale view' }), 'subscription_terms_already_open'],
+        [REPLACE_URL, () => http.replaceSubscriptionTerms(DETAIL_ID, { expected_terms_id: TERMS_ID, ...FACTS, reason: 'Replacing against a stale view' }), 'stale_subscription_terms'],
+        [END_URL, () => http.endSubscriptionTerms(DETAIL_ID, { expected_terms_id: TERMS_ID, ended_at: '2026-09-01T00:00:00+03:00', reason: 'Ending against a stale view' }), 'no_open_subscription_terms'],
+      ] as const) {
+        const seen: { status: number; code: unknown }[] = [];
+        call().subscribe({
+          next: () => fail('a conflict must not produce a value'),
+          error: (error: { status: number; error: { code?: string } }) =>
+            seen.push({ status: error.status, code: error.error?.code }),
+        });
+
+        controller
+          .expectOne(url)
+          .flush(
+            { status: 409, message: 'Subscription terms changed since they were loaded.', code },
+            { status: 409, statusText: 'Conflict' },
+          );
+
+        expect(seen).withContext(url).toEqual([{ status: 409, code }]);
+      }
+    });
+
+    it('encodes the restaurant id into every terms path segment', () => {
+      http
+        .recordSubscriptionTerms('a/../b', { ...FACTS, reason: 'Encoding check for the route helper' })
+        .subscribe();
+      controller
+        .expectOne('/api/admin/v1/restaurants/a%2F..%2Fb/commercial/subscription-terms/')
+        .flush({ status: 200, message: 'ok', data: { changed: true, commercial: CONFIGURED_COMMERCIAL } });
+
+      http
+        .replaceSubscriptionTerms('a/../b', { expected_terms_id: TERMS_ID, ...FACTS, reason: 'Encoding check for the route helper' })
+        .subscribe();
+      controller
+        .expectOne('/api/admin/v1/restaurants/a%2F..%2Fb/commercial/subscription-terms/replace/')
+        .flush({ status: 200, message: 'ok', data: { changed: true, commercial: CONFIGURED_COMMERCIAL } });
+
+      http
+        .endSubscriptionTerms('a/../b', { expected_terms_id: TERMS_ID, ended_at: '2026-09-01T00:00:00+03:00', reason: 'Encoding check for the route helper' })
+        .subscribe();
+      controller
+        .expectOne('/api/admin/v1/restaurants/a%2F..%2Fb/commercial/subscription-terms/end/')
+        .flush({ status: 200, message: 'ok', data: { changed: true, commercial: CONFIGURED_COMMERCIAL } });
+    });
+
+    it('exposes exactly the named operations, and NO generic mutation', () => {
+      // SEVEN NAMED OPERATIONS, and nothing that takes a URL, a field name or an action.
+      // A generic writer would make "what did this operator change?" a question about an
+      // argument rather than about which operation was called — and would let one future
+      // grant of access reach all of them.
+      //
+      // `#write` is a REAL hash-private method for this reason. A TypeScript `private` one
+      // is erased at runtime and leaves a callable `write(route, body)` on the instance,
+      // which is the exact surface this test exists to refuse. That is not hypothetical:
+      // this assertion caught it.
       const surface = http as unknown as Record<string, unknown>;
+      for (const named of [
+        'list',
+        'detail',
+        'setPaymentTiming',
+        'setPaymentCollectionMode',
+        'recordSubscriptionTerms',
+        'replaceSubscriptionTerms',
+        'endSubscriptionTerms',
+      ]) {
+        expect(typeof surface[named]).withContext(`${named} is part of the port`).toBe('function');
+      }
       for (const forbidden of [
         'post',
         'write',
@@ -756,9 +1023,12 @@ describe('RestaurantHttp', () => {
         'mutateCommercial',
         'setCommercialField',
         'setAxis',
-        'recordSubscriptionTerms',
-        'replaceSubscriptionTerms',
-        'endSubscriptionTerms',
+        'writeSubscriptionTerms',
+        'mutateSubscriptionTerms',
+        'setSubscriptionTerms',
+        'updateSubscriptionTerms',
+        'deleteSubscriptionTerms',
+        'cancelSubscription',
       ]) {
         expect(typeof surface[forbidden])
           .withContext(`${forbidden} must not be part of the public API`)

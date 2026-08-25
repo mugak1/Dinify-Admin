@@ -10,6 +10,7 @@ import {
   activityActionLabel,
   activityResultIsNotable,
   activityResultLabel,
+  billingIntervalLabel,
   NO_VALUE,
   ONBOARDING_UNTRACKED_NOTE,
   onboardingSourceLabel,
@@ -30,6 +31,7 @@ import {
   readinessBlockerLabel,
   readinessLabel,
   SUBSCRIPTION_TERMS_NOTE,
+  subscriptionAmountLabel,
   subscriptionMethodLabel,
   subscriptionTermsLabel,
 } from '../core/restaurants/restaurant.labels';
@@ -48,6 +50,15 @@ import {
   CommercialAxisOption,
   CommercialAxisSubmission,
 } from './commercial-axis-editor.component';
+import {
+  SubscriptionTermsEditorComponent,
+  SubscriptionTermsPrefill,
+  SubscriptionTermsSubmission,
+} from './subscription-terms-editor.component';
+import {
+  SubscriptionTermsEndComponent,
+  SubscriptionTermsEndSubmission,
+} from './subscription-terms-end.component';
 
 /**
  * The five restaurant-detail tabs.
@@ -101,6 +112,80 @@ function setAtLabel(axis: CommercialAxis<unknown> | undefined): string | null {
  * make the 409 and 404 branches dead code in the one mode this work is reviewed in
  * before a deploy exists. Mirrors `load-failure.ts`.
  */
+/** Which commercial editor is open. One slot, five operations. */
+type CommercialEditor = 'timing' | 'collection' | 'record' | 'replace' | 'end';
+
+/**
+ * What one commercial write says about its own outcomes.
+ *
+ * `unchanged` IS SUCCESS COPY, not failure copy. The server answers a same-state request
+ * with `changed: false` so a lost response followed by an exact retry is not a false
+ * conflict and does not re-stamp attribution — so the sentence says nothing moved, and
+ * never describes a no-op as a new decision.
+ */
+interface CommercialWriteCopy {
+  /** After `changed: true`. */
+  readonly recorded: string;
+  /** After `changed: false`. */
+  readonly unchanged: string;
+  /**
+   * The conflict half of a 409 sentence.
+   *
+   * A function because the two families genuinely differ. An axis has ONE conflict and
+   * the panel says so in its own words. Terms have FOUR — already open, stale, none
+   * open, and a token that resolves to nothing — and only the server can tell them
+   * apart. Collapsing those into one sentence would drop the operator's remedy: "this
+   * restaurant already has different open terms" and "this restaurant has no open terms"
+   * call for opposite next actions. The backend curates those four sentences for display
+   * and deliberately strips the row ids out of them, which is what makes them safe to
+   * pass through.
+   */
+  readonly conflict: (error: unknown) => string;
+}
+
+/** The service-configuration axes (Step 3E.2). One conflict, stated by the panel. */
+const AXIS_COPY: Record<'timing' | 'collection', CommercialWriteCopy> = {
+  timing: {
+    recorded: 'Payment timing recorded.',
+    unchanged: 'Payment timing was already set to that value. Nothing was changed.',
+    conflict: () => 'Configuration changed since you loaded it.',
+  },
+  collection: {
+    recorded: 'Collection mode recorded.',
+    unchanged: 'Collection mode was already set to that value. Nothing was changed.',
+    conflict: () => 'Configuration changed since you loaded it.',
+  },
+};
+
+/**
+ * The subscription-terms operations (Step 3E.3).
+ *
+ * NOT ONE WORD IMPLIES MONEY MOVED. Recorded, replaced and ended describe rows in a
+ * terms table; there is no invoice model, no receivable and no collection path behind
+ * any of them. Nothing here says activated, cancelled, subscribed, billed, charged,
+ * paid, refunded or revoked, and "ended" is never dressed up as any of those.
+ */
+const TERMS_COPY: Record<'record' | 'replace' | 'end', CommercialWriteCopy> = {
+  record: {
+    recorded: 'Subscription terms recorded.',
+    unchanged: 'These subscription terms were already recorded. Nothing was changed.',
+    conflict: (error) =>
+      extractErrorMessage(error, 'Subscription terms changed since they were loaded.'),
+  },
+  replace: {
+    recorded: 'Subscription terms replaced.',
+    unchanged: 'These are already the current subscription terms. Nothing was changed.',
+    conflict: (error) =>
+      extractErrorMessage(error, 'Subscription terms changed since they were loaded.'),
+  },
+  end: {
+    recorded: 'Subscription terms ended.',
+    unchanged: 'These subscription terms were already ended. Nothing was changed.',
+    conflict: (error) =>
+      extractErrorMessage(error, 'Subscription terms changed since they were loaded.'),
+  },
+};
+
 function readStatus(error: unknown): number | null {
   if (typeof error !== 'object' || error === null) return null;
   const value = (error as Record<string, unknown>)['status'];
@@ -110,7 +195,14 @@ function readStatus(error: unknown): number | null {
 @Component({
   selector: 'app-restaurant-overview-tab',
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink, StatusPillComponent, AdminButtonComponent, CommercialAxisEditorComponent],
+  imports: [
+    RouterLink,
+    StatusPillComponent,
+    AdminButtonComponent,
+    CommercialAxisEditorComponent,
+    SubscriptionTermsEditorComponent,
+    SubscriptionTermsEndComponent,
+  ],
   template: `
     @if (restaurant(); as data) {
       <div class="space-y-4">
@@ -352,20 +444,57 @@ function readStatus(error: unknown): number | null {
               }
 
               <!-- WHAT DINIFY HAS WRITTEN DOWN that this restaurant pays it. The price
-                   and the recurrence themselves — never a status word. -->
+                   and the recurrence themselves — never a status word.
+
+                   THE CONTROLS FOLLOW THE STATE, AND NEVER ALL THREE AT ONCE (Step
+                   3E.3). With no open terms the only thing an operator can do is
+                   Record; with open terms the only things they can do are Replace and
+                   End. Offering Record beside open terms would suggest a second
+                   concurrent set is possible — the database's partial unique index says
+                   it is not — and offering Replace or End with none open would be two
+                   controls whose only outcome is a 409.
+
+                   WITH NO commercial OBJECT AT ALL, none of them appears. Absence is not
+                   "Not configured": the server did not answer, so this screen does not
+                   know whether terms are open, and a control that guesses is a control
+                   that acts on a guess. -->
               <div class="flex items-baseline justify-between gap-4">
                 <dt [class]="term">Subscription terms</dt>
-                <dd class="text-right">
-                  <span [class]="definition">{{ subscriptionTerms() }}</span>
-                  @if (termsEffectiveFrom(); as when) {
-                    <span class="block text-admin-meta text-ink-subtle"
-                      >Effective from {{ when }}</span
+                <dd class="flex items-baseline justify-end gap-3 text-right">
+                  <span [class]="definition">
+                    <span class="block" data-terms-value>{{ subscriptionTerms() }}</span>
+                    @if (termsEffectiveFrom(); as when) {
+                      <span class="block text-admin-meta text-ink-subtle"
+                        >Effective from {{ when }}</span
+                      >
+                    }
+                    @if (termsRecordedAt(); as when) {
+                      <!-- RECORDED, not agreed, signed, activated or paid. Dinify wrote
+                           this down; nobody countersigned it. -->
+                      <span class="block text-admin-meta text-ink-subtle">Recorded {{ when }}</span>
+                    }
+                  </span>
+                  @if (canRecordTerms()) {
+                    <app-admin-button
+                      variant="ghost"
+                      [disabled]="changeDisabled()"
+                      (pressed)="openTermsEditor('record')"
+                      >Record terms</app-admin-button
                     >
                   }
-                  @if (termsRecordedAt(); as when) {
-                    <!-- RECORDED, not agreed, signed, activated or paid. Dinify wrote
-                         this down; nobody countersigned it. -->
-                    <span class="block text-admin-meta text-ink-subtle">Recorded {{ when }}</span>
+                  @if (hasSubscriptionTerms()) {
+                    <app-admin-button
+                      variant="ghost"
+                      [disabled]="changeDisabled()"
+                      (pressed)="openTermsEditor('replace')"
+                      >Replace terms</app-admin-button
+                    >
+                    <app-admin-button
+                      variant="ghost"
+                      [disabled]="changeDisabled()"
+                      (pressed)="openTermsEditor('end')"
+                      >End terms</app-admin-button
+                    >
                   }
                 </dd>
               </div>
@@ -419,6 +548,52 @@ function readStatus(error: unknown): number | null {
                 [errorMessage]="writeError()"
                 [fieldErrors]="writeFieldErrors()"
                 (save)="saveCollection($event)"
+                (cancelled)="closeEditor()"
+              />
+            }
+
+            <!-- THE SAME ONE-EDITOR SLOT, now shared by FIVE commercial writes rather
+                 than the two service-configuration ones. Terms writes return the whole
+                 canonical object exactly as the axis writes do, so a terms write racing
+                 an axis write would repaint the other with an older snapshot — which is
+                 precisely the race the single slot makes unrepresentable. -->
+            @if (editing() === 'record') {
+              <app-subscription-terms-editor
+                heading="Record subscription terms"
+                submitLabel="Record terms"
+                [pending]="pending()"
+                [errorMessage]="writeError()"
+                [fieldErrors]="writeFieldErrors()"
+                (save)="saveRecordTerms($event)"
+                (cancelled)="closeEditor()"
+              />
+            }
+
+            @if (editing() === 'replace') {
+              <!-- PREFILLED FROM THE SNAPSHOT TAKEN WHEN THIS EDITOR OPENED, not from
+                   the live store — the same discipline as the concurrency token beside
+                   it. A form that re-filled itself from a background change would
+                   overwrite what the operator had typed with facts they never saw. -->
+              <app-subscription-terms-editor
+                heading="Replace subscription terms"
+                submitLabel="Replace terms"
+                [prefill]="termsPrefill()"
+                [refuseUnchanged]="true"
+                [pending]="pending()"
+                [errorMessage]="writeError()"
+                [fieldErrors]="writeFieldErrors()"
+                (save)="saveReplaceTerms($event)"
+                (cancelled)="closeEditor()"
+              />
+            }
+
+            @if (editing() === 'end') {
+              <app-subscription-terms-end
+                [subject]="endSubject()"
+                [pending]="pending()"
+                [errorMessage]="writeError()"
+                [fieldErrors]="writeFieldErrors()"
+                (save)="saveEndTerms($event)"
                 (cancelled)="closeEditor()"
               />
             }
@@ -734,6 +909,19 @@ export class RestaurantOverviewTab {
 
   protected readonly hasSubscriptionTerms = computed(() => this.terms() !== null);
 
+  /**
+   * True only where the server ANSWERED and said no terms are open.
+   *
+   * `commercial === null` is not that answer — it is the absence of one — and offering
+   * Record there would manufacture "there are none" out of a missing payload, the same
+   * defect class as a dead backend presenting as "Invalid credentials." Guarded on
+   * `current` rather than on `configured`, like every other reader in this slice: what
+   * is displayed is what is checked.
+   */
+  protected readonly canRecordTerms = computed(
+    () => this.commercial() !== null && this.terms() === null,
+  );
+
   /** WHEN THE TERMS BECAME APPLICABLE. Not when they were written down. */
   protected readonly termsEffectiveFrom = computed(() => {
     const at = this.terms()?.effective_from;
@@ -763,8 +951,15 @@ export class RestaurantOverviewTab {
   private readonly api = inject(RESTAURANT_API);
   private readonly serviceStatus = inject(AdminServiceStatus);
 
-  /** Which axis is being edited, or none. Never both — see the template comment. */
-  protected readonly editing = signal<'timing' | 'collection' | null>(null);
+  /**
+   * Which commercial editor is open, or none. Never two — see the template comment.
+   *
+   * FIVE VALUES, ONE SLOT. The two service-configuration axes (Step 3E.2) and the three
+   * subscription-terms operations (Step 3E.3) share it, because every one of them
+   * returns the WHOLE canonical commercial object and any two in flight together could
+   * land out of order.
+   */
+  protected readonly editing = signal<CommercialEditor | null>(null);
 
   /**
    * IN FLIGHT — owned by the route-scoped workspace, not by this component.
@@ -803,6 +998,30 @@ export class RestaurantOverviewTab {
    * replaced only by a fresh deliberate edit.
    */
   private readonly expectedCurrent = signal<string | null>(null);
+
+  /**
+   * THE TERMS CONCURRENCY TOKEN, CAPTURED WHEN THE EDITOR OPENED.
+   *
+   * `subscription_terms.current.id` — a ROW IDENTITY, not a value, and that is the whole
+   * difference from the axes. An axis asserts "the value was X"; a replacement or an end
+   * asserts "the row I am superseding is THIS row". A UUID cannot be reconstructed from
+   * what is on screen, so losing it is not recoverable by looking harder — it is
+   * captured once and replaced only by a fresh deliberate edit.
+   */
+  private readonly expectedTermsId = signal<string | null>(null);
+
+  /**
+   * The four immutable commercial facts of the row being replaced, snapshotted at open.
+   *
+   * A snapshot rather than a projection of the store, for the same reason the token is:
+   * the operator is restating the terms they reviewed, and a form that re-derived them
+   * from a background change would silently move the baseline the unchanged-facts check
+   * is measured against.
+   */
+  protected readonly termsPrefill = signal<SubscriptionTermsPrefill | null>(null);
+
+  /** The terms being ended, as they read when the End form opened. */
+  protected readonly endSubject = signal('');
 
   protected readonly timingValue = computed(() => this.commercial()?.payment_timing.value ?? null);
   protected readonly collectionValue = computed(
@@ -882,15 +1101,74 @@ export class RestaurantOverviewTab {
     // presentation, and the token capture below is the thing that actually matters.
     if (this.changeDisabled()) return;
     this.clearOutcome();
+    this.clearTokens();
     this.expectedCurrent.set(axis === 'timing' ? this.timingValue() : this.collectionValue());
     this.editing.set(axis);
+  }
+
+  /**
+   * Open one terms editor, capturing what the operator is looking at.
+   *
+   * Record captures NOTHING — the operation means "record terms only if none are open",
+   * and the backend enforces that under the restaurant lock. There is deliberately no
+   * `expected_terms_id` on that request: a token nothing consults is a field the caller
+   * has to supply and no layer checks.
+   *
+   * Replace and End capture the OPEN ROW'S ID, and refuse to open without one. A missing
+   * id means the projection does not describe an open row, and an editor that opened
+   * anyway would collect a reason and a boundary only to send an assertion about nothing.
+   */
+  protected openTermsEditor(kind: 'record' | 'replace' | 'end'): void {
+    if (this.changeDisabled()) return;
+
+    if (kind === 'record') {
+      if (!this.canRecordTerms()) return;
+      this.clearOutcome();
+      this.clearTokens();
+      this.editing.set('record');
+      return;
+    }
+
+    const terms = this.terms();
+    if (terms === null) return;
+
+    this.clearOutcome();
+    this.clearTokens();
+    this.expectedTermsId.set(terms.id);
+
+    if (kind === 'replace') {
+      this.termsPrefill.set({
+        // The stored decimal STRING, handed to the form untouched. Parsing it to
+        // prefill a field and re-serialising on save would put a float in the middle of
+        // a round trip the backend keeps exact.
+        recurring_amount: terms.recurring_amount,
+        currency: terms.currency,
+        billing_interval_unit: terms.billing_interval.unit,
+        billing_interval_count: terms.billing_interval.count,
+      });
+      this.editing.set('replace');
+      return;
+    }
+
+    this.endSubject.set(
+      `${subscriptionAmountLabel(terms)} · ${billingIntervalLabel(terms.billing_interval)}`,
+    );
+    this.editing.set('end');
   }
 
   protected closeEditor(): void {
     if (this.workspace.mutating()) return;
     this.editing.set(null);
-    this.expectedCurrent.set(null);
+    this.clearTokens();
     this.clearOutcome();
+  }
+
+  /** Every captured assertion and snapshot. Cleared together, so none can outlive its editor. */
+  private clearTokens(): void {
+    this.expectedCurrent.set(null);
+    this.expectedTermsId.set(null);
+    this.termsPrefill.set(null);
+    this.endSubject.set('');
   }
 
   protected saveTiming(submission: CommercialAxisSubmission): void {
@@ -910,8 +1188,8 @@ export class RestaurantOverviewTab {
         reason: submission.reason,
       })
       .subscribe({
-        next: (result) => this.onWritten(result.changed, result.commercial, 'Payment timing'),
-        error: (error: unknown) => this.onWriteFailed(error),
+        next: (result) => this.onWritten(result.changed, result.commercial, AXIS_COPY.timing),
+        error: (error: unknown) => this.onWriteFailed(error, AXIS_COPY.timing),
       });
   }
 
@@ -930,8 +1208,71 @@ export class RestaurantOverviewTab {
         reason: submission.reason,
       })
       .subscribe({
-        next: (result) => this.onWritten(result.changed, result.commercial, 'Collection mode'),
-        error: (error: unknown) => this.onWriteFailed(error),
+        next: (result) => this.onWritten(result.changed, result.commercial, AXIS_COPY.collection),
+        error: (error: unknown) => this.onWriteFailed(error, AXIS_COPY.collection),
+      });
+  }
+
+  /**
+   * THE THREE SUBSCRIPTION-TERMS WRITES (Step 3E.3).
+   *
+   * Three named operations, never one parameterised by an action. Recording a first set
+   * of terms, superseding the open ones and closing them are different decisions with
+   * different preconditions, different concurrency tokens and different histories left
+   * behind — the backend refused a `subscription-terms/<action>/` route for exactly that
+   * reason, and a client that collapsed them would make "what did this operator do?" a
+   * question about an argument.
+   *
+   * They share `onWritten` / `onWriteFailed` with the axes, because "what does a 409
+   * mean" and "what does an indeterminate outcome mean" are not per-operation questions.
+   */
+  protected saveRecordTerms(submission: SubscriptionTermsSubmission): void {
+    const id = this.restaurant()?.id;
+    if (id === undefined) return;
+    if (!this.beginWrite()) return;
+
+    this.api
+      // NO `expected_terms_id`. The operation asserts "none are open", which the server
+      // checks under the restaurant lock; a token here would be checked by nothing.
+      .recordSubscriptionTerms(id, { ...submission })
+      .subscribe({
+        next: (result) => this.onWritten(result.changed, result.commercial, TERMS_COPY.record),
+        error: (error: unknown) => this.onWriteFailed(error, TERMS_COPY.record),
+      });
+  }
+
+  protected saveReplaceTerms(submission: SubscriptionTermsSubmission): void {
+    const id = this.restaurant()?.id;
+    const expected = this.expectedTermsId();
+    // NEVER a fresh read of the store. If the token is gone the request is not sent:
+    // "supersede whatever happens to be open" is the stale-screen overwrite the token
+    // exists to prevent, and the server has no way to tell it from a considered one.
+    if (id === undefined || expected === null) return;
+    if (!this.beginWrite()) return;
+
+    this.api
+      .replaceSubscriptionTerms(id, { expected_terms_id: expected, ...submission })
+      .subscribe({
+        next: (result) => this.onWritten(result.changed, result.commercial, TERMS_COPY.replace),
+        error: (error: unknown) => this.onWriteFailed(error, TERMS_COPY.replace),
+      });
+  }
+
+  protected saveEndTerms(submission: SubscriptionTermsEndSubmission): void {
+    const id = this.restaurant()?.id;
+    const expected = this.expectedTermsId();
+    if (id === undefined || expected === null) return;
+    if (!this.beginWrite()) return;
+
+    this.api
+      .endSubscriptionTerms(id, {
+        expected_terms_id: expected,
+        ended_at: submission.ended_at,
+        reason: submission.reason,
+      })
+      .subscribe({
+        next: (result) => this.onWritten(result.changed, result.commercial, TERMS_COPY.end),
+        error: (error: unknown) => this.onWriteFailed(error, TERMS_COPY.end),
       });
   }
 
@@ -959,18 +1300,18 @@ export class RestaurantOverviewTab {
    * either way; only the sentence differs, and a no-op must never be described as a new
    * decision.
    */
-  private onWritten(changed: boolean, commercial: CommercialSummary, axisLabel: string): void {
+  private onWritten(
+    changed: boolean,
+    commercial: CommercialSummary,
+    copy: CommercialWriteCopy,
+  ): void {
     this.workspace.adoptCommercial(commercial);
     this.workspace.endMutation();
     this.editing.set(null);
-    this.expectedCurrent.set(null);
+    this.clearTokens();
     this.writeError.set(null);
     this.writeFieldErrors.set({});
-    this.confirmation.set(
-      changed
-        ? `${axisLabel} recorded.`
-        : `${axisLabel} was already set to that value. Nothing was changed.`,
-    );
+    this.confirmation.set(changed ? copy.recorded : copy.unchanged);
     // The server answered, so the control plane is reachable. Mock mode runs no
     // interceptor, so without this a mocked outage would never clear.
     this.serviceStatus.markReachable();
@@ -982,7 +1323,7 @@ export class RestaurantOverviewTab {
    * The order matters: the two elevation outcomes are client-side objects with no HTTP
    * status, and a conflict is a well-formed answer rather than a defect.
    */
-  private onWriteFailed(error: unknown): void {
+  private onWriteFailed(error: unknown, copy: CommercialWriteCopy): void {
     this.workspace.endMutation();
 
     // Re-authentication dismissed. NOTHING was sent, so the draft and the reason are
@@ -1016,7 +1357,7 @@ export class RestaurantOverviewTab {
       // panel spends the rest of its existence refusing to claim things prematurely.
       // The transient progress half is appended by `panelMessage` while it is true.
       this.writeError.set(
-        'Configuration changed since you loaded it. Review the current value before trying again.',
+        `${copy.conflict(error)} Review the current value before trying again.`,
       );
       // Marks the projection superseded for the duration, so no second decision can be
       // taken against it. The workspace owns what happens next, including a failed read.
@@ -1071,7 +1412,7 @@ export class RestaurantOverviewTab {
   /** A conflict or a vanished restaurant invalidates the token this editor captured. */
   private discardStaleEditor(): void {
     this.editing.set(null);
-    this.expectedCurrent.set(null);
+    this.clearTokens();
     this.writeFieldErrors.set({});
     this.confirmation.set(null);
   }

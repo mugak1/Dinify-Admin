@@ -22,11 +22,17 @@ conventions change.
 
 **Step 0 (scaffold) complete, plus spec §15 STEP 1 (restaurant directory + detail
 workspace), the READ half of STEP 2C (the onboarding and owner-control projection),
-STEP 3E.1 (the canonical commercial READ migration) and STEP 3E.2 (the
-service-configuration WRITE controls), all rendered on Overview.** Step 2 as a whole is
-NOT complete — nothing in this repo creates a restaurant, adopts one, attests owner
-control or issues an invitation. **Step 3E is NOT complete either: 3E.2 shipped the two
-SERVICE-CONFIGURATION writes, and the SUBSCRIPTION-TERMS writes (3E.3) do not exist.**
+STEP 3E.1 (the canonical commercial READ migration), STEP 3E.2 (the
+service-configuration WRITE controls) and STEP 3E.3 (the subscription-terms WRITE
+controls), all rendered on Overview.** Step 2 as a whole is NOT complete — nothing in
+this repo creates a restaurant, adopts one, attests owner control or issues an
+invitation.
+
+**STEP 3E IS NOW COMPLETE ON THE FRONTEND: all five commercial writes exist.** That is a
+statement about THIS repo's commercial surface and nothing else. It does NOT mean
+readiness is built (the seam still fails closed — spec §15 step 3), that the Billing tab
+exists (step 7), that there is an invoice, a receivable or a collection path anywhere in
+the system, or that owner approval of commercial terms is recorded or even modelled.
 Steps 3–10 are otherwise not built.
 
 - Shell, navigation and routing: ✅ the five §9 destinations, the §9.2 URL scheme,
@@ -64,16 +70,25 @@ Steps 3–10 are otherwise not built.
   writes in this repo. Overview's Commercial panel can change **payment timing** and
   **payment collection mode** — two separate named endpoints, each elevation-gated,
   audited, and asserted against the exact axis value the operator loaded. Inline editors,
-  no optimistic UI, one local mutation at a time, 409 reloads and requires review. See
-  "The Service-Configuration Writes" below.
+  no optimistic UI, one commercial mutation at a time, 409 reloads and requires review.
+  See "The Service-Configuration Writes" below.
+- **Step 3E.3 subscription-terms writes: ✅ BUILT.** Overview's Commercial panel can
+  RECORD first terms, REPLACE the open ones and END them — three separate named
+  endpoints through the same elevation/CSRF machinery, the same single write slot and the
+  same no-optimistic-UI rule as 3E.2. The concurrency token is a ROW ID
+  (`expected_terms_id`), not a value, and Record deliberately carries none. See "The
+  Subscription-Terms Writes" below.
 - **Readiness, Billing, Support and Activity tabs: ❌ still placeholders** with
   written empty states (spec §15 steps 3, 7, 6 and 8).
 - **Restaurant creation, restaurant adoption, owner-control attestation, owner
   invitation (issue / reissue / cancel), owner reassignment, the readiness ENGINE,
-  lifecycle controls, delegated drill-in, support triage, receivables, the Activity
-  screen, Home needs-attention and portfolio metrics: ❌ NOT BUILT.** Spec §15 steps
-  2–10. Step 2C gave this repo the onboarding facts to READ; every write in that domain
-  is still unbuilt.
+  lifecycle controls, delegated drill-in, support triage, receivables, INVOICES, owner
+  APPROVAL of commercial terms, the Activity screen, Home needs-attention and portfolio
+  metrics: ❌ NOT BUILT.** Spec §15 steps 2–10. Step 2C gave this repo the onboarding
+  facts to READ; every write in that domain is still unbuilt. And 3E being complete says
+  nothing about the four commercial-adjacent items in that list — recorded terms are not
+  an invoice, a receivable, a payment or an owner's agreement, and there is no model on
+  the server behind any of them.
 - **Deployment: 0C.1 ✅ EMPIRICALLY ACCEPTED (2026-08-20) · 0C.2 ✅ EMPIRICALLY
   ACCEPTED (2026-08-21).** `.github/workflows/deploy.yml` deploys over GitHub OIDC →
   private S3 → AWS SSM. The real Angular application is live on
@@ -433,6 +448,10 @@ GET /api/admin/v1/restaurants/            -> {status, data: {results[], paginati
 GET /api/admin/v1/restaurants/<uuid>/     -> {status, data: {...detail}}
 ```
 
+(`RestaurantApi` also carries the five commercial WRITES from steps 3E.2 and 3E.3 —
+seven named operations in total. Those are elevation-gated and audited, and are documented
+in their own sections below. The files here are the read half.)
+
 Shaped like the auth seam and for the same reason — a PORT (`RESTAURANT_API`) plus a
 typed transport, so `npm start` renders both screens with no backend and everything above
 the port is identical in both modes:
@@ -631,14 +650,29 @@ lifecycle state, or `is_test`. `is_test` affects portfolio visibility later; it 
 rewrite the commercial facts a restaurant has recorded.
 
 ### THE COMMERCIAL WRITES THAT EXIST, AND THE ONES THAT DO NOT
-Step 3E.2 added exactly two: `setPaymentTiming` and `setPaymentCollectionMode`. Still
-absent, and must stay absent until Step 3E.3 owns them: `recordSubscriptionTerms`,
-`replaceSubscriptionTerms`, `endSubscriptionTerms` — and, permanently, any generic
-`post()`, `mutateCommercial`, `setAxis` or `ApiService`.
+**FIVE NAMED OPERATIONS, AND THE COUNT IS NOW CLOSED.** 3E.2 added `setPaymentTiming` and
+`setPaymentCollectionMode`; 3E.3 added `recordSubscriptionTerms`,
+`replaceSubscriptionTerms` and `endSubscriptionTerms`. With the two reads that is a port
+of SEVEN operations, and a test enumerates it.
 
-**SUBSCRIPTION TERMS REMAIN STRICTLY READ-ONLY.** No Record, no Replace, no End, and no
-disabled placeholder — a control that cannot work still tells an operator the capability
-is there. A test pins the exact button set on Overview as `['Change', 'Change']`.
+Permanently absent, and the reason has not changed: any generic `post()`, `write()`,
+`mutateCommercial`, `setAxis`, `setCommercialField`, `updateSubscriptionTerms` or
+`ApiService`. A parameterised writer would make "what did this operator change?" a
+question about an argument rather than about which operation was called, and would let
+one future grant of access reach all five.
+
+**AND STILL ABSENT BECAUSE THE DOMAIN DOES NOT HAVE THEM:** anything that issues an
+invoice, records a receivable, takes a payment, marks terms paid, cancels a subscription
+or records owner agreement to terms. There is no invoice model, no receivable and no
+collection path on the server — Dinify has never taken a subscription payment through
+this system — so a control offering any of those would promise a capability with nothing
+behind it. A test pins the panel's exact control set for each state and asserts those
+words are absent.
+
+**THE CONTROLS FOLLOW THE STATE, AND NEVER ALL THREE AT ONCE.** No open terms → `[Record
+terms]`. Open terms → `[Replace terms] [End terms]`. NO `commercial` OBJECT AT ALL → none
+of them, because absence is not "there are none open" and a control that guesses is a
+control that acts on a guess.
 
 ## The Service-Configuration Writes — spec §15 step 3E.2
 
@@ -708,11 +742,13 @@ optimistic UI for consequential writes, and a write is real once its `AdminAudit
 commits. Only then is `response.commercial` adopted, the editor closed and the draft
 cleared.
 
-**ONLY ONE AXIS EDITOR IS OPEN AND ONLY ONE WRITE IS IN FLIGHT.** Each successful write
-returns the WHOLE canonical object, so two concurrent writes from this panel could land
-out of order and the older snapshot would repaint the other axis. That is a race this
-client would be doing to itself; it is NOT a substitute for server concurrency, which
-`expected_current` and the 409 still own.
+**ONLY ONE COMMERCIAL EDITOR IS OPEN AND ONLY ONE COMMERCIAL WRITE IS IN FLIGHT.** The
+slot is shared by all FIVE writes — both service axes and all three terms operations —
+because every one of them returns the WHOLE canonical object, so two concurrent writes
+from this panel could land out of order and the older snapshot would repaint whatever the
+other one changed. That is a race this client would be doing to itself; it is NOT a
+substitute for server concurrency, which `expected_current` / `expected_terms_id` and the
+409 still own. There is deliberately no second lock for terms.
 
 **THE IN-FLIGHT FLAG LIVES ON THE ROUTE-SCOPED STORE, NOT ON THE TAB**, and that is the
 whole point rather than a detail. The tabs are SIBLING ROUTES, so switching to Readiness
@@ -792,15 +828,16 @@ Required, trimmed, minimum 10 characters (`MIN_REASON_LENGTH`, mirroring the ser
 renders. Nothing generates a reason: no "Admin update", no "Changed via portal".
 
 ### MOCK MODE RUNS THE REAL INTERACTION
-`MockRestaurantApi` implements both writes with the server's own rules in the server's own
-order — vocabulary, reason, then concurrency, with same-state checked BEFORE the
-assertion. A successful write overlays the fixture so later reads (workspace AND
+`MockRestaurantApi` implements all five writes with the server's own rules in the server's
+own order — shape, reason, then the clock, then state, with same-state and exact-retry
+checked BEFORE the concurrency assertion. A successful write overlays the fixture so later reads (workspace AND
 directory) reflect it. **There is no mock-only UI path** and no simulated elevation: that
 machinery has its own tests, and a second implementation in a fixture would prove nothing
 about the real one.
 
 ```js
-// Review the conflict UI. Fires once, then disarms so the whole
+// Review the conflict UI. Arms the NEXT commercial write — either axis, or any of the
+// three terms operations. Fires once, then disarms so the whole
 // conflict -> reload -> fresh token -> retry path can be walked.
 sessionStorage.setItem('dinify-admin.mock-commercial', 'stale')
 ```
@@ -808,12 +845,173 @@ sessionStorage.setItem('dinify-admin.mock-commercial', 'stale')
 ### THE DIRECTORY STAYS READ-ONLY
 No write controls on `/restaurants`. Writes belong inside the workspace, where the
 restaurant's identity and context stay visible while the change is made. The directory's
-stub API THROWS on both write methods, so a control added there fails a test rather than
+stub API THROWS on all FIVE write methods, so a control added there fails a test rather than
 quietly working.
 
-> **Step 3E.3 is the SUBSCRIPTION-TERMS controls** — record, replace, end. Its
-> concurrency token is `subscription_terms.current.id` rather than a value, and its
-> exact-retry rules differ from an axis's. Not built.
+## The Subscription-Terms Writes — spec §15 step 3E.3
+
+**THE OTHER HALF OF THE COMMERCIAL SURFACE.** An administrator can record a restaurant's
+first subscription terms, replace the open ones, or end them — each with a stated reason,
+against the exact row they loaded, through the SAME elevation/CSRF machinery, the SAME
+single write slot and the SAME no-optimistic-UI rule as 3E.2.
+
+```
+POST /api/admin/v1/restaurants/<uuid>/commercial/subscription-terms/
+POST /api/admin/v1/restaurants/<uuid>/commercial/subscription-terms/replace/
+POST /api/admin/v1/restaurants/<uuid>/commercial/subscription-terms/end/
+
+     -> 200 { "changed": true, "commercial": { …the canonical projection… } }
+```
+
+### THREE NAMED OPERATIONS, AND THEY STAY THREE
+Never one route with an `action` segment and never one method with a discriminator.
+Recording first terms, superseding the open ones and closing them have different
+preconditions, different concurrency tokens and different histories left behind; the
+backend refused a `subscription-terms/<action>/` route for exactly that reason, and a
+client that collapsed them would make an audit log unreadable a year later.
+
+### THE TOKEN IS A ROW IDENTITY, NOT A VALUE — AND RECORD HAS NONE
+This is the whole difference from an axis, and the easiest thing here to get quietly
+wrong.
+
+| operation | assertion | why |
+|---|---|---|
+| `record` | **none** | the operation MEANS "only if none are open", enforced under the restaurant lock. A token here would be a field the caller must supply and nothing would check. |
+| `replace` | `expected_terms_id` | "supersede THIS row" — without it a stale screen supersedes terms somebody else already replaced |
+| `end` | `expected_terms_id` | "close THIS row" |
+
+`expected_terms_id` is `subscription_terms.current.id` — a UUID this API is the only
+producer of. **Captured when the editor opens**, into a plain signal and deliberately not
+a computed, for the same reason `expected_current` is: the operator is asserting "this is
+the row I reviewed". It cannot be reconstructed from anything on screen, so a component
+that rebuilt the request after re-authentication would have nothing correct to put there
+— which is why `error.interceptor.spec.ts` pins the REPLAY carrying it byte-for-byte, and
+pins a `record` replay NOT growing one.
+
+**The server answers a token that does not resolve with 409, never 404** — this route's
+target is the RESTAURANT — so a UUID belonging to another tenant is answered identically
+to one that never existed and cannot be used to probe for other restaurants' terms.
+
+### THE MONEY IS A STRING FROM THE KEYSTROKE TO THE WIRE
+The amount input is `type="text"`, never `type="number"`: a number input hands back a
+coerced value, which is the exact round trip the backend's `StrictDecimalStringField`
+exists to refuse. Nothing parses it, nothing reformats it, and the prefill hands the
+stored string straight back. `"0.00"` versus `0.0` is precisely the distinction that would
+be lost, and a stored `"150000.50"` must arrive as `"150000.50"` and not `150000.5`.
+
+**A ZERO PRICE IS A REAL, DELIBERATE PRICE** — a rehearsing test tenant, a free pilot, a
+waived period. It is never "Free" and never absent.
+
+### THE BOUNDARY IS AN EAT WALL TIME, SERIALISED AGAINST AFRICA/KAMPALA
+`effective_from` and `ended_at` are both `datetime-local` inputs labelled **(EAT)**, and
+both go through `eatWallTimeToIso` — see "Formatting". **`new Date(wall).toISOString()`
+would read the wall time in the BROWSER'S zone**, so an operator administering from
+London would silently send an instant three hours out. The backend refuses naive
+timestamps, so that bug does not present as a 400: it presents as a well-formed request
+recording the wrong moment, in the one field that decides which terms were in force.
+
+**NEITHER IS DEFAULTED TO "NOW", AND THAT IS THE POINT OF THE FIELD.** The operator is
+recording when terms took effect or stopped applying, which is frequently not the moment
+they got round to typing it — backdating is ordinary and truthful here. A prefilled
+current time would have Dinify record a different fact from the one they meant. The
+server refuses a FUTURE moment outright: this domain records terms already in effect and
+does not schedule.
+
+### THE REPLACEMENT FORM PREFILLS FOUR FACTS, AND NOT THE FIFTH
+Amount, currency, interval unit and interval count are prefilled from the row being
+replaced so only what genuinely changes has to be retyped. **The boundary never is** — it
+is a new decision every time, and prefilling it invites an operator to accept a date they
+did not choose.
+
+Two things that look like details and are not:
+
+- **The prefill runs in `ngOnInit`, not the constructor.** Input signals are populated
+  AFTER construction, so reading them in a constructor returns the default and every
+  replacement form comes up blank. It did; two tests caught it.
+- **The interval's selected option is marked ON THE OPTION** (`[selected]`), not by
+  binding `value` on the `<select>`. A value binding is applied before the loop has
+  rendered the options, matches nothing, and the control falls back to the FIRST one — so
+  a replacement prefilled with "every 2 years" came up reading "day" and would have
+  recorded that recurrence. **A test using the default month/1 would not have caught it**,
+  because there the wrong answer and the right answer look identical; the test uses a
+  non-default interval deliberately.
+
+### SAVE IS REFUSED FOR AN UNCHANGED REPLACEMENT, ON FOUR FACTS
+The backend's `_commercial_tuple` compares amount, currency, interval unit and interval
+count and **deliberately excludes `effective_from`** — replacing terms means changing what
+the restaurant PAYS, and re-dating an unchanged price is a separate correction the domain
+does not offer. So a replacement differing only in date is a silent `changed: false`, and
+the form says so rather than encouraging the request. Amounts are compared as TRIMMED
+STRINGS; no float conversion, ever.
+
+Recording identical terms is NOT refused client-side — it is a legitimate exact retry the
+server answers as a successful no-op.
+
+### ENDING TERMS LEAVES NO CURRENT TERMS, AND THAT IS ALL IT DOES
+The copy states the consequence and claims nothing else: **"Ending these terms leaves the
+restaurant with no current subscription terms. Historical terms are retained."** It does
+not cancel a subscription, stop billing, issue a refund, revoke access, deactivate,
+suspend or charge anything — there is no model behind any of those words. Nothing is
+auto-created to fill the gap; deciding the next terms is a separate decision somebody has
+to make, and the row goes back to offering `[Record terms]`.
+
+**IT IS NOT STYLED AS DESTRUCTIVE.** §16 reserves `--admin-danger` for destructive
+actions and `--admin-warning` for "careful". Nothing is destroyed, the history survives,
+and the state is reversible by recording new terms — so the consequence is stated in the
+warning hue on wording that stands without it (§22) and the button keeps the ordinary
+accent. A danger-red control here would train the operator to read real destruction as
+routine.
+
+### END'S EXACT-RETRY PROOF IS CONDITIONAL, AND THE MOCK MIRRORS IT
+`expected.ended_at == ended_at` alone is NOT enough. The retry check has to come before
+the open-row requirement — after a successful end there is no open row, so asking "is this
+the open row?" first would refuse a resend of the request that just succeeded — but if
+another operator has opened FRESH terms since, replying "already done" would report
+success for an operation whose stated postcondition no longer holds, and would slip past
+the token entirely. That is a stale view, and it is answered as one.
+
+### THE FOUR CONFLICTS ARE FOUR, AND ONLY THE SERVER CAN TELL THEM APART
+`subscription_terms_already_open`, `stale_subscription_terms`, `no_open_subscription_terms`
+and `subscription_terms_not_found`. **The panel renders the SERVER'S 409 sentence** and
+appends its own review clause — unlike the axes, which have one conflict and say so in the
+panel's own words. Collapsing four into one would drop the operator's remedy: "this
+restaurant already has different open terms" and "this restaurant has no open terms" call
+for opposite next actions. The backend curates those four sentences for display and strips
+the row ids out of them, which is what makes them safe to pass through.
+
+Everything else about failure handling is 3E.2's, unchanged and deliberately shared: no
+auto-retry on 409, `reloadSuperseded()` gating the next decision until the replacement read
+lands, a 400 keeping the form and draft open with the server's words beside the field it
+names, a cancelled re-authentication keeping the draft, and a 5xx or status 0 reported as
+INDETERMINATE rather than as a failure to commit.
+
+### ONE SLOT FOR ALL FIVE, NOT TWO SLOTS OF TWO AND THREE
+`editing` is one signal with five values and `mutating` is the workspace's single
+in-flight flag. Every one of the five returns the WHOLE canonical object, so a terms write
+racing an axis write would repaint the other with an older snapshot — the same race, so
+the same slot. **There is deliberately no second `termsMutating` lock**, and the flag
+still lives on the ROUTE-SCOPED STORE rather than the tab, because the tabs are sibling
+routes and a tab round-trip rebuilds Overview while the request keeps running.
+
+### MOCK MODE RUNS THE REAL RULES, INCLUDING A HISTORY
+`MockRestaurantApi` keeps a terms HISTORY per restaurant, not just the current row, and
+that is what makes the rules reviewable at all: `record` refuses terms beginning before
+the last closure (the monotonic timeline), `replace` recognises a completed replacement by
+the OLD row's `ended_at`, and `end` distinguishes "already ended" from "already ended and
+something new has since opened". None of those can be answered from `current` alone.
+
+Every stored moment is normalised to ONE spelling on the way in, including the fixture
+seed's — the comparisons are string equality and lexicographic ordering, which is sound
+for ISO instants only while they all carry the same offset. The `dinify-admin.mock-commercial`
+lever now arms a conflict for any of the five writes, is consumed exactly once per
+operation whatever the outcome, and **never overrides a no-op** — an exact retry succeeds
+even when the world has moved, and a lever that broke that would be reviewing behaviour
+the server does not have.
+
+> **Still not built, and not part of 3E:** the readiness ENGINE (§15 step 3 — the seam
+> still fails closed), the Billing tab (step 7), invoices and receivables (§8), and owner
+> approval of commercial terms. Nothing in this repo records that an owner agreed to a
+> price.
 
 ## The Onboarding Projection — spec §15 step 2C, READ ONLY
 
@@ -865,7 +1063,11 @@ how a screen starts disagreeing with itself.
 
 **THERE ARE NO ONBOARDING WRITES IN THIS REPO.** No adopt, no attest, no invite, no
 reissue, no cancel, no owner reassignment, no restaurant creation — and no disabled
-buttons standing in for them. A test asserts Overview ships zero `<button>` elements.
+buttons standing in for them. This claim used to rest on Overview shipping ZERO buttons,
+which stopped being true at 3E.2. It now rests on something sharper: a test pins the tab's
+EXACT control set for each commercial state (`['Change', 'Change', 'Record terms']` with
+no open terms, `['Change', 'Change', 'Replace terms', 'End terms']` with them) and asserts
+every onboarding verb is absent from the rendered text.
 
 ## The Error Classifier — one place, four cases
 
@@ -1099,11 +1301,21 @@ reinvents them.
 - **Relative time anchors on `server_time`**, passed in as a REQUIRED argument so a
   caller with no anchor shows an absolute time rather than silently using the
   browser's clock.
+- **`eatWallTimeToIso` is the WRITE direction, and is the only way a form may turn an
+  operator's typed moment into a wire value.** A `datetime-local` value is naive, and
+  `new Date('2026-08-25T15:00').toISOString()` reads it in the BROWSER'S zone — so an
+  administrator in London sends 12:00 EAT when they typed 15:00. The backend refuses naive
+  timestamps, which means the defect never arrives as a 400: it arrives as a well-formed
+  request recording the wrong instant. The helper derives Africa/Kampala's offset from
+  `Intl` rather than hardcoding `+03:00` (the zone has no DST today, but a formatter that
+  asserts that forever is a formatter that will one day be wrong), and returns `null` for
+  an incomplete value rather than guessing — the caller renders a field error instead of
+  sending a moment nobody stated.
 
 ## Mock Mode — how the founder reviews this work
 
 **TWO PORTS, TWO MOCKS.** The auth transport sits behind `ADMIN_AUTH` and the restaurant
-reads behind `RESTAURANT_API`. `npm start` (the default `development` serve
+reads AND WRITES behind `RESTAURANT_API`. `npm start` (the default `development` serve
 configuration) resolves both to their mocks, so **the complete shell, all five
 destinations, the real restaurant directory, the restaurant workspace and the dev-only
 primitives gallery (`/__gallery`) render with NO backend running.** This is how the
@@ -1111,9 +1323,9 @@ visual direction gets reviewed, and it is how the §16 brand-red decision will a
 made.
 
 Only the TRANSPORTS are mocked. `AdminAuthService`, the login component, both
-interceptors, the elevation queue, the directory page, the workspace store, the labels
-and the formatting are the same code in both modes, so what gets reviewed is the real
-flow.
+interceptors, the elevation queue, the directory page, the workspace store, the five
+commercial editors, the labels and the formatting are the same code in both modes, so
+what gets reviewed is the real flow.
 
 **A MOCK IS NEVER A FALLBACK.** It is chosen at build time by `DEV_PROVIDERS`, never
 reached for when a request fails. A control plane that quietly substitutes fixtures for

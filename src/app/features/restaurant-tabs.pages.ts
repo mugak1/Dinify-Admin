@@ -77,6 +77,49 @@ const TERM = 'text-admin-label text-ink-muted';
 const DEFINITION = 'text-admin-body text-ink';
 
 /**
+ * A commercial row that CARRIES CONTROLS, and the reason it is not the plain row above.
+ *
+ * ── WHY THESE WRAP ────────────────────────────────────────────────────────────────
+ *
+ * A consequential action must never exist in the DOM while being unreachable. Live UAT
+ * at ~814px found exactly that: `End terms` laid out 4px past its card's right edge,
+ * painted under the neighbouring card, with no horizontal scrollbar to reach it and
+ * `elementFromPoint` at its centre returning something else entirely. A ref-targeted
+ * click would have "worked" and proved nothing — the operator still could not press it.
+ *
+ * The cause was a single unwrappable line. `flex` with no `flex-wrap` keeps a label, a
+ * value and two buttons on one row at any width, and Tailwind's grid columns are
+ * `minmax(0, 1fr)`, so the column will not grow to contain them — the surplus simply
+ * overflows the card. Moving the card grid to `lg` gave these rows enough room for
+ * today's strings; WRAPPING is what stops the defect recurring the next time a value,
+ * a currency code or a control label gets longer.
+ *
+ * ── AND WHY DENSITY SURVIVES ──────────────────────────────────────────────────────
+ *
+ * The two service-axis rows fit on one line at every width from 768px upward, before
+ * and after. The terms row does not, and did not: its value carries two metadata lines,
+ * so at a half-width card it already broke across two lines at wide desktop — the old
+ * code got there by SHRINKING the `dd` below its content, this one by wrapping it.
+ * Measured in Chromium at 1280px and 1500px, the panel height, the row height and the
+ * value block are identical to the pixel either way.
+ *
+ * What actually changed is only what happens once the row runs out of room: it used to
+ * overflow the card and strand whatever fell outside, and now it wraps inside it.
+ */
+const COMMERCIAL_ROW = 'flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1.5';
+
+/**
+ * The value-and-actions half of such a row.
+ *
+ * `grow` is what keeps the wide layout unchanged: the `dd` fills the space left by its
+ * term and `justify-end` pins its contents to the right, exactly as `justify-between`
+ * did. On a wrapped line it becomes full width and stays right-aligned rather than
+ * drifting to the start.
+ */
+const COMMERCIAL_ACTIONS =
+  'flex grow flex-wrap items-baseline justify-end gap-x-3 gap-y-1.5 text-right';
+
+/**
  * The same row, for a value an operator has to look at.
  *
  * §16's warning hue means "careful", not "broken", and there is deliberately no
@@ -244,7 +287,20 @@ function readStatus(error: unknown): number | null {
           </section>
         }
 
-        <div class="grid gap-4 md:grid-cols-2">
+        <!-- TWO COLUMNS AT lg, NOT md — measured, not guessed.
+
+             At md (768px) each card is 236px wide, and a Commercial row is a label, a
+             value and up to two controls. Live UAT at ~814px found End terms rendered
+             4px past the card's right edge, painted under the neighbouring card and not
+             hit-testable: an action present in the DOM that an operator could not
+             reach. Sweeping the range showed the whole 768-949px band affected, and at
+             768px even a single 69px Change button did not fit.
+
+             lg (1024px) is the first breakpoint where two cards each hold a full
+             commercial row with room to spare. Below it the cards go full width, which
+             is more space than they have today at any point in that band. Wide-desktop
+             density is untouched: at 1280px and above this renders exactly as before. -->
+        <div class="grid gap-4 lg:grid-cols-2">
           <!-- B. OWNER ─────────────────────────────────────────────────────────────
                WHO the owner is: identity, contact and account state. Nothing about
                claims, control or invitations.
@@ -402,9 +458,9 @@ function readStatus(error: unknown): number | null {
                    projection — a write is real once its audit row commits, and a row
                    that moved early has told the operator something that may not be
                    true. -->
-              <div class="flex items-baseline justify-between gap-4">
+              <div [class]="commercialRow">
                 <dt [class]="term">Payment timing</dt>
-                <dd class="flex items-baseline justify-end gap-3 text-right">
+                <dd [class]="commercialActions">
                   <span [class]="definition" data-axis-value="payment_timing">{{
                     paymentTiming()
                   }}</span>
@@ -425,9 +481,9 @@ function readStatus(error: unknown): number | null {
               <!-- WHO initiates the payment. A custody fact, independent of the row
                    above — the two axes are separate decisions with separate lifetimes,
                    and each has its own control for exactly that reason. -->
-              <div class="flex items-baseline justify-between gap-4">
+              <div [class]="commercialRow">
                 <dt [class]="term">Collection mode</dt>
-                <dd class="flex items-baseline justify-end gap-3 text-right">
+                <dd [class]="commercialActions">
                   <span [class]="definition" data-axis-value="payment_collection_mode">{{
                     collectionMode()
                   }}</span>
@@ -458,9 +514,9 @@ function readStatus(error: unknown): number | null {
                    "Not configured": the server did not answer, so this screen does not
                    know whether terms are open, and a control that guesses is a control
                    that acts on a guess. -->
-              <div class="flex items-baseline justify-between gap-4">
+              <div [class]="commercialRow">
                 <dt [class]="term">Subscription terms</dt>
-                <dd class="flex items-baseline justify-end gap-3 text-right">
+                <dd [class]="commercialActions">
                   <span [class]="definition">
                     <span class="block" data-terms-value>{{ subscriptionTerms() }}</span>
                     @if (termsEffectiveFrom(); as when) {
@@ -760,6 +816,8 @@ export class RestaurantOverviewTab {
   protected readonly restaurant = this.workspace.detail;
 
   protected readonly panel = PANEL;
+  protected readonly commercialRow = COMMERCIAL_ROW;
+  protected readonly commercialActions = COMMERCIAL_ACTIONS;
   protected readonly term = TERM;
   protected readonly definition = DEFINITION;
   protected readonly definitionNotable = DEFINITION_NOTABLE;

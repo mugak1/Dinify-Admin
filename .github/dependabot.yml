@@ -33,9 +33,18 @@ updates:
       interval: weekly
     open-pull-requests-limit: 0
 
-    # One pull request for the whole Angular toolchain instead of one per
-    # package. #635 proved the failure mode: eight @angular packages moved
-    # while the compiler, CLI, CDK and TypeScript stayed behind.
+    # Consolidate the Angular toolchain's security updates into ONE pull
+    # request instead of one per package.
+    #
+    # What grouping does and does not do, because the distinction matters:
+    # it collects the updates that are ALREADY eligible into a single PR. It
+    # does not force a matching version onto a package that has no advisory
+    # of its own, so a grouped PR can still move a subset. Within a major
+    # that is fine and correct — Angular's own peer ranges accept patch skew
+    # across v22, and a security patch should move what is vulnerable.
+    # Across a major it is exactly what broke #635, and the thing that
+    # prevents it is the `ignore` block below, NOT this group. Do not read
+    # these patterns as a version-alignment guarantee.
     #
     # `applies-to: security-updates` is load-bearing. A group defaults to
     # version updates, which are disabled immediately above, so without this
@@ -73,6 +82,19 @@ updates:
       - dependency-name: "typescript"
         update-types: ["version-update:semver-major"]
       - dependency-name: "typescript-eslint"
+        update-types: ["version-update:semver-major"]
+      # eslint itself, and its @eslint/js config package, are ignored for the
+      # same reason as the two lint-toolchain entries above — and more sharply,
+      # because they are what those two peer-depend ON. Ignoring a dependent's major while allowing
+      # its dependency's major is backwards. Measured on the installed trees:
+      # angular-eslint 22.2.0 peers eslint "^9.0.0 || ^10.0.0" and
+      # typescript-eslint 8.69.0 peers "^8.57.0 || ^9.0.0 || ^10.0.0", so both
+      # stop at ESLint 10. An ESLint 11 security bump arriving alone would not
+      # merely be untested — with the plain `npm ci` of DEPS-HYGIENE-01 it is an
+      # ERESOLVE at install, i.e. a PR that cannot even build.
+      - dependency-name: "eslint"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@eslint/*"
         update-types: ["version-update:semver-major"]
 
   # ---------------------------------------------------------------------

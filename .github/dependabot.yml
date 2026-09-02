@@ -1,0 +1,69 @@
+# Dependabot configuration — DEPENDABOT-01
+#
+# This file is kept BYTE-IDENTICAL in Dinify-Frontend and Dinify-Admin.
+# Change it in one repo and port it to the other in the same breath.
+#
+# Neither repo had a dependabot.yml before this one, and that is why #635
+# happened the way it did: version updates are enabled BY committing this
+# file, so they were never on, and every Dependabot PR either repo has ever
+# received — #635 included — arrived as a SECURITY update. Security updates
+# are switched on by a repository setting rather than by this file, so
+# nothing here enables or disables them. It only shapes the pull requests
+# they open.
+
+version: 2
+updates:
+  # ---------------------------------------------------------------------
+  # npm — security updates only
+  # ---------------------------------------------------------------------
+  # No routine dependency-bump noise: `open-pull-requests-limit: 0` disables
+  # version updates for this ecosystem. Security update pull requests are
+  # explicitly not subject to that limit and do not count toward it, so they
+  # keep arriving exactly as they do today.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+
+    # One pull request for the whole Angular toolchain instead of one per
+    # package. #635 proved the failure mode: eight @angular packages moved
+    # while the compiler, CLI, CDK and TypeScript stayed behind.
+    #
+    # `applies-to: security-updates` is load-bearing. A group defaults to
+    # version updates, which are disabled immediately above, so without this
+    # line the whole group would be dead config that never fires.
+    groups:
+      angular-security:
+        applies-to: security-updates
+        patterns:
+          - "@angular/*"
+          - "@angular-eslint/*"
+          - "angular-eslint"
+          - "eslint"
+          - "@eslint/*"
+          - "typescript"
+          - "typescript-eslint"
+          - "zone.js"
+
+    # Dependabot must never attempt a major in the Angular toolchain. #635
+    # bumped eight @angular packages to 22 and left compiler/CLI/CDK/TypeScript
+    # at 21 — a tree that installs but cannot compile. Angular majors cascade
+    # (TS, typescript-eslint, ESLint flat config, Node) and require `ng update`
+    # with its migrations; a version bump alone is never the upgrade.
+    # Consequence, accepted deliberately: a security fix available only across
+    # a major surfaces as an alert + a red audit run, not a PR. That is the
+    # trigger for a manual ng update.
+    # NOTE: zone.js is 0.x, so semver-major cannot bind on it (0.15 → 0.16
+    # reads as a minor). Not worth a minor-ignore; Angular pins its range.
+    ignore:
+      - dependency-name: "@angular/*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "angular-eslint"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@angular-eslint/*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "typescript-eslint"
+        update-types: ["version-update:semver-major"]

@@ -3,6 +3,13 @@
 # This file is kept BYTE-IDENTICAL in Dinify-Frontend and Dinify-Admin.
 # Change it in one repo and port it to the other in the same breath.
 #
+# Two ecosystems, deliberately configured in OPPOSITE directions:
+#
+#   npm             — security updates only, grouped, Angular majors forbidden
+#   github-actions  — version updates ON, grouped weekly, majors welcome
+#
+# The asymmetry is the whole design; the rationale sits above each block.
+#
 # Neither repo had a dependabot.yml before this one, and that is why #635
 # happened the way it did: version updates are enabled BY committing this
 # file, so they were never on, and every Dependabot PR either repo has ever
@@ -67,3 +74,23 @@ updates:
         update-types: ["version-update:semver-major"]
       - dependency-name: "typescript-eslint"
         update-types: ["version-update:semver-major"]
+
+  # ---------------------------------------------------------------------
+  # GitHub Actions — version updates ON
+  # ---------------------------------------------------------------------
+  # GitHub Actions. Deliberately NOT configured like the npm block above.
+  # Admin SHA-pins five actions on the privileged deploy path (id-token: write,
+  # AWS OIDC). SHA pins are immutable — without version updates they freeze
+  # permanently, which is strictly worse than tag-pinning: the control stays,
+  # the code goes stale. So version updates stay ON here, grouped into one
+  # weekly PR. No major-ignore: action majors are routine and carry none of the
+  # cascading coupling that makes Angular majors dangerous.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns:
+          - "*"

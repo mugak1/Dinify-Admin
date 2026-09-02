@@ -1,0 +1,119 @@
+# Dependabot configuration — DEPENDABOT-01
+#
+# This file is kept BYTE-IDENTICAL in Dinify-Frontend and Dinify-Admin.
+# Change it in one repo and port it to the other in the same breath.
+#
+# Two ecosystems, deliberately configured in OPPOSITE directions:
+#
+#   npm             — security updates only, grouped, Angular majors forbidden
+#   github-actions  — version updates ON, grouped weekly, majors welcome
+#
+# The asymmetry is the whole design; the rationale sits above each block.
+#
+# Neither repo had a dependabot.yml before this one, and that is why #635
+# happened the way it did: version updates are enabled BY committing this
+# file, so they were never on, and every Dependabot PR either repo has ever
+# received — #635 included — arrived as a SECURITY update. Security updates
+# are switched on by a repository setting rather than by this file, so
+# nothing here enables or disables them. It only shapes the pull requests
+# they open.
+
+version: 2
+updates:
+  # ---------------------------------------------------------------------
+  # npm — security updates only
+  # ---------------------------------------------------------------------
+  # No routine dependency-bump noise: `open-pull-requests-limit: 0` disables
+  # version updates for this ecosystem. Security update pull requests are
+  # explicitly not subject to that limit and do not count toward it, so they
+  # keep arriving exactly as they do today.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+
+    # Consolidate the Angular toolchain's security updates into ONE pull
+    # request instead of one per package.
+    #
+    # What grouping does and does not do, because the distinction matters:
+    # it collects the updates that are ALREADY eligible into a single PR. It
+    # does not force a matching version onto a package that has no advisory
+    # of its own, so a grouped PR can still move a subset. Within a major
+    # that is fine and correct — Angular's own peer ranges accept patch skew
+    # across v22, and a security patch should move what is vulnerable.
+    # Across a major it is exactly what broke #635, and the thing that
+    # prevents it is the `ignore` block below, NOT this group. Do not read
+    # these patterns as a version-alignment guarantee.
+    #
+    # `applies-to: security-updates` is load-bearing. A group defaults to
+    # version updates, which are disabled immediately above, so without this
+    # line the whole group would be dead config that never fires.
+    groups:
+      angular-security:
+        applies-to: security-updates
+        patterns:
+          - "@angular/*"
+          - "@angular-eslint/*"
+          - "angular-eslint"
+          - "eslint"
+          - "@eslint/*"
+          - "typescript"
+          - "typescript-eslint"
+          - "zone.js"
+
+    # Dependabot must never attempt a major in the Angular toolchain. #635
+    # bumped eight @angular packages to 22 and left compiler/CLI/CDK/TypeScript
+    # at 21 — a tree that installs but cannot compile. Angular majors cascade
+    # (TS, typescript-eslint, ESLint flat config, Node) and require `ng update`
+    # with its migrations; a version bump alone is never the upgrade.
+    # Consequence, accepted deliberately: a security fix available only across
+    # a major surfaces as an alert + a red audit run, not a PR. That is the
+    # trigger for a manual ng update.
+    # NOTE: zone.js is 0.x, so semver-major cannot bind on it (0.15 → 0.16
+    # reads as a minor). Not worth a minor-ignore; Angular pins its range.
+    ignore:
+      - dependency-name: "@angular/*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "angular-eslint"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@angular-eslint/*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "typescript-eslint"
+        update-types: ["version-update:semver-major"]
+      # eslint itself, and its @eslint/js config package, are ignored for the
+      # same reason as the two lint-toolchain entries above — and more sharply,
+      # because they are what those two peer-depend ON. Ignoring a dependent's
+      # major while allowing its dependency's major is backwards. Measured on
+      # the installed trees: angular-eslint 22.2.0 peers eslint
+      # "^9.0.0 || ^10.0.0", and typescript-eslint 8.69.0 peers
+      # "^8.57.0 || ^9.0.0 || ^10.0.0", so both stop at ESLint 10. An ESLint 11
+      # security bump arriving alone would not merely be untested — with the
+      # plain `npm ci` of DEPS-HYGIENE-01 it is an ERESOLVE at install, i.e. a
+      # PR that cannot even build.
+      - dependency-name: "eslint"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@eslint/*"
+        update-types: ["version-update:semver-major"]
+
+  # ---------------------------------------------------------------------
+  # GitHub Actions — version updates ON
+  # ---------------------------------------------------------------------
+  # GitHub Actions. Deliberately NOT configured like the npm block above.
+  # Admin SHA-pins five actions on the privileged deploy path (id-token: write,
+  # AWS OIDC). SHA pins are immutable — without version updates they freeze
+  # permanently, which is strictly worse than tag-pinning: the control stays,
+  # the code goes stale. So version updates stay ON here, grouped into one
+  # weekly PR. No major-ignore: action majors are routine and carry none of the
+  # cascading coupling that makes Angular majors dangerous.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns:
+          - "*"

@@ -411,6 +411,11 @@ const ACTION_LABELS: Record<string, string> = {
   'admin.delegation.action_denied': 'Action refused in a delegated session',
   'admin.restaurant.lifecycle_transition': 'Lifecycle changed',
   'admin.restaurant.transition_denied': 'Lifecycle change refused',
+  // Step 2G. ONE action for the whole creation decision, however many rows it wrote;
+  // `reissued`, never `resent` — nothing was delivered, a credential was rotated.
+  'admin.restaurant.created': 'Restaurant created',
+  'admin.restaurant.owner_invitation_reissued': 'Owner claim code reissued',
+  'admin.restaurant.owner_invitation_cancelled': 'Owner invitation cancelled',
 };
 
 export function activityActionLabel(action: string): string {
@@ -611,8 +616,15 @@ const OWNER_INVITATION_LABELS: Record<OwnerInvitationStatus, string> = {
   // domain. This one is load-bearing truth, not a nicety.
   not_applicable: 'Not applicable',
   not_issued: 'Not issued',
+  // NEVER "Sent" or "Delivered". Nothing was sent: a claim code was issued to an
+  // operator, who hands it over out of band. Pending means the owner has not redeemed
+  // it yet — and says nothing about whether they have received it.
   pending: 'Pending',
   expired: 'Expired',
+  // The claim's guess budget is spent (backend Step 2F.2). Its own words rather than a
+  // flavour of Expired: the remedy is the same, the cause is not, and "expired" on a
+  // code issued this morning reads as a clock problem when it is a security event.
+  verification_locked: 'Verification locked',
   consumed: 'Redeemed',
   cancelled: 'Cancelled',
   superseded: 'Superseded',
@@ -623,12 +635,47 @@ export function ownerInvitationLabel(status: OwnerInvitationStatus): string {
 }
 
 /**
- * An expired invitation is the one state an operator has to do something about — the
- * owner cannot act on it and nothing will re-issue it on its own. Pending is waiting,
- * not failing; cancelled and superseded were deliberate.
+ * The two states an operator has to do something about — the owner cannot act on
+ * either, and nothing will reissue on its own. Pending is waiting, not failing;
+ * cancelled and superseded were deliberate; redeemed is done.
  */
 export function ownerInvitationIsNotable(status: OwnerInvitationStatus): boolean {
-  return status === 'expired';
+  return status === 'expired' || status === 'verification_locked';
+}
+
+/**
+ * The sentence an invitation state needs beyond its label, or null.
+ *
+ * EVERY SENTENCE IS EVIDENCE-BASED AND DELIVERY-FREE. None of them says sent,
+ * delivered, resent, emailed or texted, because the platform does none of those
+ * things: a claim code is ISSUED to the operator and handed to the owner out of band.
+ * "Redeemed" states that A code was redeemed and deliberately not that the CURRENT
+ * owner redeemed it — that is the owner-control axis's question, and an invitation
+ * consumed by a previous owner reads `consumed` beside `not_established`.
+ */
+export function ownerInvitationNote(status: OwnerInvitationStatus): string | null {
+  switch (status) {
+    case 'not_issued':
+      return 'No claim code has been issued for this restaurant.';
+    case 'pending':
+      return 'Waiting for the owner to enter the claim code in the restaurant portal.';
+    case 'expired':
+      return 'This claim code can no longer be redeemed. Reissue a new one for the owner to use.';
+    case 'verification_locked':
+      return (
+        'Too many failed verification attempts were made against this claim code, so it can ' +
+        'no longer be redeemed. Reissue a new one.'
+      );
+    case 'consumed':
+      return 'This claim code was redeemed.';
+    case 'cancelled':
+      return 'This claim code was withdrawn and cannot be redeemed. Reissuing mints a new one.';
+    case 'superseded':
+      return 'This claim code was replaced by a later one.';
+    default:
+      // `not_applicable` and `unavailable` are explained at panel level.
+      return null;
+  }
 }
 
 // --- shared ------------------------------------------------------------------

@@ -9,9 +9,11 @@
 #   1. type-check          (tsc --noEmit)
 #   2. lint                (eslint .)
 #   3. design-token gate   (--self-test, then the real scan — fail fast)
-#   4. test                (ng test, headless single run)
-#   5. build:prod          (ng build --configuration=production)
-#   6. mock-isolation gate (scans the build output from step 5)
+#   4. claim-code gate     (--self-test, then the real scan — a raw owner claim code
+#                           reaches no storage, log, URL, store or fabricated link)
+#   5. test                (ng test, headless single run)
+#   6. build:prod          (ng build --configuration=production)
+#   7. mock-isolation gate (scans the build output from step 6)
 #
 # There is no `/dinify-check` for this repo — that command is backend-only. CI is the
 # gate; this is the local mirror of it.
@@ -45,6 +47,7 @@ run_step() {
 run_step "type-check"          npm run type-check
 run_step "lint"                npm run lint
 run_step "design-token gate"   npm run check:tokens
+run_step "claim-code gate"     npm run check:claim-code
 run_step "test"                npm run test:ci
 run_step "build:prod"          npm run build:prod
 # Deliberately last: it reads dist/, which the step above produces.

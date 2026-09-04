@@ -93,6 +93,44 @@ export function extractFieldErrors(error: unknown): Record<string, readonly stri
   return out;
 }
 
+/**
+ * The server's per-field validation errors for a NESTED request body, keyed by dotted
+ * path.
+ *
+ * The creation endpoint's body is nested — `{restaurant: {…}, owner: {…}, reason}` —
+ * and DRF nests its errors the same way: `{"owner": {"phone_number": ["…"]}}`. The
+ * backend deliberately shapes a DOMAIN refusal on the same field identically, so one
+ * field never has two error shapes depending on which layer refused it. This reader
+ * flattens that tree to `owner.phone_number` so a form can hang each message on the
+ * control it names; a top-level list (`reason`, `__all__`) keeps its plain key, so for
+ * a flat body it agrees exactly with `extractFieldErrors`.
+ *
+ * Kept separate from `extractFieldErrors` rather than folded into it: the flat reader
+ * is what the commercial forms assert against, and widening its output keys would
+ * silently change what those specs pin.
+ */
+export function extractNestedFieldErrors(error: unknown): Record<string, readonly string[]> {
+  const body = unwrap(error);
+  if (!isRecord(body)) return {};
+  const errors = body['errors'];
+  if (!isRecord(errors)) return {};
+
+  const out: Record<string, readonly string[]> = {};
+  const walk = (node: Record<string, unknown>, prefix: string): void => {
+    for (const [field, value] of Object.entries(node)) {
+      const path = prefix ? `${prefix}.${field}` : field;
+      if (isRecord(value)) {
+        walk(value, path);
+        continue;
+      }
+      const messages = toMessages(value);
+      if (messages.length) out[path] = messages;
+    }
+  };
+  walk(errors, '');
+  return out;
+}
+
 /** One field's errors as a flat string list. DRF sends `string | string[]`. */
 function toMessages(value: unknown): readonly string[] {
   if (typeof value === 'string') {

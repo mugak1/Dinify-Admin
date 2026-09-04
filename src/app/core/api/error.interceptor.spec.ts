@@ -442,6 +442,88 @@ describe('errorClassifierInterceptor', () => {
       replay.flush({ status: 200, data: { changed: true, commercial: {} } });
     });
 
+    it('replays a RESTAURANT CREATION with its is_test boolean and its owner block intact', () => {
+      // Step 2G. Creation is elevation-gated, so the FIRST creation an operator makes
+      // in a while is refused with 403 and replayed after the TOTP prompt. Two facts in
+      // that body must survive the round trip untouched: `is_test`, which the backend
+      // accepts ONLY as a JSON boolean (a rebuilt body that coerced it to `"false"`
+      // would be a 400 after re-authentication), and the owner block, whose keys are
+      // read by the server as the claims the caller made — a rebuild that added a stray
+      // `user_id: ""` beside `mode: "new"` would be refused for the key alone.
+      const route = apiUrl('/restaurants/');
+      const original = {
+        restaurant: { name: 'Speke Road Cafe', location: 'Kampala', is_test: false },
+        owner: {
+          mode: 'new',
+          first_name: 'Miriam',
+          last_name: 'Nakato',
+          phone_number: '0772140388',
+          email: null,
+        },
+        reason: 'Signed pilot agreement, March cohort',
+      };
+
+      let result: unknown = null;
+      http.post(route, original).subscribe((response) => (result = response));
+
+      backend
+        .expectOne(route)
+        .flush({ detail: ELEVATION_REQUIRED_DETAIL }, { status: 403, statusText: 'Forbidden' });
+      expect(elevation.requests).toBe(1);
+      elevation.succeed();
+
+      const replay = backend.expectOne(route);
+      expect(replay.request.method).toBe('POST');
+      expect(replay.request.body).toEqual(original);
+      const wire = JSON.stringify(replay.request.body);
+      expect(wire).toContain('"is_test":false');
+      expect(wire).toContain('"email":null');
+      expect(Object.keys((replay.request.body as { owner: object }).owner)).toEqual([
+        'mode',
+        'first_name',
+        'last_name',
+        'phone_number',
+        'email',
+      ]);
+      // The claim token rides the 201 and is handed to the caller exactly once. The
+      // interceptor neither reads it nor keeps it.
+      const created = {
+        status: 201,
+        message: 'Restaurant created.',
+        data: { owner_invitation: { claim_token: 'raw-claim-code' } },
+      };
+      replay.flush(created, { status: 201, statusText: 'Created' });
+      expect(result).toEqual(created);
+      expect(defects.current()).toBeNull();
+    });
+
+    it('replays an OWNER-INVITATION write with the invitation id the operator reviewed', () => {
+      // `expected_invitation_id` asserts IDENTITY — "the invitation I reviewed is still
+      // the head" — and it is captured when the operator opens the action, before the
+      // TOTP prompt. Another operator can reissue during that prompt; a replay that
+      // re-read "the current invitation" would then act on a credential nobody looked
+      // at, which is exactly the stale-screen overwrite the token exists to stop.
+      const route = apiUrl('/restaurants/abc/owner-invitation/reissue/');
+      const original = {
+        expected_invitation_id: '4d5e6f70-8192-4a3b-9c4d-000000000001',
+        reason: 'Owner lost the original code',
+      };
+
+      http.post(route, original).subscribe();
+
+      backend
+        .expectOne(route)
+        .flush({ detail: ELEVATION_REQUIRED_DETAIL }, { status: 403, statusText: 'Forbidden' });
+      elevation.succeed();
+
+      const replay = backend.expectOne(route);
+      expect(replay.request.body).toEqual(original);
+      expect(JSON.stringify(replay.request.body)).toContain(
+        '"expected_invitation_id":"4d5e6f70-8192-4a3b-9c4d-000000000001"',
+      );
+      replay.flush({ status: 200, data: { changed: true, onboarding: {}, owner_invitation: {} } });
+    });
+
     it('opens ONE prompt for concurrent refusals and replays them all', () => {
       const done: string[] = [];
       http.post(apiUrl('/a/'), {}).subscribe(() => done.push('a'));

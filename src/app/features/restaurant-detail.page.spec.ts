@@ -1,4 +1,4 @@
-import { TestBed, fakeAsync, flush, tick } from '@angular/core/testing';
+import { TestBed, fakeAsync, flush, flushMicrotasks, tick } from '@angular/core/testing';
 import {
   Router,
   provideRouter,
@@ -21,6 +21,11 @@ import {
   CommercialSummary,
   EndSubscriptionTermsRequest,
   OnboardingSummary,
+  OwnerInvitationCancelResult,
+  OwnerInvitationProjection,
+  OwnerInvitationReissueResult,
+  OwnerInvitationRequest,
+  OwnerInvitationStatus,
   PaymentCollectionMode,
   PaymentTiming,
   RecordSubscriptionTermsRequest,
@@ -31,11 +36,11 @@ import {
   SetPaymentTimingRequest,
 } from '../core/restaurants/restaurant.model';
 import { RestaurantDetailPage } from './restaurant-detail.page';
+import { RestaurantReadinessTab } from './restaurant-readiness.tab';
 import {
   RestaurantActivityTab,
   RestaurantBillingTab,
   RestaurantOverviewTab,
-  RestaurantReadinessTab,
   RestaurantSupportTab,
 } from './restaurant-tabs.pages';
 
@@ -73,9 +78,44 @@ function onboarding(overrides: Partial<OnboardingSummary> = {}): OnboardingSumma
     recorded_at: '2026-08-22T09:14:33+03:00',
     owner_relationship: { status: 'consistent' },
     owner_control: { status: 'not_established', evidence: null, evidence_at: null },
-    invitation: { status: 'not_applicable' },
+    invitation: invitation('not_applicable'),
     ...overrides,
   };
+}
+
+/** The head invitation's identity and window, as the Step 2E read publishes them. */
+const HEAD_ID = '4d5e6f70-8192-4a3b-9c4d-000000000001';
+const NEW_HEAD_ID = '4d5e6f70-8192-4a3b-9c4d-000000000002';
+const ISSUED_AT = '2026-08-20T10:00:00+03:00';
+const EXPIRES_AT = '2026-08-27T10:00:00+03:00';
+const NEW_ISSUED_AT = '2026-08-25T09:00:00+03:00';
+const NEW_EXPIRES_AT = '2026-09-01T09:00:00+03:00';
+/** A raw claim code, shaped like `secrets.token_urlsafe(48)` — 64 base64url characters. */
+const TOKEN = 'Zx9AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AbCdEfGhIjKlMnOpQrStUvWxYz0';
+
+/**
+ * The invitation axis, built the way the SERVER builds it: the three metadata keys are
+ * PRESENT AND NULL where no invitation exists (`not_issued`, `not_applicable`,
+ * `unavailable`), and carry the head's handle and window everywhere else. A spec that
+ * wrote `{ status: 'pending' }` alone would be asserting against a payload the backend
+ * cannot emit — the id is what every write must name.
+ */
+function invitation(
+  status: OwnerInvitationStatus,
+  overrides: Partial<OwnerInvitationProjection> = {},
+): OwnerInvitationProjection {
+  const absent = status === 'not_issued' || status === 'not_applicable' || status === 'unavailable';
+  return absent
+    ? { status, id: null, issued_at: null, expires_at: null, ...overrides }
+    : { status, id: HEAD_ID, issued_at: ISSUED_AT, expires_at: EXPIRES_AT, ...overrides };
+}
+
+/** An admin-created restaurant's onboarding record, with its invitation in `status`. */
+function adminOnboarding(
+  status: OwnerInvitationStatus,
+  overrides: Partial<OnboardingSummary> = {},
+): OnboardingSummary {
+  return onboarding({ source: 'admin_created', invitation: invitation(status), ...overrides });
 }
 
 /** The domain has no record of this restaurant. Every question unevaluated. */
@@ -85,7 +125,7 @@ const UNTRACKED: OnboardingSummary = {
   recorded_at: null,
   owner_relationship: { status: 'unavailable' },
   owner_control: { status: 'unavailable', evidence: null, evidence_at: null },
-  invitation: { status: 'unavailable' },
+  invitation: invitation('unavailable'),
 };
 
 /**
@@ -215,6 +255,38 @@ interface RecordedWrite {
   readonly body: Record<string, unknown>;
 }
 
+/** One recorded OWNER-INVITATION write — reissue or cancel — with its exact body. */
+interface RecordedInvitationWrite {
+  readonly operation: 'reissue' | 'cancel';
+  readonly restaurantId: string;
+  readonly body: Record<string, unknown>;
+}
+
+/** A successful reissue: the head moved to a NEW pending invitation, and the code rides beside it. */
+function reissued(): OwnerInvitationReissueResult {
+  return {
+    changed: true,
+    onboarding: adminOnboarding('pending', {
+      invitation: invitation('pending', {
+        id: NEW_HEAD_ID,
+        issued_at: NEW_ISSUED_AT,
+        expires_at: NEW_EXPIRES_AT,
+      }),
+    }),
+    owner_invitation: {
+      id: NEW_HEAD_ID,
+      issued_at: NEW_ISSUED_AT,
+      expires_at: NEW_EXPIRES_AT,
+      claim_token: TOKEN,
+    },
+  };
+}
+
+/** A cancellation: the SAME head, stamped cancelled. `changed: false` is the exact retry. */
+function cancelled(changed: boolean): OwnerInvitationCancelResult {
+  return { changed, onboarding: adminOnboarding('cancelled') };
+}
+
 class StubApi implements RestaurantApi {
   detailCalls: string[] = [];
   answer: () => Observable<RestaurantDetail> = () => of(detail());
@@ -224,6 +296,33 @@ class StubApi implements RestaurantApi {
   /** How the next write answers. Defaults to a successful, changed mutation. */
   writeAnswer: () => Observable<CommercialMutationResult> = () =>
     of({ changed: true, commercial: commercial({ timing: 'pay_after' }) });
+
+  /** Every owner-invitation write attempted, in order. */
+  readonly invitationWrites: RecordedInvitationWrite[] = [];
+  reissueAnswer: () => Observable<OwnerInvitationReissueResult> = () => of(reissued());
+  cancelAnswer: () => Observable<OwnerInvitationCancelResult> = () => of(cancelled(true));
+
+  // CREATION IS NOT A WORKSPACE OPERATION. There is no restaurant yet for a workspace
+  // to be scoped to; `/restaurants/new` has its own screen and its own spec.
+  createRestaurant(): Observable<never> {
+    throw new Error('the workspace must not create a restaurant');
+  }
+
+  reissueOwnerInvitation(
+    restaurantId: string,
+    request: OwnerInvitationRequest,
+  ): Observable<OwnerInvitationReissueResult> {
+    this.invitationWrites.push({ operation: 'reissue', restaurantId, body: { ...request } });
+    return this.reissueAnswer();
+  }
+
+  cancelOwnerInvitation(
+    restaurantId: string,
+    request: OwnerInvitationRequest,
+  ): Observable<OwnerInvitationCancelResult> {
+    this.invitationWrites.push({ operation: 'cancel', restaurantId, body: { ...request } });
+    return this.cancelAnswer();
+  }
 
   list(): Observable<RestaurantDirectoryPage> {
     throw new Error('the workspace must not read the directory');
@@ -2566,6 +2665,7 @@ describe('RestaurantOverviewTab — onboarding', () => {
   let api: StubApi;
 
   beforeEach(() => {
+    loads = 0;
     api = new StubApi();
     TestBed.configureTestingModule({
       providers: [
@@ -2610,10 +2710,20 @@ describe('RestaurantOverviewTab — onboarding', () => {
     return panel('onboarding').textContent ?? '';
   }
 
+  /**
+   * Load one onboarding record into the workspace. A SECOND call in the same test
+   * navigates to a different `:id` under the same route — one harness per test is a
+   * `RouterTestingHarness` rule, and a same-URL navigation would be ignored — so the
+   * route-scoped store issues a fresh read for it. The fixture's own `id` stays `ID`,
+   * which is what every rendered link and identifier reads.
+   */
+  let loads = 0;
   async function loadedWith(record: OnboardingSummary, extra: Partial<RestaurantDetail> = {}) {
     api.answer = () => of(detail({ onboarding: record, ...extra }));
-    harness = await RouterTestingHarness.create();
-    await harness.navigateByUrl(`/restaurants/${ID}`, RestaurantDetailPage);
+    if (loads === 0) harness = await RouterTestingHarness.create();
+    loads += 1;
+    const routeId = loads === 1 ? ID : `${ID.slice(0, -4)}${String(loads).padStart(4, '0')}`;
+    await harness.navigateByUrl(`/restaurants/${routeId}`, RestaurantDetailPage);
     harness.detectChanges();
     tick();
     harness.detectChanges();
@@ -2869,6 +2979,7 @@ describe('RestaurantOverviewTab — onboarding', () => {
       ['not_issued', 'Not issued'],
       ['pending', 'Pending'],
       ['expired', 'Expired'],
+      ['verification_locked', 'Verification locked'],
       ['consumed', 'Redeemed'],
       ['cancelled', 'Cancelled'],
       ['superseded', 'Superseded'],
@@ -2876,9 +2987,7 @@ describe('RestaurantOverviewTab — onboarding', () => {
 
     for (const [status, label] of CASES) {
       it(`renders ${status} as "${label}"`, fakeAsync(async () => {
-        await loadedWith(
-          onboarding({ source: 'admin_created', invitation: { status } }),
-        );
+        await loadedWith(adminOnboarding(status));
 
         expect(rows()['Source']).toBe('Created by Dinify Admin');
         expect(rows()['Invitation']).toBe(label);
@@ -2901,9 +3010,7 @@ describe('RestaurantOverviewTab — onboarding', () => {
     }));
 
     it('reads an uninvited admin-created restaurant as Not issued', fakeAsync(async () => {
-      await loadedWith(
-        onboarding({ source: 'admin_created', invitation: { status: 'not_issued' } }),
-      );
+      await loadedWith(adminOnboarding('not_issued'));
 
       expect(rows()['Invitation']).toBe('Not issued');
       expect(rows()['Invitation']).not.toBe('Not applicable');
@@ -2911,19 +3018,60 @@ describe('RestaurantOverviewTab — onboarding', () => {
     }));
 
     it('says nothing about a pre-existing restaurant when one was created here', fakeAsync(async () => {
-      await loadedWith(onboarding({ source: 'admin_created', invitation: { status: 'pending' } }));
+      await loadedWith(adminOnboarding('pending'));
 
       expect(onboardingText()).not.toContain('existed before the Admin onboarding record');
       flush();
     }));
 
-    it('offers no invitation controls anywhere', fakeAsync(async () => {
-      await loadedWith(onboarding({ source: 'admin_created', invitation: { status: 'expired' } }));
+    it('offers no invitation CONTROLS on Overview — only the way to the Readiness tab', fakeAsync(async () => {
+      // SHARPENED at Step 2G. This asserted "no button, anchor, input or select at all"
+      // while the domain had no writes. It now has two, and they live on the Readiness
+      // tab (spec §14) — so Overview stays a READ, and what it may carry is exactly one
+      // anchor pointing there. The forbidden vocabulary is delivery language, which no
+      // screen in this repo uses: the note beside an expired invitation legitimately
+      // says "reissue", because that is the one thing an operator can do about it.
+      await loadedWith(adminOnboarding('expired'));
 
-      expect(panel('onboarding').querySelectorAll('button, a, input, select').length).toBe(0);
-      for (const fake of ['Resend', 'Re-issue', 'Reissue', 'Send invitation', 'Invite', 'Cancel invitation']) {
+      expect(panel('onboarding').querySelectorAll('button, input, select').length).toBe(0);
+      const anchors = Array.from(panel('onboarding').querySelectorAll('a'));
+      expect(anchors.length).toBe(1);
+      expect(anchors[0].getAttribute('href')).toBe(`/restaurants/${ID}/readiness`);
+      expect(anchors[0].textContent?.trim()).toBe('Manage the owner claim on Readiness');
+      for (const fake of ['Resend', 'Re-send', 'Send invitation', 'Sent', 'Delivered', 'Invite ', 'claim link']) {
         expect(text()).withContext(fake).not.toContain(fake);
       }
+      flush();
+    }));
+
+    it('offers that way in ONLY for an admin-created restaurant', fakeAsync(async () => {
+      // A legacy adoption has no invitation to manage, and an untracked tenant has
+      // nothing evaluated at all; a link that promised controls there would be a
+      // control that acts on a guess.
+      await loadedWith(onboarding({ source: 'legacy_adopted' }));
+      expect(panel('onboarding').querySelector('[data-onboarding-manage-claim]')).toBeNull();
+
+      await loadedWith(UNTRACKED);
+      expect(panel('onboarding').querySelector('[data-onboarding-manage-claim]')).toBeNull();
+
+      await loadedWith(adminOnboarding('not_issued'));
+      expect(panel('onboarding').querySelector('[data-onboarding-manage-claim]')).toBeTruthy();
+      flush();
+    }));
+
+    it('states the claim window beside an unresolved invitation, in EAT', fakeAsync(async () => {
+      await loadedWith(adminOnboarding('pending'));
+      expect(panel('onboarding').querySelector('[data-onboarding-invitation-window]')?.textContent?.trim())
+        .toBe('Claim window closes 10:00 EAT · 27 Aug 2026.');
+
+      await loadedWith(adminOnboarding('expired'));
+      expect(panel('onboarding').querySelector('[data-onboarding-invitation-window]')?.textContent?.trim())
+        .toBe('Claim window closed 10:00 EAT · 27 Aug 2026.');
+
+      // Resolved heads have no window to state — and NEVER a raw ISO string anywhere.
+      await loadedWith(adminOnboarding('consumed'));
+      expect(panel('onboarding').querySelector('[data-onboarding-invitation-window]')).toBeNull();
+      expect(onboardingText()).not.toContain('2026-08-27T');
       flush();
     }));
   });
@@ -2936,7 +3084,7 @@ describe('RestaurantOverviewTab — onboarding', () => {
         evidence: 'invitation_redeemed',
         evidence_at: '2026-07-14T16:05:00+03:00',
       },
-      invitation: { status: 'consumed' },
+      invitation: invitation('consumed'),
     });
 
     it('reads as Established, evidenced by the OWNER redeeming it, in EAT', fakeAsync(async () => {
@@ -3073,7 +3221,7 @@ describe('RestaurantOverviewTab — onboarding', () => {
   // ── EXACTLY FIVE COMMERCIAL WRITES, AND NO OTHERS ────────────────────────────────
 
   it('offers the commercial controls for the state it is in, and NOTHING else', fakeAsync(async () => {
-    await loadedWith(onboarding({ source: 'admin_created', invitation: { status: 'pending' } }));
+    await loadedWith(adminOnboarding('pending'));
 
     // This assertion was `toEqual([])` at Step 2C and `['Change', 'Change']` at 3E.2.
     // Each time the honest replacement has been a SHARPER check rather than a weaker
@@ -3081,6 +3229,10 @@ describe('RestaurantOverviewTab — onboarding', () => {
     //
     // THIS FIXTURE HAS NO OPEN TERMS, so the terms row offers Record and nothing else.
     // Replace and End would be two controls whose only possible outcome is a 409.
+    //
+    // Step 2G added the owner-invitation writes and put them on the READINESS tab, so
+    // this set is unchanged: Overview gained one ANCHOR to that tab (asserted in the
+    // onboarding specs above) and no button.
     const buttons = Array.from(el().querySelectorAll('button')).map((b) => b.textContent?.trim());
     expect(buttons).toEqual(['Change', 'Change', 'Record terms']);
     for (const fake of [
@@ -3169,4 +3321,837 @@ describe('RestaurantOverviewTab — onboarding', () => {
     expect(onboardingText()).not.toContain('GMT');
     flush();
   }));
+});
+
+/**
+ * THE OWNER CLAIM PANEL on the Readiness tab — spec §14, Step 2G.
+ *
+ * The operator side of the ownership chain: issue nothing (creation did that), REISSUE
+ * a claim code the owner lost, CANCEL one that should no longer work, and read the two
+ * axes the server keeps separate — owner control and invitation state. Five things
+ * these specs hold:
+ *
+ *   THE CONTROLS FOLLOW THE SERVER'S RULES. A button whose only possible outcome is a
+ *   409 is not a control; each state offers exactly what the domain would accept.
+ *
+ *   THE TOKEN IS THE INVITATION THE OPERATOR REVIEWED. `expected_invitation_id` is
+ *   captured when the action opens and is never re-read at submit — not from the store,
+ *   not from a reload — because "act on whatever is current" is the stale-screen
+ *   overwrite it exists to prevent.
+ *
+ *   THE RAW CODE LIVES IN THIS TAB AND NOWHERE ELSE. Not the store, not storage, not a
+ *   URL, not an anchor. Shown once, copyable, dismissed by Done, and LOST if the tab is
+ *   rebuilt — which the panel says, and repairs by reissuing again.
+ *
+ *   A 409 IS NEVER RETRIED, and no new decision is possible until the reload has landed.
+ *
+ *   A LOST ANSWER IS NOT A FAILURE. It is re-read, and what the re-read shows is stated.
+ */
+describe('RestaurantReadinessTab — owner claim', () => {
+  let harness: RouterTestingHarness;
+  let api: StubApi;
+  const REASON = 'Owner lost the original code';
+
+  beforeEach(() => {
+    loads = 0;
+    api = new StubApi();
+    TestBed.configureTestingModule({
+      providers: [
+        provideRouter(
+          [
+            {
+              path: 'restaurants/:id',
+              component: RestaurantDetailPage,
+              providers: [RestaurantWorkspaceStore],
+              children: [
+                { path: '', component: RestaurantOverviewTab },
+                { path: 'readiness', component: RestaurantReadinessTab },
+              ],
+            },
+            { path: 'restaurants', children: [] },
+          ],
+          withComponentInputBinding(),
+        ),
+        { provide: RESTAURANT_API, useValue: api },
+      ],
+    });
+  });
+
+  function el(): HTMLElement {
+    return harness.routeDebugElement?.nativeElement as HTMLElement;
+  }
+  function text(): string {
+    return el().textContent ?? '';
+  }
+  function claimPanel(): HTMLElement {
+    const found = el().querySelector('section[aria-labelledby="owner-claim-heading"]');
+    expect(found).withContext('the owner claim panel is mounted').toBeTruthy();
+    return found as HTMLElement;
+  }
+  function claimText(): string {
+    return claimPanel().textContent ?? '';
+  }
+  function value(attribute: string): string | null {
+    return claimPanel().querySelector(`[${attribute}]`)?.textContent?.trim() ?? null;
+  }
+  function actionLabels(): string[] {
+    return Array.from(claimPanel().querySelectorAll('[data-claim-actions] button')).map(
+      (button) => button.textContent?.trim() ?? '',
+    );
+  }
+  function action(label: string): HTMLButtonElement | null {
+    return (
+      Array.from(claimPanel().querySelectorAll<HTMLButtonElement>('[data-claim-actions] button')).find(
+        (button) => button.textContent?.trim() === label,
+      ) ?? null
+    );
+  }
+  function editor(): HTMLElement | null {
+    return claimPanel().querySelector('[data-invitation-editor]');
+  }
+  function editorText(): string {
+    return editor()?.textContent ?? '';
+  }
+  function typeReason(reason = REASON): void {
+    const box = editor()!.querySelector<HTMLTextAreaElement>('[data-invitation-reason]')!;
+    box.value = reason;
+    box.dispatchEvent(new Event('input'));
+    harness.detectChanges();
+  }
+  function submitButton(label: string): HTMLButtonElement {
+    return Array.from(editor()!.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === label,
+    )!;
+  }
+  function codePanel(): HTMLElement | null {
+    return claimPanel().querySelector('[data-claim-code-panel]');
+  }
+  function codeValue(): string | null {
+    return claimPanel().querySelector<HTMLInputElement>('[data-claim-code]')?.value ?? null;
+  }
+  function store(): RestaurantWorkspaceStore {
+    return harness.routeDebugElement!.injector.get(RestaurantWorkspaceStore);
+  }
+  function open(label: string): void {
+    action(label)!.click();
+    harness.detectChanges();
+  }
+  function reissue(reason = REASON): void {
+    open('Reissue claim code');
+    typeReason(reason);
+    submitButton('Reissue claim code').click();
+    harness.detectChanges();
+  }
+  function cancel(reason = REASON): void {
+    open('Cancel invitation');
+    typeReason(reason);
+    submitButton('Cancel invitation').click();
+    harness.detectChanges();
+  }
+  /**
+   * Every place a credential could have leaked to, in one sweep. `shown` says whether
+   * it is expected in the ONE sanctioned place — the readonly field's value — and it
+   * is never expected in prose, an attribute, storage, the URL or the store.
+   */
+  function tokenIsNowhereBut(shown: boolean): void {
+    for (const storage of [sessionStorage, localStorage]) {
+      for (let i = 0; i < storage.length; i += 1) {
+        const key = storage.key(i)!;
+        expect(storage.getItem(key) ?? '').withContext(`storage ${key}`).not.toContain(TOKEN);
+      }
+    }
+    expect(TestBed.inject(Router).url).withContext('the URL').not.toContain(TOKEN);
+    expect(JSON.stringify(store().detail())).withContext('the workspace store').not.toContain(TOKEN);
+    for (const anchor of Array.from(el().querySelectorAll('a'))) {
+      expect(anchor.getAttribute('href') ?? '').withContext('an anchor').not.toContain(TOKEN);
+    }
+    expect(text()).withContext('prose').not.toContain(TOKEN);
+    expect(el().innerHTML).withContext('markup').not.toContain(TOKEN);
+    expect(codeValue() === TOKEN).withContext('the readonly field').toBe(shown);
+  }
+
+  /** As in the Overview suite: a second load in one test goes to a different `:id`. */
+  let loads = 0;
+  async function loadedWith(record: OnboardingSummary, extra: Partial<RestaurantDetail> = {}) {
+    api.answer = () => of(detail({ onboarding: record, ...extra }));
+    if (loads === 0) harness = await RouterTestingHarness.create();
+    loads += 1;
+    const routeId = loads === 1 ? ID : `${ID.slice(0, -4)}${String(loads).padStart(4, '0')}`;
+    await harness.navigateByUrl(`/restaurants/${routeId}/readiness`, RestaurantDetailPage);
+    harness.detectChanges();
+    tick();
+    harness.detectChanges();
+  }
+
+  // ── THE TWO AXES, AND THE CONTROL MATRIX ─────────────────────────────────────────
+
+  it('renders owner control and the invitation as two rows, never one verdict', fakeAsync(async () => {
+    await loadedWith(adminOnboarding('pending'));
+
+    expect(value('data-claim-owner-control')).toBe('Not established');
+    expect(value('data-claim-invitation')).toBe('Pending');
+    expect(value('data-claim-window')).toBe('Claim window closes 10:00 EAT · 27 Aug 2026.');
+    expect(claimText()).not.toContain('Onboarding complete');
+    flush();
+  }));
+
+  it('keeps a consumed invitation and NOT-established control side by side (a previous owner claimed)', fakeAsync(async () => {
+    // The backend documents this pair as legitimate: the account that redeemed the
+    // invitation is no longer the owner, so the invitation reads consumed while the
+    // CURRENT owner's control is not established. Reissuing for the current owner is
+    // the right thing to offer, and cancelling is not — the credential is resolved.
+    await loadedWith(adminOnboarding('consumed'));
+
+    expect(value('data-claim-owner-control')).toBe('Not established');
+    expect(value('data-claim-invitation')).toBe('Redeemed');
+    expect(actionLabels()).toEqual(['Reissue claim code']);
+    flush();
+  }));
+
+  const MATRIX: readonly [
+    string,
+    OnboardingSummary,
+    Partial<RestaurantDetail>,
+    readonly string[],
+    string | null,
+  ][] = [
+    ['pending', adminOnboarding('pending'), {}, ['Reissue claim code', 'Cancel invitation'], null],
+    ['expired', adminOnboarding('expired'), {}, ['Reissue claim code', 'Cancel invitation'], null],
+    [
+      'verification_locked',
+      adminOnboarding('verification_locked'),
+      {},
+      ['Reissue claim code', 'Cancel invitation'],
+      null,
+    ],
+    ['cancelled', adminOnboarding('cancelled'), {}, ['Reissue claim code'], null],
+    ['superseded', adminOnboarding('superseded'), {}, ['Reissue claim code'], null],
+    [
+      'consumed by the CURRENT owner',
+      adminOnboarding('consumed', {
+        owner_control: {
+          status: 'invitation_redeemed',
+          evidence: 'invitation_redeemed',
+          evidence_at: '2026-07-14T16:05:00+03:00',
+        },
+      }),
+      {},
+      [],
+      'already claimed this restaurant',
+    ],
+    [
+      'pending with a drifted owner relationship',
+      adminOnboarding('pending', { owner_relationship: { status: 'owner_membership_mismatch' } }),
+      {},
+      ['Cancel invitation'],
+      'owner of record and the owner authority disagree',
+    ],
+    [
+      'pending with a deactivated owner',
+      adminOnboarding('pending'),
+      { owner: { ...detail().owner!, is_active: false } },
+      ['Cancel invitation'],
+      'deactivated',
+    ],
+    ['pending with no owner row', adminOnboarding('pending'), { owner: null }, ['Cancel invitation'], 'no owner account'],
+    ['not issued', adminOnboarding('not_issued'), {}, [], null],
+    ['a legacy adoption', onboarding(), {}, [], null],
+    ['untracked', UNTRACKED, {}, [], null],
+  ];
+
+  for (const [name, record, extra, controls, blocker] of MATRIX) {
+    it(`offers exactly ${JSON.stringify(controls)} for ${name}`, fakeAsync(async () => {
+      // WHAT THE SERVER WOULD ACCEPT, and nothing else. Reissue needs an issued head, an
+      // owner whose control is NOT established, a consistent owner relationship and a
+      // usable owner account; cancel needs an UNRESOLVED head. Every refusal the domain
+      // would give is a control this panel does not draw — and where reissue is withheld
+      // for a reason the operator can act on, the reason is stated.
+      await loadedWith(record, extra);
+
+      expect(actionLabels()).toEqual([...controls]);
+      if (blocker === null) {
+        expect(claimPanel().querySelector('[data-claim-reissue-blocker]')).toBeNull();
+      } else {
+        expect(value('data-claim-reissue-blocker')).toContain(blocker);
+      }
+      flush();
+    }));
+  }
+
+  it('explains a legacy adoption and an untracked tenant without inventing a missing step', fakeAsync(async () => {
+    await loadedWith(onboarding());
+    expect(value('data-claim-legacy-note')).toContain('no claim code applies to it');
+    expect(claimText()).not.toContain('Not issued');
+
+    await loadedWith(UNTRACKED);
+    expect(claimText()).not.toContain('Not established');
+    expect(claimPanel().querySelector('[data-claim-invitation]')).toBeNull();
+    flush();
+  }));
+
+  it('never uses delivery vocabulary, and never fabricates a claim link', fakeAsync(async () => {
+    for (const status of ['pending', 'expired', 'consumed', 'cancelled', 'not_issued'] as const) {
+      await loadedWith(adminOnboarding(status));
+      // ISSUANCE IS NOT DELIVERY. A word implying a message went somewhere would be a
+      // claim about something this platform does not do.
+      expect(text()).withContext(status).not.toMatch(/\b(sent|resend|resent|delivered|delivery failed|SMS|emailed)\b/i);
+      expect(text()).withContext(status).not.toContain('claim link');
+      expect(text()).withContext(status).not.toContain('Copy link');
+      expect(text()).withContext(status).not.toContain('Send invitation');
+      expect(text()).withContext(status).not.toContain('Invitation link');
+    }
+    flush();
+  }));
+
+  // ── REISSUE ──────────────────────────────────────────────────────────────────────
+
+  it('REISSUE sends the exact reviewed id and reason to the named operation', fakeAsync(async () => {
+    await loadedWith(adminOnboarding('expired'));
+
+    open('Reissue claim code');
+    expect(editor()).toBeTruthy();
+    expect(editor()!.querySelector('h3')?.textContent?.trim()).toBe('Reissue claim code');
+    // WHICH invitation is being acted on, as it read when the form opened.
+    expect(value('data-invitation-subject')).toBe('Expired · issued 10:00 EAT · 20 Aug 2026');
+    expect(value('data-invitation-consequence')).toContain('rotates the claim code');
+    expect(value('data-invitation-consequence')).toContain('Nothing is delivered to the owner');
+
+    typeReason();
+    submitButton('Reissue claim code').click();
+    harness.detectChanges();
+
+    expect(api.invitationWrites).toEqual([
+      {
+        operation: 'reissue',
+        restaurantId: ID,
+        body: { expected_invitation_id: HEAD_ID, reason: REASON },
+      },
+    ]);
+    expect(Object.keys(api.invitationWrites[0].body).sort()).toEqual(['expected_invitation_id', 'reason']);
+    flush();
+  }));
+
+  it('keeps Confirm unavailable without a substantive reason', fakeAsync(async () => {
+    await loadedWith(adminOnboarding('pending'));
+
+    open('Reissue claim code');
+    expect(submitButton('Reissue claim code').disabled).toBeTrue();
+    typeReason('too short');
+    expect(submitButton('Reissue claim code').disabled).toBeTrue();
+    typeReason(REASON);
+    expect(submitButton('Reissue claim code').disabled).toBeFalse();
+    expect(api.invitationWrites.length).toBe(0);
+    flush();
+  }));
+
+  it('adopts the canonical projection, shows the NEW code once, and keeps it copyable through the row change', fakeAsync(async () => {
+    await loadedWith(adminOnboarding('expired'));
+
+    reissue();
+
+    // The row now reports the NEW pending credential from the canonical projection the
+    // write returned — never from the request, never guessed.
+    expect(value('data-claim-invitation')).toBe('Pending');
+    expect(value('data-claim-window')).toBe('Claim window closes 09:00 EAT · 1 Sept 2026.');
+    expect(store().detail()!.onboarding.invitation.id).toBe(NEW_HEAD_ID);
+    // The code is on screen, exactly, in a copyable field — AFTER the adoption above,
+    // so the operator can still copy it while the row already reads Pending.
+    expect(codePanel()).toBeTruthy();
+    expect(codeValue()).toBe(TOKEN);
+    expect(claimText()).toContain('Claim code reissued');
+    expect(claimText()).toContain('Shown once');
+    expect(claimText()).toContain('Any earlier claim code no longer works');
+    expect(value('data-claim-confirmation')).toContain('Claim code reissued');
+    expect(editor()).withContext('the form is done').toBeNull();
+    // The window of the NEW credential is stated beside it.
+    expect(value('data-claim-code-window')).toBe('Issued 09:00 EAT · 25 Aug 2026 · Expires 09:00 EAT · 1 Sept 2026');
+    flush();
+  }));
+
+  it('holds the raw code in THIS TAB and nowhere else', fakeAsync(async () => {
+    await loadedWith(adminOnboarding('pending'));
+    reissue();
+
+    tokenIsNowhereBut(true);
+    // And the store carries the canonical projection WITHOUT the credential — the
+    // write response keeps the two in separate objects, and only one is adopted.
+    expect(store().detail()!.onboarding.invitation.id).toBe(NEW_HEAD_ID);
+    flush();
+  }));
+
+  it('Done removes the code from the screen, and it does not come back', fakeAsync(async () => {
+    await loadedWith(adminOnboarding('pending'));
+    reissue();
+    expect(codeValue()).toBe(TOKEN);
+
+    claimPanel().querySelector<HTMLButtonElement>('[data-claim-done] button')!.click();
+    harness.detectChanges();
+
+    expect(codePanel()).toBeNull();
+    tokenIsNowhereBut(false);
+    // The row stays as the write left it: dismissing the CODE is not undoing the reissue.
+    expect(value('data-claim-invitation')).toBe('Pending');
+    flush();
+  }));
+
+  it('copies the EXACT code to the clipboard, and reports a clipboard that refuses', fakeAsync(async () => {
+    await loadedWith(adminOnboarding('pending'));
+    reissue();
+
+    const writes: string[] = [];
+    let refuse = false;
+    const original = Object.getOwnPropertyDescriptor(Navigator.prototype, 'clipboard');
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        writeText: (value: string) => {
+          writes.push(value);
+          return refuse ? Promise.reject(new Error('denied')) : Promise.resolve();
+        },
+      },
+    });
+    try {
+      claimPanel().querySelector<HTMLButtonElement>('[data-claim-copy] button')!.click();
+      flushMicrotasks();
+      harness.detectChanges();
+      expect(writes).toEqual([TOKEN]);
+      expect(claimText()).toContain('Copied to the clipboard.');
+
+      refuse = true;
+      claimPanel().querySelector<HTMLButtonElement>('[data-claim-copy] button')!.click();
+      flushMicrotasks();
+      harness.detectChanges();
+      // A refusal is reported, not swallowed: the readonly field is the manual path.
+      expect(claimText()).toContain('The clipboard could not be used');
+      expect(claimPanel().querySelector<HTMLInputElement>('[data-claim-code]')!.readOnly).toBeTrue();
+    } finally {
+      if (original) Object.defineProperty(Navigator.prototype, 'clipboard', original);
+      delete (navigator as unknown as Record<string, unknown>)['clipboard'];
+    }
+    flush();
+  }));
+
+  it('sends the id captured WHEN THE ACTION OPENED, not whatever the store holds at submit', fakeAsync(async () => {
+    // The operator reviewed HEAD_ID and opened Reissue against it. Something then moves
+    // the projection underneath the open form — here, a background adoption. The
+    // request must still assert HEAD_ID: that is the invitation the operator looked at,
+    // and if it is no longer the head the SERVER answers 409 and the panel reloads.
+    // Re-reading the store at submit would silently act on a credential nobody reviewed.
+    await loadedWith(adminOnboarding('pending'));
+    open('Reissue claim code');
+    typeReason();
+
+    store().adoptOnboarding(
+      adminOnboarding('pending', { invitation: invitation('pending', { id: NEW_HEAD_ID }) }),
+    );
+    harness.detectChanges();
+
+    submitButton('Reissue claim code').click();
+    harness.detectChanges();
+
+    expect(api.invitationWrites[0].body['expected_invitation_id']).toBe(HEAD_ID);
+    flush();
+  }));
+
+  // ── CANCEL ───────────────────────────────────────────────────────────────────────
+
+  it('CANCEL sends the same body shape to the cancel operation, and reports the withdrawal', fakeAsync(async () => {
+    await loadedWith(adminOnboarding('pending'));
+
+    open('Cancel invitation');
+    expect(editor()!.querySelector('h3')?.textContent?.trim()).toBe('Cancel invitation');
+    expect(value('data-invitation-consequence')).toContain('no replacement is issued');
+    expect(value('data-invitation-consequence')).toContain('The owner account is not changed');
+    typeReason();
+    submitButton('Cancel invitation').click();
+    harness.detectChanges();
+
+    expect(api.invitationWrites).toEqual([
+      { operation: 'cancel', restaurantId: ID, body: { expected_invitation_id: HEAD_ID, reason: REASON } },
+    ]);
+    expect(value('data-claim-invitation')).toBe('Cancelled');
+    expect(value('data-claim-confirmation')).toBe('Owner invitation cancelled. The claim code no longer works.');
+    // A cancelled head can be reissued and cannot be cancelled again.
+    expect(actionLabels()).toEqual(['Reissue claim code']);
+    expect(codePanel()).toBeNull();
+    flush();
+  }));
+
+  it('treats changed:false as a SUCCESS that decided nothing', fakeAsync(async () => {
+    // The server's exact-retry answer for a head already cancelled — reachable through a
+    // lost response followed by a resend. Not a conflict, not a new decision.
+    await loadedWith(adminOnboarding('expired'));
+    api.cancelAnswer = () => of(cancelled(false));
+
+    cancel();
+
+    expect(value('data-claim-confirmation')).toBe('This invitation was already cancelled. Nothing was changed.');
+    expect(claimPanel().querySelector('[data-invitation-error]')).toBeNull();
+    expect(value('data-claim-invitation')).toBe('Cancelled');
+    flush();
+  }));
+
+  it('does not describe cancellation as destroying anything, and keeps it off the danger hue', fakeAsync(async () => {
+    await loadedWith(adminOnboarding('pending'));
+    open('Cancel invitation');
+
+    expect(value('data-invitation-consequence')).toContain('the invitation history is retained');
+    for (const overclaim of ['deactivate', 'delete', 'revoke access', 'remove the owner', 'suspend']) {
+      expect(editorText().toLowerCase()).withContext(overclaim).not.toContain(overclaim);
+    }
+    // Withdrawing a credential is reversible by reissuing; nothing is destroyed. §16
+    // reserves the danger hue for destruction.
+    expect(submitButton('Cancel invitation').className).not.toContain('danger');
+    flush();
+  }));
+
+  it('clears a code still on screen when the invitation it belonged to is cancelled', fakeAsync(async () => {
+    await loadedWith(adminOnboarding('pending'));
+    reissue();
+    expect(codeValue()).toBe(TOKEN);
+
+    cancel();
+
+    expect(codePanel()).toBeNull();
+    tokenIsNowhereBut(false);
+    flush();
+  }));
+
+  // ── ONE AT A TIME, AND ACROSS A TAB ROUND-TRIP ───────────────────────────────────
+
+  it('shuts both controls while a write is in flight, and opens nothing', fakeAsync(async () => {
+    const pending = new Subject<OwnerInvitationReissueResult>();
+    await loadedWith(adminOnboarding('pending'));
+    api.reissueAnswer = () => pending;
+
+    reissue();
+
+    expect(api.invitationWrites.length).toBe(1);
+    expect(editor()).withContext('the form stays up, pending').toBeTruthy();
+    expect(submitButton('Reissue claim code').disabled).toBeTrue();
+
+    pending.next(reissued());
+    pending.complete();
+    harness.detectChanges();
+    expect(action('Reissue claim code')!.disabled).toBeFalse();
+    expect(action('Cancel invitation')!.disabled).toBeFalse();
+    flush();
+  }));
+
+  it('SURVIVES A TAB ROUND-TRIP: no second writer, and an honest note about the code it could not show', fakeAsync(async () => {
+    // The tabs are SIBLING ROUTES: switching to Overview destroys this tab while the
+    // reissue keeps running. The in-flight flag lives on the route-scoped store, so the
+    // rebuilt tab knows a write is in flight and cannot start another. When the answer
+    // lands, the projection reaches the store — and the CODE does not, because a bearer
+    // credential is never parked in a store that outlives every tab. The rebuilt tab
+    // says so instead of showing a fresh Pending row with no explanation.
+    const pending = new Subject<OwnerInvitationReissueResult>();
+    await loadedWith(adminOnboarding('pending'));
+    api.reissueAnswer = () => pending;
+    reissue();
+    expect(api.invitationWrites.length).toBe(1);
+
+    await harness.navigateByUrl(`/restaurants/${ID}`, RestaurantDetailPage);
+    harness.detectChanges();
+    expect(el().querySelector('section[aria-labelledby="owner-claim-heading"]')).toBeNull();
+
+    await harness.navigateByUrl(`/restaurants/${ID}/readiness`, RestaurantDetailPage);
+    harness.detectChanges();
+
+    expect(action('Reissue claim code')!.disabled).withContext('rebuilt, and still in flight').toBeTrue();
+    expect(action('Cancel invitation')!.disabled).toBeTrue();
+    action('Reissue claim code')!.click();
+    harness.detectChanges();
+    expect(editor()).withContext('no second action opens').toBeNull();
+    expect(api.invitationWrites.length).withContext('still exactly one request').toBe(1);
+
+    pending.next(reissued());
+    pending.complete();
+    harness.detectChanges();
+
+    // The projection landed on the surviving workspace; the credential did not, and the
+    // tab says exactly that rather than presenting the new row as unexplained.
+    expect(value('data-claim-invitation')).toBe('Pending');
+    expect(store().detail()!.onboarding.invitation.id).toBe(NEW_HEAD_ID);
+    expect(codePanel()).toBeNull();
+    tokenIsNowhereBut(false);
+    expect(value('data-claim-orphaned')).toContain('no claim code from it could be shown here');
+    expect(value('data-claim-orphaned')).toContain('reissue again');
+    expect(action('Reissue claim code')!.disabled).withContext('the slot is released').toBeFalse();
+    flush();
+  }));
+
+  it('does not raise the orphan note for a cancellation that lands after a round-trip', fakeAsync(async () => {
+    // A cancellation's answer carries nothing that could be lost.
+    const pending = new Subject<OwnerInvitationCancelResult>();
+    await loadedWith(adminOnboarding('pending'));
+    api.cancelAnswer = () => pending;
+    cancel();
+
+    await harness.navigateByUrl(`/restaurants/${ID}`, RestaurantDetailPage);
+    harness.detectChanges();
+    await harness.navigateByUrl(`/restaurants/${ID}/readiness`, RestaurantDetailPage);
+    harness.detectChanges();
+
+    pending.next(cancelled(true));
+    pending.complete();
+    harness.detectChanges();
+
+    expect(value('data-claim-invitation')).toBe('Cancelled');
+    expect(claimPanel().querySelector('[data-claim-orphaned]')).toBeNull();
+    flush();
+  }));
+
+  // ── THE OUTCOMES ─────────────────────────────────────────────────────────────────
+
+  it('keeps the form and the draft open on a 400, with the server’s field error', fakeAsync(async () => {
+    await loadedWith(adminOnboarding('pending'));
+    api.reissueAnswer = () =>
+      throwError(
+        () =>
+          new WireError(400, {
+            status: 400,
+            message: 'The request could not be applied.',
+            errors: { reason: ['Please state a reason of at least 10 characters.'] },
+          }),
+      );
+
+    reissue('Owner lost it');
+
+    expect(editor()).toBeTruthy();
+    expect(value('data-invitation-field-error')).toBe('Please state a reason of at least 10 characters.');
+    expect(editor()!.querySelector<HTMLTextAreaElement>('[data-invitation-reason]')!.value).toBe('Owner lost it');
+    expect(api.detailCalls.length).withContext('no reload for a validation refusal').toBe(1);
+    flush();
+  }));
+
+  it('preserves the draft when re-authentication is cancelled', fakeAsync(async () => {
+    await loadedWith(adminOnboarding('pending'));
+    api.reissueAnswer = () => throwError(() => new ElevationCancelledError());
+
+    reissue();
+
+    expect(editor()).toBeTruthy();
+    expect(value('data-invitation-error')).toBe('Re-authentication was cancelled. Nothing was changed.');
+    expect(editor()!.querySelector<HTMLTextAreaElement>('[data-invitation-reason]')!.value).toBe(REASON);
+    expect(action('Reissue claim code')!.disabled).withContext('the slot is released').toBeFalse();
+    flush();
+  }));
+
+  it('does NOT auto-retry a 409: one attempt, the server’s sentence, and a reload', fakeAsync(async () => {
+    await loadedWith(adminOnboarding('pending'));
+    api.cancelAnswer = () =>
+      throwError(
+        () =>
+          new WireError(409, {
+            status: 409,
+            message: 'The owner invitation changed since it was loaded.',
+            code: 'stale_owner_invitation',
+          }),
+      );
+
+    cancel();
+
+    // Exactly ONE attempt. Replaying with a fresh id would act on a credential the
+    // operator has never seen — the thing expected_invitation_id exists to prevent.
+    expect(api.invitationWrites.length).toBe(1);
+    expect(editor()).withContext('the stale action is discarded').toBeNull();
+    expect(value('data-claim-panel-error')).toContain('The owner invitation changed since it was loaded.');
+    expect(value('data-claim-panel-error')).toContain('Review the current invitation before trying again.');
+    expect(api.detailCalls.length).withContext('reload requested').toBe(2);
+    tick();
+    flush();
+  }));
+
+  it('renders WHICH refusal the server gave, since only it can tell them apart', fakeAsync(async () => {
+    await loadedWith(adminOnboarding('pending'));
+    api.reissueAnswer = () =>
+      throwError(
+        () =>
+          new WireError(409, {
+            status: 409,
+            message: "This restaurant's owner has already claimed it.",
+            code: 'owner_control_already_established',
+          }),
+      );
+
+    reissue();
+
+    expect(value('data-claim-panel-error')).toContain("This restaurant's owner has already claimed it.");
+    flush();
+  }));
+
+  it('REFUSES A NEW DECISION until the post-conflict reload has landed, then captures the FRESH id', fakeAsync(async () => {
+    await loadedWith(adminOnboarding('pending'));
+    api.cancelAnswer = () =>
+      throwError(
+        () => new WireError(409, { status: 409, message: 'stale', code: 'stale_owner_invitation' }),
+      );
+    const reload = new Subject<RestaurantDetail>();
+    api.answer = () => reload;
+
+    cancel();
+    expect(api.detailCalls.length).toBe(2);
+
+    // MID-RELOAD: the superseded projection is still on screen, and the controls are shut.
+    expect(value('data-claim-invitation')).toBe('Pending');
+    expect(action('Reissue claim code')!.disabled).toBeTrue();
+    expect(action('Cancel invitation')!.disabled).toBeTrue();
+    action('Cancel invitation')!.click();
+    harness.detectChanges();
+    expect(editor()).withContext('nothing opens against superseded state').toBeNull();
+    expect(api.invitationWrites.length).toBe(1);
+    expect(claimText()).toContain('Reloading');
+    expect(claimText()).not.toContain('has been reloaded');
+
+    // The fresh read lands: another operator had reissued, so the head is NEW_HEAD_ID.
+    reload.next(
+      detail({
+        onboarding: adminOnboarding('pending', {
+          invitation: invitation('pending', { id: NEW_HEAD_ID, issued_at: NEW_ISSUED_AT, expires_at: NEW_EXPIRES_AT }),
+        }),
+      }),
+    );
+    reload.complete();
+    harness.detectChanges();
+
+    expect(claimText()).not.toContain('Reloading');
+    expect(action('Cancel invitation')!.disabled).withContext('deciding is possible again').toBeFalse();
+
+    api.cancelAnswer = () => of(cancelled(true));
+    cancel('Reviewed the reissued invitation; withdrawing it');
+    expect(api.invitationWrites.length).toBe(2);
+    expect(api.invitationWrites[1].body['expected_invitation_id'])
+      .withContext('NOT the stale id — the reloaded one')
+      .toBe(NEW_HEAD_ID);
+    flush();
+  }));
+
+  it('clears a code on screen when a later write is refused as stale', fakeAsync(async () => {
+    // The credential shown belonged to a head that has since moved. Leaving it on
+    // screen would present a possibly-superseded code as live.
+    await loadedWith(adminOnboarding('pending'));
+    reissue();
+    expect(codeValue()).toBe(TOKEN);
+    api.cancelAnswer = () =>
+      throwError(
+        () => new WireError(409, { status: 409, message: 'stale', code: 'stale_owner_invitation' }),
+      );
+
+    cancel();
+
+    expect(codePanel()).toBeNull();
+    tokenIsNowhereBut(false);
+    tick();
+    flush();
+  }));
+
+  it('discards the action and re-reads on a 404', fakeAsync(async () => {
+    await loadedWith(adminOnboarding('pending'));
+    api.reissueAnswer = () =>
+      throwError(() => new WireError(404, { status: 404, message: 'Restaurant not found.' }));
+
+    reissue();
+
+    expect(editor()).toBeNull();
+    expect(api.detailCalls.length).toBe(2);
+    tick();
+    flush();
+  }));
+
+  describe('an indeterminate answer', () => {
+    /** The write got no usable answer, and the reload shows `after`. */
+    async function reissueThenReload(after: OnboardingSummary): Promise<void> {
+      await loadedWith(adminOnboarding('pending'));
+      api.reissueAnswer = () =>
+        throwError(() => ({ status: 0, error: null, message: 'Http failure response' }));
+      api.answer = () => of(detail({ onboarding: after }));
+      reissue();
+      tick();
+      harness.detectChanges();
+    }
+
+    it('never says the reissue failed, never retries, and re-reads before anything else', fakeAsync(async () => {
+      await reissueThenReload(adminOnboarding('pending'));
+
+      expect(api.invitationWrites.length).toBe(1);
+      expect(editor()).toBeNull();
+      expect(value('data-claim-panel-error')).toBe(
+        'The admin service did not answer, so it is not known whether a new claim code was issued.',
+      );
+      expect(claimText().toLowerCase()).not.toContain('failed');
+      expect(api.detailCalls.length).withContext('the projection was re-read').toBe(2);
+      tick(60_000);
+      expect(api.invitationWrites.length).withContext('and nothing was retried, ever').toBe(1);
+      flush();
+    }));
+
+    it('states that nothing was minted when the re-read shows the same head', fakeAsync(async () => {
+      await reissueThenReload(adminOnboarding('pending'));
+
+      expect(value('data-claim-indeterminate')).toBe(
+        'The invitation on record is unchanged, so no new claim code was issued.',
+      );
+      flush();
+    }));
+
+    it('tells the operator to reissue AGAIN when the re-read shows a head nobody has seen', fakeAsync(async () => {
+      // THE CASE THE BACKEND BUILT REISSUE-AS-ROTATION FOR. The server rotated the
+      // credential and the only copy of the new code was in the answer that never
+      // arrived. There is no plaintext to recover; the remedy is to supersede that
+      // unknown credential with one the operator can copy.
+      await reissueThenReload(
+        adminOnboarding('pending', {
+          invitation: invitation('pending', { id: NEW_HEAD_ID, issued_at: NEW_ISSUED_AT, expires_at: NEW_EXPIRES_AT }),
+        }),
+      );
+
+      expect(value('data-claim-indeterminate')).toBe(
+        'A newer claim code is now on record, and it was never shown here. Reissue again to replace it with one you can copy.',
+      );
+      expect(codePanel()).toBeNull();
+      expect(action('Reissue claim code')!.disabled).withContext('a deliberate reissue is possible').toBeFalse();
+      flush();
+    }));
+
+    it('reads a cancellation’s outcome off the re-read invitation', fakeAsync(async () => {
+      await loadedWith(adminOnboarding('pending'));
+      api.cancelAnswer = () => throwError(() => new WireError(503, null));
+      api.answer = () => of(detail({ onboarding: adminOnboarding('cancelled') }));
+
+      cancel();
+      tick();
+      harness.detectChanges();
+
+      expect(value('data-claim-panel-error')).toBe(
+        'The admin service did not answer, so it is not known whether the invitation was cancelled.',
+      );
+      expect(value('data-claim-indeterminate')).toBe('The invitation on record is now cancelled.');
+      expect(value('data-claim-invitation')).toBe('Cancelled');
+      flush();
+    }));
+
+    it('says nothing about the outcome until the re-read has SETTLED', fakeAsync(async () => {
+      await loadedWith(adminOnboarding('pending'));
+      api.reissueAnswer = () =>
+        throwError(() => ({ status: 0, error: null, message: 'Http failure response' }));
+      const reload = new Subject<RestaurantDetail>();
+      api.answer = () => reload;
+
+      reissue();
+
+      // Mid-reload there is no verdict to give, and no decision to allow.
+      expect(claimPanel().querySelector('[data-claim-indeterminate]')).toBeNull();
+      expect(claimText()).toContain('Reloading');
+      expect(action('Reissue claim code')!.disabled).toBeTrue();
+
+      reload.next(detail({ onboarding: adminOnboarding('pending') }));
+      reload.complete();
+      harness.detectChanges();
+
+      expect(value('data-claim-indeterminate')).toContain('unchanged');
+      expect(action('Reissue claim code')!.disabled).toBeFalse();
+      flush();
+    }));
+  });
 });

@@ -8,7 +8,7 @@ import {
   signal,
 } from '@angular/core';
 import { takeUntilDestroyed, toObservable } from '@angular/core/rxjs-interop';
-import { Router } from '@angular/router';
+import { Router, RouterLink } from '@angular/router';
 import { catchError, distinctUntilChanged, of, switchMap, tap } from 'rxjs';
 
 import { AdminServiceStatus } from '../core/api/service-status';
@@ -30,7 +30,7 @@ import {
   RestaurantRow,
 } from '../core/restaurants/restaurant.model';
 import { booleanParam, enumParam, integerParam, stringParam, urlState } from '../core/url/query-param';
-import { AdminButtonComponent } from '../ui/button.component';
+import { adminButtonClasses, AdminButtonComponent } from '../ui/button.component';
 import { StatusPillComponent } from '../ui/status-pill.component';
 import {
   AdminTableCellDirective,
@@ -92,12 +92,20 @@ type DirectoryState = 'loading' | 'rows' | 'empty' | 'beyond-end' | 'error';
  * produces a failure state with a retry, and (for a 5xx or a dead socket) the shell's
  * outage banner alongside it.
  *
+ * ── THE ONE ENTRY POINT THIS SCREEN OWNS ─────────────────────────────────────────
+ *
+ * CREATE RESTAURANT (Step 2G). A real navigation to `/restaurants/new` — an anchor, not
+ * a button, because it goes somewhere rather than doing something (§19). It lives here
+ * and not in global navigation: creation is done TO the portfolio, and §9 keeps the
+ * sidebar at five destinations. The directory itself stays read-only — the creation
+ * screen owns the write, and this page's stub API still throws on every write method
+ * so a mutation control added here fails a test rather than quietly working.
+ *
  * ── WHAT IS DELIBERATELY ABSENT ───────────────────────────────────────────────────
  *
  * No bulk actions and no saved views (§15: nothing legitimate happens in bulk across
- * tenants). No Create restaurant button — that is step 2, and a button that cannot
- * work is worse than no button. No sort control: the server orders by name and offers
- * no ordering parameter, so a sort header would be a control with nothing behind it.
+ * tenants). No sort control: the server orders by name and offers no ordering
+ * parameter, so a sort header would be a control with nothing behind it.
  */
 @Component({
   selector: 'app-restaurants-page',
@@ -106,14 +114,22 @@ type DirectoryState = 'loading' | 'rows' | 'empty' | 'beyond-end' | 'error';
     AdminButtonComponent,
     AdminTableCellDirective,
     AdminTableComponent,
+    RouterLink,
     StatusPillComponent,
   ],
   template: `
-    <header>
-      <h1 class="text-admin-page text-ink">Restaurants</h1>
-      <p class="mt-0.5 text-admin-body text-ink-muted">
-        Every tenant, and the state each one is in.
-      </p>
+    <header class="flex flex-wrap items-start justify-between gap-3">
+      <div>
+        <h1 class="text-admin-page text-ink">Restaurants</h1>
+        <p class="mt-0.5 text-admin-body text-ink-muted">
+          Every tenant, and the state each one is in.
+        </p>
+      </div>
+      <!-- NAVIGATION, so an anchor: §19 keeps <button> for actions and <a> for going
+           somewhere. Creation is a screen of its own, reached from here. -->
+      <a routerLink="/restaurants/new" [class]="createActionClasses" data-create-restaurant
+        >Create restaurant</a
+      >
     </header>
 
     <!-- QUICK VIEWS. A real tablist: the selected one always describes the URL, so
@@ -326,6 +342,8 @@ export class RestaurantsPage {
   protected readonly lifecycleOptions = LIFECYCLE_FILTERS;
   protected readonly lifecycleLabel = lifecycleLabel;
   protected readonly lifecycleVariant = lifecycleVariant;
+  /** Shared with the button primitive so a navigating action cannot drift from it. */
+  protected readonly createActionClasses = adminButtonClasses('primary');
   /** Row-shaped placeholders for the loading state. The count is cosmetic. */
   protected readonly placeholders = [0, 1, 2, 3, 4, 5];
 

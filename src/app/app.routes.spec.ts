@@ -6,13 +6,16 @@ import { DEV_ROUTES } from './dev/dev-tools';
 import { NAV_DESTINATIONS } from './shell/navigation';
 
 /**
- * The scheme this application serves, per spec §9.2, plus `/unavailable`. Fourteen
+ * The scheme this application serves, per spec §9.2, plus `/unavailable`. Fifteen
  * addresses, and each one is a contract: the needs-attention items on Home link INTO
  * them, so a rename is a broken link somewhere the operator was told to look.
  *
  * `/unavailable` is not a §9.2 destination and not a navigable one — it is the third
  * bootstrap outcome, and it exists because a login form is the wrong thing to show an
  * operator whose control plane is not answering.
+ *
+ * `/restaurants/new` (Step 2G) is the creation screen: a UI route over the existing
+ * `POST /restaurants/` collection write, not a new API surface.
  */
 const EXPECTED_PATHS = [
   '/',
@@ -22,6 +25,7 @@ const EXPECTED_PATHS = [
   '/receivables',
   '/receivables/:invoiceId',
   '/restaurants',
+  '/restaurants/new',
   '/restaurants/:id',
   '/restaurants/:id/activity',
   '/restaurants/:id/billing',
@@ -114,6 +118,29 @@ describe('app routes', () => {
     }
     // One guard on the parent, rather than twelve that can drift apart.
     expect(shell?.canActivate?.length).toBe(1);
+  });
+
+  it('declares /restaurants/new BEFORE /restaurants/:id, so "new" is never read as an id', () => {
+    // The router matches in declaration order. Declared after the parameterised route,
+    // `/restaurants/new` would open the workspace for a restaurant whose id is the
+    // string "new", and the creation screen would be unreachable by URL.
+    const shell = findRoute(routes, '');
+    const paths = (shell?.children ?? []).map((child) => child.path);
+    expect(paths.indexOf('restaurants/new')).toBeGreaterThanOrEqual(0);
+    expect(paths.indexOf('restaurants/new')).toBeLessThan(paths.indexOf('restaurants/:id'));
+  });
+
+  it('gives the creation screen its own LAZY component, and no children', () => {
+    // Creation is a decision screen, not a workspace: it has no tabs, no persistent
+    // header, and no `RestaurantWorkspaceStore` — there is no restaurant yet. And it is
+    // lazy: a rare, deliberate act does not belong in the bundle every operator
+    // downloads to look at the directory.
+    const shell = findRoute(routes, '');
+    const create = findRoute(shell?.children ?? [], 'restaurants/new');
+    expect(create?.loadComponent).toBeDefined();
+    expect(create?.component).toBeUndefined();
+    expect(create?.children).toBeUndefined();
+    expect(create?.providers).toBeUndefined();
   });
 
   it('nests the restaurant tabs so the §9.1 header is genuinely persistent', () => {

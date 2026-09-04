@@ -8,6 +8,7 @@ import {
   OperationsSummary,
   OwnerControlEvidence,
   OwnerControlStatus,
+  OwnerInvitationProjection,
   OwnerInvitationStatus,
   OwnerRelationshipStatus,
   PaymentCollectionMode,
@@ -73,6 +74,14 @@ import {
  * and a billing interval whose count is not 1. The two partial combinations are the
  * ones a review would otherwise never see, and they are exactly what a collapsed
  * "Configured / Not configured" cell would hide.
+ *
+ * Step 2G completed the invitation states, because the Readiness tab now ACTS on them:
+ * every invitation now carries the Step 2E metadata (`id`, `issued_at`, `expires_at`)
+ * the write endpoints assert against, and the corpus gained the three states the
+ * controls have to come apart on — `verification_locked`, an invitation CONSUMED BY A
+ * PREVIOUS OWNER while control stays not established, and a pending invitation whose
+ * owner account is deactivated. Nothing here carries a claim token: an invitation id
+ * is a handle, and the credential exists only in the response that minted it.
  *
  * ── EVERY CONFIGURED ROW IS ALSO A CANONICAL-VERSUS-LEGACY CONTRADICTION ──────────
  *
@@ -165,6 +174,14 @@ interface OnboardingSeed {
   readonly evidenceHoursAgo?: number;
   /** Only meaningful for `admin_created`; a legacy adoption is always not applicable. */
   readonly invitation?: OwnerInvitationStatus;
+  /**
+   * Hours ago the head invitation was ISSUED. Its expiry is DERIVED — issued plus the
+   * server's 7-day TTL — never written beside it, so a seed cannot state a `pending`
+   * invitation that expired last week or an `expired` one still inside its window.
+   * Defaults per status (see `invitationIssuedHoursAgo`); ignored where no invitation
+   * exists.
+   */
+  readonly invitationIssuedHoursAgo?: number;
 }
 
 const SEEDS: readonly Seed[] = [
@@ -452,6 +469,20 @@ const FILLER_NAMES: readonly string[] = [
 const FILLER_LOCATIONS: readonly string[] = ['Kampala', 'Wakiso', 'Entebbe', 'Jinja', 'Mbarara'];
 const FILLER_STATUSES: readonly LifecycleState[] = ['live', 'live', 'onboarding', 'live', 'suspended'];
 
+/** The four fillers that carry an invitation state the named seeds do not — see the map below. */
+const FILLER_ONBOARDING: Readonly<Record<number, OnboardingSeed>> = {
+  3: { source: 'admin_created', recordedHoursAgo: 90, invitation: 'verification_locked' },
+  7: { source: 'admin_created', recordedHoursAgo: 520, invitation: 'superseded' },
+  11: {
+    source: 'admin_created',
+    recordedHoursAgo: 1_300,
+    control: 'not_established',
+    invitation: 'consumed',
+    invitationIssuedHoursAgo: 1_290,
+  },
+  19: { source: 'admin_created', recordedHoursAgo: 70, invitation: 'pending' },
+};
+
 const FILLER_SEEDS: readonly Seed[] = FILLER_NAMES.map((name, index) => ({
   name,
   location: FILLER_LOCATIONS[index % FILLER_LOCATIONS.length],
@@ -462,6 +493,10 @@ const FILLER_SEEDS: readonly Seed[] = FILLER_NAMES.map((name, index) => ({
     name: `Owner ${index + 1}`,
     email: `owner${index + 1}@example.ug`,
     phone_number: `2567${String(70000000 + index).padStart(8, '0')}`,
+    // THE ONE DEACTIVATED OWNER WITH A CLAIM OWING (index 19, below): the account the
+    // credential would be minted for is deactivated, so a reissue is refused while a
+    // cancel is still allowed — the two controls must come apart here.
+    is_active: index !== 19,
   },
   operations: {
     table_count: 4 + (index % 17),
@@ -469,14 +504,26 @@ const FILLER_SEEDS: readonly Seed[] = FILLER_NAMES.map((name, index) => ({
     dining_area_count: 1 + (index % 3),
   },
   latestOrderHoursAgo: index % 6 === 0 ? null : index + 2,
-  // Plain adoptions, like the fillers themselves — except one. `superseded` is the
-  // only invitation state the named seeds above do not carry, and a state no fixture
-  // ever reaches is a state nobody ever looks at.
-  onboarding:
-    index === 7
-      ? { source: 'admin_created', recordedHoursAgo: 520, invitation: 'superseded' }
-      : { source: 'legacy_adopted', recordedHoursAgo: 800 + index * 13 },
+  // Plain adoptions, like the fillers themselves — except four, each carrying an
+  // invitation state the named seeds above do not, because a state no fixture ever
+  // reaches is a state nobody ever looks at:
+  //
+  //   index 3   VERIFICATION LOCKED — the claim-attempt budget was spent against the
+  //             code, so it can no longer be redeemed although its window is still
+  //             open. Reissuable and cancellable, exactly like `expired`.
+  //   index 7   SUPERSEDED — replaced by a later credential; resolved, so neither
+  //             control applies.
+  //   index 11  CONSUMED BY A PREVIOUS OWNER — the invitation reads `consumed` while
+  //             owner control stays `not_established`, because the account that
+  //             redeemed it is no longer the owner. Two axes, not a contradiction; and
+  //             a reissue for the CURRENT owner is legitimate here.
+  //   index 19  PENDING, OWNER DEACTIVATED — see the owner block above.
+  onboarding: FILLER_ONBOARDING[index] ?? {
+    source: 'legacy_adopted',
+    recordedHoursAgo: 800 + index * 13,
+  },
 }));
+
 
 const ALL_SEEDS: readonly Seed[] = [...SEEDS, ...FILLER_SEEDS];
 
@@ -636,11 +683,82 @@ function onboarding(seed: Seed): OnboardingSummary {
       evidence_at:
         evidence === null ? null : isoHoursAgo(settings.evidenceHoursAgo ?? recordedHoursAgo),
     },
-    invitation: {
-      status:
-        source === 'legacy_adopted' ? 'not_applicable' : (settings.invitation ?? 'not_issued'),
-    },
+    invitation: invitation(
+      seed,
+      source === 'legacy_adopted' ? 'not_applicable' : (settings.invitation ?? 'not_issued'),
+      settings.invitationIssuedHoursAgo,
+      recordedHoursAgo,
+    ),
   };
+}
+
+/**
+ * `ADMIN_OWNER_INVITATION_TTL`, mirrored: a claim credential's window is seven days
+ * from the instant it was minted, and `expires_at` is derived from `issued_at` exactly
+ * as `mint_owner_invitation` derives it. Exported so the mock transport mints with the
+ * same window the seeds are built on.
+ */
+export const MOCK_OWNER_INVITATION_TTL_MS = 7 * 86_400_000;
+
+/**
+ * The invitation axis of the Step 2C projection, with its Step 2E concurrency
+ * metadata — `id`, `issued_at`, `expires_at` — DERIVED from the status.
+ *
+ * The three keys are PRESENT AND NULL for `not_issued` / `not_applicable` /
+ * `unavailable`, exactly as `onboarding_reads` publishes them, so a client never has
+ * to branch on the status word to know which keys exist. For every other status the
+ * id is the handle a write must name (`expected_invitation_id`), and the window is
+ * consistent with the status by construction: `pending` and `verification_locked`
+ * default to a credential issued 40 hours ago (five days left), `expired` to one issued
+ * 200 hours ago (its window closed the day before yesterday), and the resolved states
+ * to one issued shortly after the admin record appeared.
+ *
+ * NO TOKEN, NO HASH, NO CLAIM URL. An invitation id is an opaque handle and a claim
+ * token is a credential; the projection carries the first and never the second.
+ */
+function invitation(
+  seed: Seed,
+  status: OwnerInvitationStatus,
+  issuedHoursAgo: number | undefined,
+  recordedHoursAgo: number,
+): OwnerInvitationProjection {
+  if (status === 'not_issued' || status === 'not_applicable' || status === 'unavailable') {
+    return { status, id: null, issued_at: null, expires_at: null };
+  }
+  const issuedAt = NOW_MS - invitationIssuedHoursAgo(status, issuedHoursAgo, recordedHoursAgo) * 3_600_000;
+  return {
+    status,
+    id: invitationId(seed),
+    issued_at: new Date(issuedAt).toISOString(),
+    expires_at: new Date(issuedAt + MOCK_OWNER_INVITATION_TTL_MS).toISOString(),
+  };
+}
+
+function invitationIssuedHoursAgo(
+  status: OwnerInvitationStatus,
+  supplied: number | undefined,
+  recordedHoursAgo: number,
+): number {
+  if (supplied !== undefined) return supplied;
+  switch (status) {
+    case 'pending':
+    case 'verification_locked':
+      return 40;
+    case 'expired':
+      return 200;
+    default:
+      return Math.max(1, recordedHoursAgo - 2);
+  }
+}
+
+/**
+ * Deterministic, so a deep link into a workspace survives a reload and the same seed
+ * always presents the same handle. The first hex digit is forced to `0`, and the mock
+ * transport mints its own ids with a leading `f` — so a seeded handle and a minted one
+ * can never collide however many are minted in a session.
+ */
+function invitationId(seed: Seed): string {
+  return `4d5e6f70-8192-4a3b-9c4d-0${termsId(seed).slice(-11)}`;
 }
 
 /** Not represented in the domain: every question unevaluated, and none of them failed. */
@@ -650,7 +768,7 @@ const UNTRACKED: OnboardingSummary = {
   recorded_at: null,
   owner_relationship: { status: 'unavailable' },
   owner_control: { status: 'unavailable', evidence: null, evidence_at: null },
-  invitation: { status: 'unavailable' },
+  invitation: { status: 'unavailable', id: null, issued_at: null, expires_at: null },
 };
 
 const CONTROL_EVIDENCE: Record<OwnerControlStatus, OwnerControlEvidence | null> = {
@@ -771,6 +889,35 @@ export const MOCK_RESTAURANT_DETAILS: ReadonlyMap<string, RestaurantDetail> = ne
   ALL_SEEDS.map((seed, index) => [id(index), detail(seed, index)] as const),
 );
 
-function compareRows(a: RestaurantRow, b: RestaurantRow): number {
+/** `('name', 'id')` — the `id` tiebreak is what makes paging deterministic. */
+export function compareRows(a: RestaurantRow, b: RestaurantRow): number {
   return a.name.localeCompare(b.name) || a.id.localeCompare(b.id);
 }
+
+/**
+ * A row's owner account as the mock transport needs to see it for CREATION: the
+ * collision facts (`phone_number`, lower-cased `email`) and the two eligibility facts
+ * an existing-owner request is checked against. Derived from the same details the
+ * workspace reads, so "an account already uses that phone number" in the mock is true
+ * of exactly the accounts a reviewer can see.
+ */
+export interface MockOwnerAccount {
+  readonly id: string;
+  readonly name: string | null;
+  readonly email: string | null;
+  readonly phone_number: string | null;
+  readonly is_active: boolean;
+}
+
+export const MOCK_OWNER_ACCOUNTS: readonly MockOwnerAccount[] = [...MOCK_RESTAURANT_DETAILS.values()]
+  .flatMap((record) => (record.owner === null ? [] : [record.owner]))
+  .map((account) => ({
+    id: account.id,
+    name: account.name,
+    email: account.email,
+    phone_number: account.phone_number,
+    is_active: account.is_active,
+  }));
+
+/** The fixed review clock, so the transport's "now" can be reproducible too. */
+export const MOCK_NOW_MS = NOW_MS;

@@ -3,10 +3,15 @@ import { Observable } from 'rxjs';
 
 import {
   CommercialMutationResult,
+  CreateRestaurantRequest,
   DirectoryQuery,
   EndSubscriptionTermsRequest,
+  OwnerInvitationCancelResult,
+  OwnerInvitationReissueResult,
+  OwnerInvitationRequest,
   RecordSubscriptionTermsRequest,
   ReplaceSubscriptionTermsRequest,
+  RestaurantCreationResult,
   RestaurantDetail,
   RestaurantDirectoryPage,
   SetPaymentCollectionModeRequest,
@@ -16,8 +21,9 @@ import {
 /**
  * The restaurant port — a BOUNDED, ENUMERABLE set of operations.
  *
- * Two reads, two service-configuration writes (Step 3E.2) and three subscription-terms
- * writes (Step 3E.3). Seven named operations, and a reader can list them.
+ * Two reads, two service-configuration writes (Step 3E.2), three subscription-terms
+ * writes (Step 3E.3), one creation (Step 2G) and two owner-invitation writes (Step 2G).
+ * Ten named operations, and a reader can list them.
  *
  * The second seam in this application that talks to a server, and it is shaped like
  * the first (`ADMIN_AUTH`) on purpose. A port plus a token is what keeps `npm start`
@@ -42,9 +48,18 @@ import {
  * and a parameterised method would make "what did this operator change?" a question
  * about an argument rather than about which operation was called.
  *
+ * STEP 2G ADDED THREE MORE, under the same discipline. `createRestaurant` is the one
+ * thing on this plane that can mint a tenant, an owner identity and a claim credential
+ * in one request; `reissueOwnerInvitation` and `cancelOwnerInvitation` are the two
+ * halves of the credential lifecycle — named, separate, and never
+ * `ownerInvitationAction(kind, …)`, `mutateInvitation`, `updateOwner` or `resend…`.
+ * Rotating a credential and terminating one are opposite decisions, and the method
+ * called is what makes the audit trail readable.
+ *
  * STILL ABSENT, and must stay absent until the step that owns them:
  *
  *   Step 4     the lifecycle transition
+ *   —          any owner search, any delivery of a claim code, any owner reassignment
  *
  * ── WHAT THE PORT DELIBERATELY DOES NOT DO ────────────────────────────────────────
  *
@@ -146,6 +161,71 @@ export interface RestaurantApi {
     restaurantId: string,
     request: EndSubscriptionTermsRequest,
   ): Observable<CommercialMutationResult>;
+
+  // --- restaurant creation (Step 2G, backend Step 2D) ---------------------------
+
+  /**
+   * Create ONE new canonical restaurant, its owner authority, its `admin_created`
+   * provenance and the owner's initial claim credential — all six rows or none.
+   *
+   * `POST /restaurants/`: the collection route, elevation-gated, CSRF-protected,
+   * audited exactly once. Answers 201 with the canonical detail projection, the owner
+   * account's id and whether it was created, and the invitation with its RAW claim
+   * token — returned here and never again. Creation ISSUES the credential; it does not
+   * deliver it, and it does not establish owner control. The restaurant starts
+   * `onboarding` and cannot go live until the readiness engine exists.
+   *
+   * A phone already in use is a 409 `owner_account_already_exists` naming only the
+   * existing account's UUID. NOTHING here, and nothing above this port, ever turns
+   * that into an automatic `mode: "existing"` request.
+   *
+   * A 5xx or a dead socket is INDETERMINATE: the server may have committed and the
+   * credential in its response is then lost. Nothing on this side retries a creation
+   * automatically; the operator reloads the directory and, if the restaurant exists,
+   * reissues the invitation from its workspace.
+   */
+  createRestaurant(request: CreateRestaurantRequest): Observable<RestaurantCreationResult>;
+
+  // --- owner invitation (Step 2G, backend Step 2E) -------------------------------
+  //
+  // TWO NAMED OPERATIONS, mirroring two named routes. `reissue`, NEVER `resend`: this
+  // system delivers nothing, and a method promising a delivery event would put a claim
+  // in the code that the platform cannot keep. Both take the exact invitation the
+  // operator reviewed (`expected_invitation_id`) and a reason, and both are
+  // elevation-gated and audited.
+
+  /**
+   * ROTATE this restaurant's owner claim credential.
+   *
+   * Supersedes whatever unresolved invitation the onboarding presents, mints a fresh
+   * one for the CURRENT canonical owner, and returns its raw claim token EXACTLY ONCE
+   * beside the canonical `onboarding` projection. Refused (409) when the head has moved
+   * (`stale_owner_invitation`), when the current owner has already claimed
+   * (`owner_control_already_established`), when the owner relationship has drifted,
+   * and when there is no usable owner account to invite.
+   *
+   * A lost response leaves the platform holding a credential nobody knows. THE REMEDY
+   * IS TO REISSUE AGAIN — which supersedes that unknown credential and mints a known
+   * one — never to recover plaintext that was never stored.
+   */
+  reissueOwnerInvitation(
+    restaurantId: string,
+    request: OwnerInvitationRequest,
+  ): Observable<OwnerInvitationReissueResult>;
+
+  /**
+   * TERMINATE this restaurant's exact unresolved owner claim credential.
+   *
+   * Stamps it cancelled and creates NO replacement — reopening later is a separate,
+   * deliberate reissue. Never requires owner consistency: revoking a credential must
+   * stay possible exactly when a tenant's state is messy. An exact retry answers
+   * `changed: false`, which is a success. Touches nothing about the owner account, its
+   * customer access, or its access to other restaurants.
+   */
+  cancelOwnerInvitation(
+    restaurantId: string,
+    request: OwnerInvitationRequest,
+  ): Observable<OwnerInvitationCancelResult>;
 }
 
 export const RESTAURANT_API = new InjectionToken<RestaurantApi>('RESTAURANT_API');

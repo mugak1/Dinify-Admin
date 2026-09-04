@@ -172,6 +172,21 @@ class StubApi implements RestaurantApi {
   endSubscriptionTerms(): Observable<CommercialMutationResult> {
     throw new Error('the directory must not write commercial state');
   }
+
+  // Creation is a NAVIGATION from here — `/restaurants/new` is its own screen — and the
+  // invitation writes belong to a workspace. All three throw for the same reason the
+  // commercial writes do.
+  createRestaurant(): Observable<never> {
+    throw new Error('the directory must not create a restaurant');
+  }
+
+  reissueOwnerInvitation(): Observable<never> {
+    throw new Error('the directory must not write an owner invitation');
+  }
+
+  cancelOwnerInvitation(): Observable<never> {
+    throw new Error('the directory must not write an owner invitation');
+  }
 }
 
 @Component({ selector: 'app-detail-stub', template: 'detail' })
@@ -245,6 +260,24 @@ describe('RestaurantsPage', () => {
     pending.next(pageOf([row()]));
     pending.complete();
     settle();
+    flush();
+  }));
+
+  it('offers Create restaurant as a real navigation to /restaurants/new, and never as a write here', fakeAsync(async () => {
+    await open();
+    settle();
+    flush();
+    settle();
+
+    // An ANCHOR, not a button: creation is a screen of its own, reached by URL, so it
+    // can be bookmarked, opened in a new tab and returned to with Back. The directory
+    // itself performs no write — its stub API throws on every one.
+    const create = el().querySelector<HTMLAnchorElement>('[data-create-restaurant]');
+    expect(create).withContext('the action is present').toBeTruthy();
+    expect(create!.tagName).toBe('A');
+    expect(create!.getAttribute('href')).toBe('/restaurants/new');
+    expect(create!.textContent?.trim()).toBe('Create restaurant');
+    expect(api.queries.length).withContext('rendering the action costs no request').toBe(1);
     flush();
   }));
 

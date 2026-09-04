@@ -22,6 +22,7 @@ import {
   ownerControlNote,
   ownerInvitationIsNotable,
   ownerInvitationLabel,
+  ownerInvitationNote,
   ownerRelationshipIsNotable,
   ownerRelationshipLabel,
   ownerRelationshipNote,
@@ -41,6 +42,7 @@ import {
   CommercialSummary,
   PaymentCollectionMode,
   PaymentTiming,
+  RestaurantDetail,
 } from '../core/restaurants/restaurant.model';
 import { RestaurantWorkspaceStore } from '../core/restaurants/restaurant-workspace.store';
 import { StatusPillComponent } from '../ui/status-pill.component';
@@ -63,18 +65,20 @@ import {
 /**
  * The five restaurant-detail tabs.
  *
- * OVERVIEW IS REAL (spec §9.1, step 1). The other four state what will live there and
- * which step of §15 brings it, so the boundary of this slice is legible from inside
- * the running application rather than only from a PR description. None of them
- * duplicates Overview's data to look busier: a placeholder that shows real numbers is
- * a placeholder an operator will start trusting as the feature.
+ * OVERVIEW IS REAL (spec §9.1, step 1), and READINESS now carries the OWNER CLAIM
+ * panel (Step 2G) beside the still-unbuilt readiness engine's placeholder. The other
+ * three state what will live there and which step of §15 brings it, so the boundary
+ * of this slice is legible from inside the running application rather than only from
+ * a PR description. None of them duplicates Overview's data to look busier: a
+ * placeholder that shows real numbers is a placeholder an operator will start trusting
+ * as the feature.
  */
 
-const PANEL = 'rounded-lg bg-surface p-6 ring-1 ring-line';
+export const PANEL = 'rounded-lg bg-surface p-6 ring-1 ring-line';
 
 /** A definition-list row. §16 asks for density, not four oversized KPI cards. */
-const TERM = 'text-admin-label text-ink-muted';
-const DEFINITION = 'text-admin-body text-ink';
+export const TERM = 'text-admin-label text-ink-muted';
+export const DEFINITION = 'text-admin-body text-ink';
 
 /**
  * A commercial row that CARRIES CONTROLS, and the reason it is not the plain row above.
@@ -130,9 +134,9 @@ const COMMERCIAL_ACTIONS =
  * reads as a problem on its own — "Stale evidence", "Owner mismatch", "Expired" — and
  * each is accompanied by prose saying what it means.
  */
-const DEFINITION_NOTABLE = 'text-admin-body text-admin-warning';
-const NOTE = 'mt-2 max-w-prose text-admin-meta text-ink-subtle';
-const NOTE_NOTABLE = 'mt-2 max-w-prose text-admin-meta text-admin-warning';
+export const DEFINITION_NOTABLE = 'text-admin-body text-admin-warning';
+export const NOTE = 'mt-2 max-w-prose text-admin-meta text-ink-subtle';
+export const NOTE_NOTABLE = 'mt-2 max-w-prose text-admin-meta text-admin-warning';
 
 /**
  * When a commercial axis was decided, EAT-labelled (§16) — or null where there is no
@@ -147,6 +151,27 @@ function setAtLabel(axis: CommercialAxis<unknown> | undefined): string | null {
   return formatEat(axis.set_at);
 }
 
+
+/**
+ * The one date an unresolved head needs beside its status, EAT-labelled. Null where
+ * there is no window to state — resolved heads, and heads that were never issued.
+ */
+export function invitationWindowLine(
+  invitation: RestaurantDetail['onboarding']['invitation'] | null,
+): string | null {
+  if (!invitation?.expires_at) return null;
+  // "Claim window", not "claim code expires": the WINDOW is the fact being stated, and
+  // the machine value (`expired`) must never appear as such in operator prose.
+  switch (invitation.status) {
+    case 'pending':
+    case 'verification_locked':
+      return `Claim window closes ${formatEat(invitation.expires_at)}.`;
+    case 'expired':
+      return `Claim window closed ${formatEat(invitation.expires_at)}.`;
+    default:
+      return null;
+  }
+}
 /**
  * The HTTP status of a failed write, or null.
  *
@@ -229,7 +254,7 @@ const TERMS_COPY: Record<'record' | 'replace' | 'end', CommercialWriteCopy> = {
   },
 };
 
-function readStatus(error: unknown): number | null {
+export function readStatus(error: unknown): number | null {
   if (typeof error !== 'object' || error === null) return null;
   const value = (error as Record<string, unknown>)['status'];
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
@@ -426,6 +451,31 @@ function readStatus(error: unknown): number | null {
 
               @if (controlNote(); as copy) {
                 <p [class]="ownerControlNotable() ? noteNotable : note">{{ copy }}</p>
+              }
+
+              <!-- The invitation's own sentence, and the one date that makes Pending
+                   and Expired legible. Warning treatment only where the operator has
+                   something to do (expired, verification locked). -->
+              @if (invitationWindow(); as line) {
+                <p [class]="note" data-onboarding-invitation-window>{{ line }}</p>
+              }
+              @if (invitationNote(); as copy) {
+                <p [class]="invitationNotable() ? noteNotable : note">{{ copy }}</p>
+              }
+
+              <!-- Where the claim code is ISSUED, REISSUED and CANCELLED (Step 2G): the
+                   Readiness tab, beside the blocker the claim satisfies. Overview
+                   summarises; it never carries the credential controls. A NAVIGATION,
+                   so an anchor. -->
+              @if (invitationManageable()) {
+                <p class="mt-3">
+                  <a
+                    [routerLink]="['/restaurants', data.id, 'readiness']"
+                    class="text-admin-label text-admin-accent hover:underline"
+                    data-onboarding-manage-claim
+                    >Manage the owner claim on Readiness</a
+                  >
+                </p>
               }
             }
           </section>
@@ -912,6 +962,22 @@ export class RestaurantOverviewTab {
   protected readonly invitationNotable = computed(() => {
     const summary = this.onboarding();
     return summary ? ownerInvitationIsNotable(summary.invitation.status) : false;
+  });
+
+  protected readonly invitationNote = computed(() => {
+    const summary = this.onboarding();
+    return summary ? ownerInvitationNote(summary.invitation.status) : null;
+  });
+
+  /** "Claim window closes …" / "Claim window closed …", EAT-labelled, for an unresolved head. */
+  protected readonly invitationWindow = computed(() =>
+    invitationWindowLine(this.onboarding()?.invitation ?? null),
+  );
+
+  /** Only an admin-created, tracked restaurant has a claim to manage. */
+  protected readonly invitationManageable = computed(() => {
+    const summary = this.onboarding();
+    return summary?.tracked === true && summary.source === 'admin_created';
   });
 
   protected readonly readiness = computed(() => {
@@ -1483,64 +1549,6 @@ export class RestaurantOverviewTab {
   protected readonly orderTime = computed(() =>
     formatEat(this.restaurant()?.operations.latest_order?.created_at),
   );
-}
-
-@Component({
-  selector: 'app-restaurant-readiness-tab',
-  changeDetection: ChangeDetectionStrategy.OnPush,
-  template: `
-    <section [class]="panel">
-      <h2 class="text-admin-section text-ink">Readiness</h2>
-      <p class="mt-1 max-w-prose text-admin-body text-ink-muted">
-        The go-live rules engine is not built yet. The server's readiness check currently fails
-        closed for every restaurant — it reports one blocker, "readiness not configured", and
-        refuses the onboarding-to-live transition on every path. That is a deliberate safety
-        state, not a fault with any particular restaurant.
-      </p>
-      <p class="mt-2 max-w-prose text-admin-body text-ink-muted">
-        This tab will show the real checklist: restaurant setup (a published available item, an
-        enabled table with a current QR, a completed test order), ownership (owner account
-        claimed and go-live approval recorded), and commercial.
-      </p>
-      <p class="mt-2 max-w-prose text-admin-body text-ink-muted">
-        <!-- Rewritten for Step 3E.1. This described the commercial half as "subscription record,
-             payment mode" and spoke of a cash-only restaurant — vocabulary that predates the
-             commercial domain and that the portal no longer uses anywhere else. It names the
-             three canonical facts instead, and states the offline consequence without turning
-             either collection mode into a claim the platform cannot support. -->
-        The commercial half evaluates the three facts Overview already reports, separately:
-        payment timing recorded, payment collection mode recorded, and current subscription terms
-        recorded. Conditional rules apply before satisfaction is evaluated — a TIN is required
-        only when the restaurant is VAT-registered.
-      </p>
-      <p class="mt-2 max-w-prose text-admin-body text-ink-muted">
-        Collection mode decides whether a payment provider is in scope at all. Where the
-        restaurant collects the diner payment itself, provider readiness is NOT APPLICABLE rather
-        than a blocker it could never clear — that mode is permanent and first-class, and the
-        first commercial restaurant has to be able to go live in it.
-      </p>
-      <p class="mt-2 max-w-prose text-admin-body text-ink-muted">
-        <!-- FAIL CLOSED, deliberately. An earlier draft of this paragraph said merchant readiness
-             became a requirement "only once a real integration exists", which reads as a WAIVER:
-             it would let a restaurant go live having chosen a collection path that cannot take a
-             payment. The backend states the intended answer as "required but unavailable", which
-             is a blocker, and readiness fails closed everywhere else in this system. -->
-        Where Dinify is recorded as initiating the diner payment through a provider,
-        provider-authoritative merchant readiness is REQUIRED — and with no integration built,
-        that requirement is required but UNAVAILABLE: nothing can satisfy it, so it blocks rather
-        than being waived. There is still no provider, no merchant identity and no readiness
-        verdict for this portal to report; what the engine will report is that the question
-        cannot yet be answered.
-      </p>
-      <p class="mt-2 max-w-prose text-admin-body text-ink-muted">
-        The owner-invitation state machine lives here too, beside the blocker it satisfies.
-      </p>
-      <p class="mt-3 text-admin-meta text-ink-subtle">Spec §10 and §14 — arrives with step 3.</p>
-    </section>
-  `,
-})
-export class RestaurantReadinessTab {
-  protected readonly panel = PANEL;
 }
 
 @Component({

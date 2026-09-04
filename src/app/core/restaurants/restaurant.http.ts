@@ -2,15 +2,25 @@ import { HttpClient, HttpParams } from '@angular/common/http';
 import { inject, Injectable } from '@angular/core';
 import { map, Observable } from 'rxjs';
 
-import { apiUrl, COMMERCIAL_ROUTES, RESTAURANT_ROUTES } from '../api/api.constants';
+import {
+  apiUrl,
+  COMMERCIAL_ROUTES,
+  OWNER_INVITATION_ROUTES,
+  RESTAURANT_ROUTES,
+} from '../api/api.constants';
 import { RestaurantApi } from './restaurant.api';
 import {
   CommercialMutationResult,
+  CreateRestaurantRequest,
   DEFAULT_PAGE_SIZE,
   DirectoryQuery,
   EndSubscriptionTermsRequest,
+  OwnerInvitationCancelResult,
+  OwnerInvitationReissueResult,
+  OwnerInvitationRequest,
   RecordSubscriptionTermsRequest,
   ReplaceSubscriptionTermsRequest,
+  RestaurantCreationResult,
   RestaurantDetail,
   RestaurantDirectoryPage,
   SetPaymentCollectionModeRequest,
@@ -24,9 +34,9 @@ interface Envelope<T> {
 }
 
 /**
- * The real restaurant transport. Seven named operations; no other endpoint is reachable
- * from here — two reads, two service-configuration writes and three subscription-terms
- * writes.
+ * The real restaurant transport. Ten named operations; no other endpoint is reachable
+ * from here — two reads, two service-configuration writes, three subscription-terms
+ * writes, one creation and two owner-invitation writes.
  *
  * Same-origin and relative, so the `__Host-` session cookie rides automatically and
  * `withCredentials` is deliberately absent. It goes through the ordinary `HttpClient`
@@ -88,56 +98,89 @@ export class RestaurantHttp implements RestaurantApi {
     restaurantId: string,
     request: SetPaymentTimingRequest,
   ): Observable<CommercialMutationResult> {
-    return this.#write(COMMERCIAL_ROUTES.paymentTiming(restaurantId), request);
+    return this.#post(COMMERCIAL_ROUTES.paymentTiming(restaurantId), request);
   }
 
   setPaymentCollectionMode(
     restaurantId: string,
     request: SetPaymentCollectionModeRequest,
   ): Observable<CommercialMutationResult> {
-    return this.#write(COMMERCIAL_ROUTES.paymentCollectionMode(restaurantId), request);
+    return this.#post(COMMERCIAL_ROUTES.paymentCollectionMode(restaurantId), request);
   }
 
-  /**
-   * POST one already-built commercial request and unwrap the envelope.
-   *
-   * Ordinary `HttpClient`, so the whole existing security stack applies without being
-   * restated: `csrfInterceptor` adds `X-CSRFToken` from the `__Host-` cookie, and
-   * `errorClassifierInterceptor` owns the 401, the bounded CSRF refresh-and-replay and
-   * — the one that matters most here — the 403 that means "elevate first", which opens
-   * ONE dialog and replays THIS EXACT request once on success. Rebuilding the body
-   * after elevation is impossible from here, which is the point.
-   *
-   * A REAL `#private` method, not a TypeScript `private` one. The latter is erased at
-   * compile time and leaves a generic `write(route, body)` sitting on the instance —
-   * which is exactly the generic mutation surface this slice is supposed not to have. A
-   * hash-private method is unreachable at runtime, so the public API really is two named
-   * operations rather than two named operations plus an unadvertised third.
-   */
   recordSubscriptionTerms(
     restaurantId: string,
     request: RecordSubscriptionTermsRequest,
   ): Observable<CommercialMutationResult> {
-    return this.#write(COMMERCIAL_ROUTES.recordSubscriptionTerms(restaurantId), request);
+    return this.#post(COMMERCIAL_ROUTES.recordSubscriptionTerms(restaurantId), request);
   }
 
   replaceSubscriptionTerms(
     restaurantId: string,
     request: ReplaceSubscriptionTermsRequest,
   ): Observable<CommercialMutationResult> {
-    return this.#write(COMMERCIAL_ROUTES.replaceSubscriptionTerms(restaurantId), request);
+    return this.#post(COMMERCIAL_ROUTES.replaceSubscriptionTerms(restaurantId), request);
   }
 
   endSubscriptionTerms(
     restaurantId: string,
     request: EndSubscriptionTermsRequest,
   ): Observable<CommercialMutationResult> {
-    return this.#write(COMMERCIAL_ROUTES.endSubscriptionTerms(restaurantId), request);
+    return this.#post(COMMERCIAL_ROUTES.endSubscriptionTerms(restaurantId), request);
   }
 
-  #write<T>(route: string, body: T): Observable<CommercialMutationResult> {
+  // --- restaurant creation (Step 2G) --------------------------------------------
+
+  /**
+   * `POST /restaurants/` — the collection route. The request body is sent VERBATIM:
+   * `is_test` as the boolean the operator stated, the owner block with exactly the
+   * chosen mode's fields, the reason untouched. The 201 envelope is unwrapped and the
+   * payload — the canonical detail, the owner account and the invitation with its raw
+   * claim token — is handed on exactly as it arrived. The token passes through this
+   * class in flight and is held nowhere in it.
+   */
+  createRestaurant(request: CreateRestaurantRequest): Observable<RestaurantCreationResult> {
+    return this.#post(RESTAURANT_ROUTES.create, request);
+  }
+
+  // --- owner invitation (Step 2G) -----------------------------------------------
+  //
+  // TWO NAMED METHODS, TWO NAMED ROUTES, one body shape. `reissue`, never `resend`.
+
+  reissueOwnerInvitation(
+    restaurantId: string,
+    request: OwnerInvitationRequest,
+  ): Observable<OwnerInvitationReissueResult> {
+    return this.#post(OWNER_INVITATION_ROUTES.reissue(restaurantId), request);
+  }
+
+  cancelOwnerInvitation(
+    restaurantId: string,
+    request: OwnerInvitationRequest,
+  ): Observable<OwnerInvitationCancelResult> {
+    return this.#post(OWNER_INVITATION_ROUTES.cancel(restaurantId), request);
+  }
+
+  /**
+   * POST one already-built request and unwrap the envelope.
+   *
+   * Ordinary `HttpClient`, so the whole existing security stack applies without being
+   * restated: `csrfInterceptor` adds `X-CSRFToken` from the `__Host-` cookie, and
+   * `errorClassifierInterceptor` owns the 401, the bounded CSRF refresh-and-replay and
+   * — the one that matters most here — the 403 that means "elevate first", which opens
+   * ONE dialog and replays THIS EXACT request once on success. Rebuilding the body
+   * after elevation is impossible from here, which is the point: the concurrency token,
+   * the reviewed reason and the operator's stated `is_test` all ride the replay intact.
+   *
+   * A REAL `#private` method, not a TypeScript `private` one. The latter is erased at
+   * compile time and leaves a generic `post(route, body)` sitting on the instance —
+   * which is exactly the generic mutation surface this class is supposed not to have. A
+   * hash-private method is unreachable at runtime, so the public API really is the ten
+   * named operations rather than ten named operations plus an unadvertised eleventh.
+   */
+  #post<TBody, TResult>(route: string, body: TBody): Observable<TResult> {
     return this.http
-      .post<Envelope<CommercialMutationResult>>(apiUrl(route), body)
+      .post<Envelope<TResult>>(apiUrl(route), body)
       .pipe(map((response) => response.data));
   }
 }

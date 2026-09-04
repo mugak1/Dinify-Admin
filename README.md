@@ -9,18 +9,21 @@ no runtime code with the restaurant portal or the diner app.
 
 ## Status
 
-**Step 0 — scaffold.** This repo currently contains the system, not the screens:
-the shell and navigation, the routing and URL-as-state layer, authentication against
-the five admin auth routes, the HTTP layer (CSRF, the error classifier, the elevation
-queue), the design tokens and the guard that enforces them, three primitives, and the
-formatting helpers.
+**Steps 0 through 3E, plus 2G, of the spec's §15 sequence are built and deployed.**
+The shell and navigation, URL-as-state filtering, authentication against the five admin
+auth routes, the HTTP layer (CSRF, the error classifier, the elevation queue), the
+design tokens and their guard, the restaurant directory and detail workspace, the
+onboarding and commercial projections on Overview, the five commercial writes, and —
+as of Step 2G — restaurant creation (`/restaurants/new`, with the one-time owner claim
+code) and the owner-invitation reissue and cancel controls on the Readiness tab.
 
-The restaurant directory, detail workspace, readiness engine, lifecycle controls,
-owner invitation, delegated drill-in, support triage, receivables and activity feed
-are **not built** — every destination renders a placeholder with a written empty
-state. See `ADMIN_PORTAL_MVP_v2_3.md` §15 for the sequence.
+The readiness engine, lifecycle controls, restaurant adoption, owner-control
+attestation, delegated drill-in, support triage, receivables, the Activity screen and
+Home's needs-attention list are **not built**; those destinations render a placeholder
+with a written empty state. See `ADMIN_PORTAL_MVP_v2_3.md` §15 for the sequence.
 
-There is **no deployment yet**. That is 0C.
+Deployment is live and automatic — a successful CI run on `main` deploys that exact
+commit over OIDC and SSM. See `CLAUDE.md` › Deployment.
 
 ## Getting started
 
@@ -29,11 +32,13 @@ npm ci          # plain ci — no --legacy-peer-deps, see CLAUDE.md
 npm start       # http://localhost:4200, NO BACKEND NEEDED
 ```
 
-`npm start` runs against a mock auth transport, so the complete shell, all five
-destinations and a dev-only primitives gallery at `/__gallery` render with nothing
-else running. Sign in with any username and password; a username containing `locked`
-exercises the break-glass recovery-code path, and the code `000000` exercises a
-failed second factor.
+`npm start` runs against mock transports, so the complete shell, all five destinations,
+the restaurant directory and workspace, restaurant creation, the owner-claim controls
+and a dev-only primitives gallery at `/__gallery` render with nothing else running.
+Sign in with any username and password; a username containing `locked` exercises the
+break-glass recovery-code path, and the code `000000` exercises a failed second factor.
+The unhappy paths of creation and the invitation writes have console levers — see
+`CLAUDE.md` › Mock Mode.
 
 `ng serve --configuration=live` uses the real API instead (same-origin — it needs
 something serving this app and proxying `/api`).
@@ -45,6 +50,7 @@ something serving this app and proxying `/api`).
 npm run type-check
 npm run lint
 npm run check:tokens         # design-token gate (self-test, then the real scan)
+npm run check:claim-code     # claim-code gate: a raw owner claim code reaches no sink
 npm run test:ci
 npm run build:prod
 npm run check:mock-isolation # after build:prod — scans dist/

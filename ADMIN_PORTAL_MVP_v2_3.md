@@ -1,6 +1,7 @@
 # Dinify Admin Portal — MVP Specification v2.3
 
 **Status:** Phase 0.5 complete; Phase 1 ready to begin · August 2026 · **Supersedes v2.2 in full**
+**Amended for Step 2G (September 2026):** §6, §9.2, §14 and §15 now record the admin-plane restaurant creation and owner-invitation controls as built, and correct v2.3's statement that Phase 1 has no admin-plane onboarding API. Each amended passage says what it replaced. Nothing else in this document changed, and §10's open question on owner go-live approval is deliberately left open.
 **What changed from v2.2:** an information architecture (§9) that v2.2 lacked entirely; a corrected readiness definition (§10) resolving a contradiction between v2.2 §9 and its own Definition of Done; Home reframed as an operator inbox rather than a dashboard (§11); a read-only Activity view promoted into MVP (§12); lifecycle transitions given preflight consequence screens (§13); the owner-invitation state machine specified (§14); and UI conventions locked (§16). Sections 1–8 carry over from v2.2 with light edits.
 
 ---
@@ -37,7 +38,7 @@ Unchanged from v2.2 §5. Support delegation and assisted onboarding are separate
 
 ## 6. Onboarding and suspension — Gate 1 decisions
 
-Unchanged from v2.2 §6. White-glove onboarding is a hands-on operational service performed through the restaurant portal with the owner present; **no admin-plane onboarding API in Phase 1**. Owner-controlled always: account claim, credentials, privileged staff, payment-provider connection, payment-mode confirmation, **go-live approval**, anything contractual.
+**Corrected in Step 2G.** This paragraph carried over from v2.2 the sentence *"no admin-plane onboarding API in Phase 1"*, and that stopped being true before this document was written: PR-A removed the last customer-plane path that could create a restaurant (there is none, and there must never be one again), and backend Steps 2D and 2E rebuilt creation natively on the admin plane. So: white-glove onboarding remains a hands-on operational service performed with the owner present, but the tenant is **created on the admin plane** — `POST /api/admin/v1/restaurants/` creates the canonical restaurant, its owner account (new, or an existing one attached unmodified), its `admin_created` provenance and the owner's initial claim credential in one elevated, audited transaction, and `restaurants/<id>/owner-invitation/reissue/` and `.../cancel/` rotate or withdraw that credential. The Admin portal exposes exactly those three operations (Step 2G; §14). Creation establishes no owner control and makes nothing live: the restaurant starts `onboarding`, and readiness (§10) still fails closed. Owner-controlled always: account claim (the owner redeems the claim code in the restaurant portal, with a verification code to their own phone), credentials, privileged staff, payment-provider connection, payment-mode confirmation, **go-live approval** (a separate step, still undesigned — see §10), anything contractual.
 
 Suspension policy, to be settled and built within the lifecycle slice: ordinary suspension blocks new trading but lets already-accepted orders progress to terminal states; emergency freeze is a separate exceptional action; cancellation requires a defined financial resolution; offboard is refused while active orders remain; freeing a table is a consequence of reaching a terminal order state.
 
@@ -97,12 +98,15 @@ Meaningful, deep-linkable, refreshable, with working browser Back:
 
 ```
 /restaurants                      /support
-/restaurants/:id                  /support/:issueId
-/restaurants/:id/readiness        /receivables
-/restaurants/:id/billing          /receivables/:invoiceId
-/restaurants/:id/support          /activity
+/restaurants/new                  /support/:issueId
+/restaurants/:id                  /receivables
+/restaurants/:id/readiness        /receivables/:invoiceId
+/restaurants/:id/billing          /activity
+/restaurants/:id/support
 /restaurants/:id/activity
 ```
+
+`/restaurants/new` (added in Step 2G) is the creation screen — a UI route over the existing `POST /restaurants/` collection write, declared before `/restaurants/:id` so that "new" is never read as an identifier.
 
 **Filters persist in the URL**, not component state: `/restaurants?status=onboarding&attention=true`. This is what makes needs-attention links from Home actually work.
 
@@ -164,15 +168,21 @@ A **written reason is required** on every transition, consistent with the audit 
 
 **After execution, close the loop:** confirm what changed, state what remains — "New orders blocked. 3 accepted orders remain in fulfilment" — and link to them.
 
-## 14. Owner invitation state machine — NEW
+## 14. Owner invitation state machine — REVISED in Step 2G
 
-"Invite owner to claim" needs more than a button, because owner claim is a hard readiness blocker.
+"Invite owner to claim" needs more than a button, because owner claim is a hard readiness blocker. That much stands. The rest of this section as written in v2.3 — states *not invited → invitation sent → claimed*, actions *send / resend / cancel*, a displayed *recipient* and *sent timestamp*, and a visible SMS delivery failure — described a delivery the platform was assumed to perform. **What was built delivers nothing, and that is a decision rather than a shortfall:** the schema has no delivery model, channel or delivery state, because today's transactional delivery is not reliable enough to freeze a contract around, and a Sent or Delivered status would have asserted something the platform never did. The v2.3 text is replaced by the following.
 
-**States:** not invited → invitation sent → claimed; plus expired and cancelled. **Actions:** send, resend, cancel. **Displayed:** recipient, sent timestamp, expiry timestamp.
+**What an invitation is.** A claim is two-factor. The backend issues a high-entropy claim **credential** (≈288 bits) at creation and at every reissue, persists only its hash, and returns the raw code exactly once, in that one response; the owner then proves current control with a verification code sent to their own phone from the restaurant portal. The hand-off is **operator-mediated**: the Admin portal shows the code once, in a copyable field, and the operator gives it to the owner out of band; the owner enters it on the restaurant portal's owner-claim screen. No claim link exists and none is fabricated.
 
-**Delivery failure must be visible.** The Yo SMS gateway reports outcomes inside HTTP 200 bodies, so "the notification service accepted the request" is not "the owner can claim their account." The UI must distinguish accepted-for-delivery from delivered, and surface failures rather than showing an optimistic Sent.
+**States**, read from the server's canonical `onboarding.invitation` projection and never derived here: `not_issued`, `pending`, `expired`, `verification_locked` (the per-credential attempt budget is spent — the same remedy as expiry, but a security event rather than a clock), `consumed`, `cancelled`, `superseded`; plus `not_applicable` for a pre-existing restaurant and `unavailable` for one the domain has no record of. **Owner control is a separate axis** (`not_established` / `attested` / `invitation_redeemed` / `stale_attestation`) and is never inferred from the invitation: a consumed invitation beside not-established control is a legitimate pair (a previous owner redeemed it).
 
-This lives on the restaurant's Readiness tab, where the blocker it satisfies also lives.
+**Actions:** *issue* happens as a consequence of creation, never as a separate button; **reissue** is rotation — the outstanding credential stops working and a new code is shown once; **cancel** withdraws the credential and mints no replacement. There is no *send* and no *resend*. Both writes name the exact invitation the operator reviewed (`expected_invitation_id`, an identity rather than a status) and a reason, are elevation-gated and audited, and a 409 is never retried with a fresh token: the projection is reloaded and no new decision is possible until it has. Controls are offered only where the server would accept them.
+
+**Displayed:** owner control and invitation state as two rows, the issue and expiry timestamps in EAT, and — once, after creation or reissue — the raw code with an explicit warning that it cannot be retrieved. A lost code, including one lost to a response that never arrived, is recovered by **reissuing**, never by retrieving plaintext; the Admin frontend persists the code nowhere and a source gate enforces that.
+
+**Where:** the restaurant's Readiness tab, where the blocker it satisfies also lives; Overview reports the state and links there.
+
+**Still open:** delivery of any kind; and Home's "invitation nearing expiry" item (§11), derivable from `expires_at` once Home is built.
 
 ## 15. Phase 1 scope and sequence
 
@@ -180,9 +190,9 @@ This lives on the restaurant's Readiness tab, where the blocker it satisfies als
 
 **1. Restaurant directory + detail workspace shell** — the §9.1 structure with Overview populated. Directory columns: restaurant, lifecycle, **readiness**, payment, subscription terms, open issues, last activity. Filters: All / Needs attention / Onboarding, plus status and search. No bulk actions or saved views — nothing legitimate happens in bulk across tenants.
 
-**2. Create restaurant shell + owner invitation** (§14).
+**2. Create restaurant + owner invitation** (§14) — **built.** Backend Steps 2D (creation), 2E (reissue and cancel) and 2F.1–2F.3 (owner claim in the restaurant portal, with profile bootstrap) landed first; Admin Step 2G added `/restaurants/new`, the one-time claim-code hand-off, and the reissue and cancel controls on the Readiness tab. Restaurant adoption, owner-control attestation and owner reassignment are not part of it.
 
-**3. Readiness engine + QR generation** (§10) — landing as **one vertical slice with step 2**. Never ship restaurant creation that leaves tenants permanently stranded.
+**3. Readiness engine + QR generation** (§10) — v2.3 sequenced this as one vertical slice with step 2 so that creation could never leave tenants permanently stranded. **Creation shipped ahead of it**, on the strength of the safety property the backend already has: `check_go_live_readiness` fails closed, so a tenant created today cannot go live and is stranded in `onboarding` until the engine lands. That is the recoverable direction — a tenant that went live unready would not be — and it is stated here as the accepted cost rather than left for the next reader to discover. The engine remains unbuilt and is the next step.
 
 **4. Lifecycle controls** (§13), including the §6 suspension policy as design-then-build.
 

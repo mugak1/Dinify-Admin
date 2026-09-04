@@ -14,7 +14,7 @@ Before making changes:
 5. Do not make broad refactors unless explicitly requested.
 6. Run `./scripts/verify.sh` before preparing a PR and paste the output.
 
-Seven rules that are easy to break by habit:
+Eight rules that are easy to break by habit:
 - Global navigation is FIVE destinations. New capability becomes a restaurant-detail
   tab or a needs-attention condition, never a sixth sidebar item.
 - Filters go in the URL via `core/url/query-param.ts`, never in component state.
@@ -32,6 +32,12 @@ Seven rules that are easy to break by habit:
   showing a portfolio that does not exist.
 - Templates are inline, so a BACKTICK inside one terminates the TypeScript template
   literal — including inside an HTML comment. Write prose, or single quotes.
+- A raw owner claim code is a BEARER CREDENTIAL shown once. It may live in a
+  component's transient state to be displayed and copied, and nowhere else — never
+  storage, the URL, router state, the workspace store, a canonical model, a log, a
+  notice, or a fabricated claim link. `scripts/check-claim-code-handling.mjs` enforces
+  it, and the vocabulary is issue / reissue / cancel — never send, resend, sent or
+  delivered, because nothing is delivered.
 
 For Codex Desktop work:
 - Use Worktree mode by default.

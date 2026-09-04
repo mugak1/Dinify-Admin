@@ -161,6 +161,52 @@ describe('RestaurantWorkspaceStore', () => {
     });
   });
 
+  describe('the invitation write records', () => {
+    // NON-SECRET bookkeeping about a write whose outcome the tab that sent it may not be
+    // around to render: WHICH invitation's code went unseen, and WHAT an unanswered
+    // write asserted. Never the code — the claim-code gate refuses a credential
+    // identifier in this file at all, and the tab specs sweep these two values for the
+    // token beside the detail.
+
+    it('remember which invitation’s code went unseen — by its id, and until a code is shown', () => {
+      expect(store.unshownCodeInvitationId()).toBeNull();
+      store.markCodeUnshown('4d5e6f70-8192-4a3b-9c4d-000000000002');
+      expect(store.unshownCodeInvitationId()).toBe('4d5e6f70-8192-4a3b-9c4d-000000000002');
+      store.clearCodeUnshown();
+      expect(store.unshownCodeInvitationId()).toBeNull();
+    });
+
+    it('remember an unanswered write until the operator acts again', () => {
+      expect(store.indeterminateInvitationWrite()).toBeNull();
+      store.noteIndeterminateInvitationWrite({ action: 'reissue', expectedId: '4d5e6f70-8192-4a3b-9c4d-000000000001' });
+      expect(store.indeterminateInvitationWrite()).toEqual({
+        action: 'reissue',
+        expectedId: '4d5e6f70-8192-4a3b-9c4d-000000000001',
+      });
+      store.clearIndeterminateInvitationWrite();
+      expect(store.indeterminateInvitationWrite()).toBeNull();
+    });
+
+    it('survive a re-read of the same restaurant, and NOT a move to a different one', () => {
+      store.load(ID);
+      store.markCodeUnshown('4d5e6f70-8192-4a3b-9c4d-000000000002');
+      store.noteIndeterminateInvitationWrite({ action: 'cancel', expectedId: '4d5e6f70-8192-4a3b-9c4d-000000000001' });
+
+      // The re-read after an unanswered write is exactly when the records are needed.
+      store.reloadSuperseded();
+      expect(store.unshownCodeInvitationId()).toBe('4d5e6f70-8192-4a3b-9c4d-000000000002');
+      expect(store.indeterminateInvitationWrite()).not.toBeNull();
+      store.reload();
+      expect(store.unshownCodeInvitationId()).toBe('4d5e6f70-8192-4a3b-9c4d-000000000002');
+
+      // A record about one restaurant's invitation must not survive into another's
+      // workspace, where an id could only ever fail to match — or, worse, match.
+      store.load('aaaaaaaa-0000-4000-8000-000000000002');
+      expect(store.unshownCodeInvitationId()).toBeNull();
+      expect(store.indeterminateInvitationWrite()).toBeNull();
+    });
+  });
+
   describe('adoptOnboarding', () => {
     it('replaces ONLY the onboarding projection, and re-derives the owner aliases from it', () => {
       store.load(ID);

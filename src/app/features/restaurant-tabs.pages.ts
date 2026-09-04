@@ -153,24 +153,37 @@ function setAtLabel(axis: CommercialAxis<unknown> | undefined): string | null {
 
 
 /**
- * The one date an unresolved head needs beside its status, EAT-labelled. Null where
- * there is no window to state — resolved heads, and heads that were never issued.
+ * The head invitation's own timestamps, EAT-labelled (§14): when it was ISSUED — which
+ * after a reissue is when the credential was rotated, the one fact that tells a stale
+ * code from the current one — and, while it is unresolved, when its claim window closes
+ * or closed. A resolved head (consumed, cancelled, superseded) states only its issue
+ * time: its window is no longer a fact that matters. Null where nothing was issued.
+ *
+ * Review found the first version stating the expiry alone, which left the issue time
+ * — the timestamp §14 asks for first — nowhere on either screen.
  */
 export function invitationWindowLine(
   invitation: RestaurantDetail['onboarding']['invitation'] | null,
 ): string | null {
-  if (!invitation?.expires_at) return null;
+  if (!invitation?.id) return null;
+  const sentences: string[] = [];
+  if (invitation.issued_at) sentences.push(`Issued ${formatEat(invitation.issued_at)}.`);
   // "Claim window", not "claim code expires": the WINDOW is the fact being stated, and
   // the machine value (`expired`) must never appear as such in operator prose.
-  switch (invitation.status) {
-    case 'pending':
-    case 'verification_locked':
-      return `Claim window closes ${formatEat(invitation.expires_at)}.`;
-    case 'expired':
-      return `Claim window closed ${formatEat(invitation.expires_at)}.`;
-    default:
-      return null;
+  if (invitation.expires_at) {
+    switch (invitation.status) {
+      case 'pending':
+      case 'verification_locked':
+        sentences.push(`Claim window closes ${formatEat(invitation.expires_at)}.`);
+        break;
+      case 'expired':
+        sentences.push(`Claim window closed ${formatEat(invitation.expires_at)}.`);
+        break;
+      default:
+        break;
+    }
   }
+  return sentences.length ? sentences.join(' ') : null;
 }
 /**
  * The HTTP status of a failed write, or null.
@@ -453,9 +466,10 @@ export function readStatus(error: unknown): number | null {
                 <p [class]="ownerControlNotable() ? noteNotable : note">{{ copy }}</p>
               }
 
-              <!-- The invitation's own sentence, and the one date that makes Pending
-                   and Expired legible. Warning treatment only where the operator has
-                   something to do (expired, verification locked). -->
+              <!-- The invitation's own sentence, and its timestamps: when the current
+                   credential was issued, and the window that makes Pending and Expired
+                   legible. Warning treatment only where the operator has something to
+                   do (expired, verification locked). -->
               @if (invitationWindow(); as line) {
                 <p [class]="note" data-onboarding-invitation-window>{{ line }}</p>
               }

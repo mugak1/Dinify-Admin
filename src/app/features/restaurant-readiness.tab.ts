@@ -1,12 +1,4 @@
-import {
-  ChangeDetectionStrategy,
-  Component,
-  computed,
-  effect,
-  inject,
-  signal,
-  untracked,
-} from '@angular/core';
+import { ChangeDetectionStrategy, Component, computed, DestroyRef, inject, signal } from '@angular/core';
 
 import { AdminServiceStatus } from '../core/api/service-status';
 import { extractErrorMessage, extractFieldErrors } from '../core/api/error-message';
@@ -31,7 +23,10 @@ import {
   RestaurantDetail,
   UNRESOLVED_OWNER_INVITATION_STATUSES,
 } from '../core/restaurants/restaurant.model';
-import { RestaurantWorkspaceStore } from '../core/restaurants/restaurant-workspace.store';
+import {
+  OwnerInvitationWriteAction,
+  RestaurantWorkspaceStore,
+} from '../core/restaurants/restaurant-workspace.store';
 import { AdminButtonComponent } from '../ui/button.component';
 import { OwnerClaimCodeComponent } from './owner-claim-code.component';
 import {
@@ -95,7 +90,7 @@ import {
  * already claimed) and it offers CANCEL and not REISSUE; `consumed` beside
  * `not_established` is another (a previous owner claimed) and it offers REISSUE.
  */
-export type InvitationAction = 'reissue' | 'cancel';
+export type InvitationAction = OwnerInvitationWriteAction;
 
 export interface InvitationControls {
   readonly reissue: boolean;
@@ -310,13 +305,13 @@ const INVITATION_COPY: Record<
             }
 
             @if (orphanedWrite()) {
-              <!-- A write from a PREVIOUS instance of this tab landed after the tab was
-                   rebuilt. The projection above is current; the credential it may have
-                   produced is not, and never will be. -->
+              <!-- A reissue from a PREVIOUS instance of this tab landed after that tab
+                   was gone. The projection above is current; the credential it produced
+                   was never shown and never will be. -->
               <p class="mt-2 max-w-prose text-admin-body text-admin-warning" data-claim-orphaned>
-                The invitation changed while this tab was away — a reissue or cancellation was
-                still in flight when it was closed — and no claim code from it could be shown
-                here. If the owner still needs a code, reissue again.
+                The claim code was reissued while this tab was closed, so no claim code from it
+                could be shown here, and it cannot be retrieved. If the owner still needs a code,
+                reissue again.
               </p>
             }
 
@@ -448,33 +443,51 @@ export class RestaurantReadinessTab {
   protected readonly controls = computed(() => invitationControlsFor(this.restaurant()));
 
   /**
-   * A write from a PREVIOUS instance of this tab landed after this one was built.
+   * A reissue from a PREVIOUS instance of this tab landed after that instance was gone,
+   * and the head on screen is the credential it minted.
    *
    * The tabs are sibling routes, so an operator who clicks Reissue and then Overview has
    * this tab destroyed while the request runs. The request is deliberately not torn down
    * with it (cancelling the subscription would not un-send it), and when it lands the
    * dead instance adopts the projection into the shared store — which this instance
-   * renders — and sets the raw code on a signal nobody will ever read. The store is the
-   * right place for the projection and the wrong place for the credential, so the code
-   * is simply lost. This says so, rather than leaving a fresh "Pending" row with no
-   * explanation of where its code went; the remedy is the usual one.
+   * renders — and must drop the raw code, because the store is the right place for the
+   * projection and the wrong place for a credential. What the dead instance records
+   * instead, on the store, is the NON-SECRET fact: the id of the invitation whose code
+   * went unseen (`markCodeUnshown`). This tab renders the note while that id is still the
+   * unresolved head, rather than leaving a fresh "Pending" row with no explanation of
+   * where its code went; the remedy is the usual one.
    *
-   * Detected at construction: if the workspace already has an invitation write in flight,
-   * the head at that moment is remembered and compared once the slot is released. A
-   * changed head means a reissue landed unseen (or somebody else's did, which for the
-   * operator's purposes is the same fact); an unchanged head means a cancellation, whose
-   * answer carries nothing that could be lost.
+   * WHY A STORE RECORD AND NOT A CONSTRUCTION-TIME WATCH. The first version of this tab
+   * noticed the case only when the write was still in flight as it was built, and review
+   * found the half it missed: a reissue that COMPLETED while the operator was on Overview
+   * left the slot released, so the rebuilt tab saw nothing to watch and said nothing. The
+   * fact has to outlive the tab that produced it, so it lives where the projection does.
+   *
+   * A cancellation landing the same way raises nothing: its answer carries nothing that
+   * could be lost. And the note disappears on its own once the head moves on — a fresh
+   * reissue (whose code IS shown) or a cancellation resolves it.
    */
-  protected readonly orphanedWrite = signal(false);
+  protected readonly orphanedWrite = computed(() => {
+    const unshown = this.workspace.unshownCodeInvitationId();
+    const head = this.onboarding()?.invitation;
+    return (
+      unshown !== null &&
+      head?.id === unshown &&
+      UNRESOLVED_OWNER_INVITATION_STATUSES.includes(head.status)
+    );
+  });
+
+  /**
+   * Whether this instance has been destroyed — read by the write callbacks, which
+   * deliberately outlive it. A callback on a dead instance still owns the workspace-level
+   * bookkeeping (the slot, the projection, the unshown-code record); what it must NOT do
+   * is put the credential on a signal nobody will render.
+   */
+  private destroyed = false;
 
   constructor() {
-    if (!this.workspace.invitationMutating()) return;
-    const headBefore = this.onboarding()?.invitation.id ?? null;
-    const watch = effect(() => {
-      if (this.workspace.invitationMutating()) return;
-      const headAfter = untracked(() => this.onboarding()?.invitation.id ?? null);
-      if (headAfter !== headBefore) this.orphanedWrite.set(true);
-      watch.destroy();
+    inject(DestroyRef).onDestroy(() => {
+      this.destroyed = true;
     });
   }
 
@@ -540,16 +553,6 @@ export class RestaurantReadinessTab {
   protected readonly claimToken = signal<string | null>(null);
   protected readonly issued = signal<{ issued_at: string; expires_at: string } | null>(null);
 
-  /**
-   * An invitation write that got NO USABLE ANSWER: which action, and which invitation
-   * it named. Resolved against the re-read projection once that lands — see
-   * `indeterminateResolution`.
-   */
-  private readonly indeterminate = signal<{
-    readonly action: InvitationAction;
-    readonly expectedId: string;
-  } | null>(null);
-
   /** The panel-level failure sentence, with a progress clause only while the re-read is in flight. */
   protected readonly panelMessage = computed(() => {
     const message = this.writeError();
@@ -565,9 +568,14 @@ export class RestaurantReadinessTab {
    * a credential exists that was never shown here; the only remedy is to reissue again,
    * which supersedes it. An unchanged id means nothing was minted. A cancellation is
    * read the same way, off the status of the invitation that was named.
+   *
+   * The write it describes is recorded on the WORKSPACE (`indeterminateInvitationWrite`),
+   * so the verdict is still given by a tab rebuilt after the answer failed to arrive —
+   * the unseen-credential case is exactly the one an operator is likeliest to have
+   * walked away from.
    */
   protected readonly indeterminateResolution = computed(() => {
-    const pending = this.indeterminate();
+    const pending = this.workspace.indeterminateInvitationWrite();
     if (pending === null) return null;
     if (this.workspace.detailSuperseded()) return null;
     const head = this.onboarding()?.invitation;
@@ -608,8 +616,7 @@ export class RestaurantReadinessTab {
     if (!head?.id) return;
 
     this.clearOutcome();
-    this.indeterminate.set(null);
-    this.orphanedWrite.set(false);
+    this.workspace.clearIndeterminateInvitationWrite();
     this.expectedInvitationId.set(head.id);
     this.subject.set(
       `${ownerInvitationLabel(head.status)} · issued ${formatEat(head.issued_at)}`,
@@ -674,12 +681,21 @@ export class RestaurantReadinessTab {
   /**
    * A reissue landed. Adopt the canonical projection, release the slot, and show the
    * NEW credential once — replacing any earlier one on screen, which is dead now.
+   *
+   * ON A DESTROYED INSTANCE the projection is still adopted and the slot still released
+   * — those are the workspace's — but the credential is dropped, and the workspace is told
+   * WHICH invitation's code went unseen so the next tab can say so. See `orphanedWrite`.
    */
   private onReissued(result: OwnerInvitationReissueResult): void {
     this.workspace.adoptOnboarding(result.onboarding);
     this.workspace.endInvitationMutation();
+    this.workspace.clearIndeterminateInvitationWrite();
+    if (this.destroyed) {
+      this.workspace.markCodeUnshown(result.owner_invitation.id);
+      return;
+    }
+    this.workspace.clearCodeUnshown();
     this.discardAction();
-    this.indeterminate.set(null);
     this.claimToken.set(result.owner_invitation.claim_token);
     this.issued.set({
       issued_at: result.owner_invitation.issued_at,
@@ -699,8 +715,9 @@ export class RestaurantReadinessTab {
   private onCancelled(result: OwnerInvitationCancelResult): void {
     this.workspace.adoptOnboarding(result.onboarding);
     this.workspace.endInvitationMutation();
+    this.workspace.clearIndeterminateInvitationWrite();
+    this.workspace.clearCodeUnshown();
     this.discardAction();
-    this.indeterminate.set(null);
     this.claimToken.set(null);
     this.issued.set(null);
     this.writeError.set(null);
@@ -783,7 +800,7 @@ export class RestaurantReadinessTab {
     if (classifyTransportFailure(error) === 'unavailable') {
       this.serviceStatus.reportUnavailable(extractRequestId(error));
       this.discardAction();
-      this.indeterminate.set({ action, expectedId: expected });
+      this.workspace.noteIndeterminateInvitationWrite({ action, expectedId: expected });
       this.writeError.set(
         action === 'reissue'
           ? 'The admin service did not answer, so it is not known whether a new claim code was issued.'

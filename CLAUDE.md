@@ -1171,12 +1171,25 @@ IndexedDB, a cookie, the URL, router state, the workspace store, a notice, a def
 report or a log, and **no claim URL is fabricated**: the portal's claim screen is NAMED
 in prose and takes a pasted code. `scripts/check-claim-code-handling.mjs`
 (ADMIN-CLAIM-CODE-00, `npm run check:claim-code`, in `verify.sh` and CI) enforces the
-source-level half of that — a code line naming a claim-code identifier beside a sink,
-any assembled `owner-claim?…` / `token=` link, or a claim-code identifier in the store
-or a canonical model fails the build; it is comment-aware, carries a `--self-test`, and
-excludes specs, which assert the negative and legitimately name sinks beside fixture
-tokens. The runtime half is the specs' `tokenIsNowhereBut` sweep over storage, the URL,
-the store, every anchor and the rendered markup. The panel's copy states the
+source-level half of that — a STATEMENT, or an inline template's start tag, however many
+lines either spans, naming a claim-code identifier beside a sink; any assembled
+`owner-claim?…` / `token=` link, concatenated pieces included; or a claim-code identifier
+in the store or a canonical model fails the build. **It judges units, not lines**: the
+first version compared each source line with itself, and review found the hole in one
+sentence — an ordinarily formatted multi-line `setItem(` call had the sink on one line
+and the credential on the next and passed. It now parses every file with the TypeScript
+compiler API (the repo's own `typescript` devDependency), takes the innermost enclosing
+unit around each credential occurrence (statement, class member, type member, decorator,
+parameter) with nested units and sibling callbacks blanked out — so
+`subscribe({ next: r => …claim_token…, error: e => this.defects.report(e) })` is not a
+credential reaching the defect channel — reads each template start tag as one unit,
+checks the URL shapes against a squashed copy of each unit too (so `'/owner-claim' + '?'
++ 'token='` reads as the link it builds), is comment-aware, carries a `--self-test` whose
+cases include the multi-line shapes, and excludes specs, which assert the negative and
+legitimately name sinks beside fixture tokens. It is syntax, not taint analysis: a
+credential copied into another variable and then stored still passes. The runtime half is
+the specs' `tokenIsNowhereBut` sweep over storage, the URL, the store (its two
+invitation-write records included), every anchor and the rendered markup. The panel's copy states the
 consequence exactly: shown once, not retrievable, reissue from the Readiness tab if
 lost; and it says what issuance is not — not delivery (the operator hands the code
 over) and not owner control (established only when the owner redeems it).
@@ -1260,12 +1273,23 @@ Overview for a reason that does not exist. Within the domain the commercial argu
 applies unchanged. It lives on the route-scoped store because the tabs are sibling
 routes: a reissue in flight survives a tab switch, the rebuilt tab reads the flag and
 starts nothing, and `takeUntilDestroyed` would be worse (cancelling the subscription
-does not un-send the request). **A reissue that lands after its tab was rebuilt adopts
-the projection into the store and LOSES ITS CODE** — the credential is never parked in a
-store that outlives every tab — and the rebuilt tab says so (`data-claim-orphaned`)
-instead of presenting a fresh Pending row with no explanation; the remedy is to reissue
-again. A cancellation landing the same way raises no note, since its answer carries
-nothing that could be lost.
+does not un-send the request). **A reissue that lands after its tab was left adopts the
+projection into the store and LOSES ITS CODE** — the credential is never parked in a
+store that outlives every tab. What the dead instance records on the store instead is
+the NON-SECRET fact: the id of the invitation whose code went unseen
+(`RestaurantWorkspaceStore.unshownCodeInvitationId`, via `markCodeUnshown`), and the
+Readiness tab renders the note (`data-claim-orphaned`) while that id is still the
+unresolved head, instead of presenting a fresh Pending row with no explanation; the
+remedy is to reissue again, and showing a code clears the record. **The record is on the
+store because review found the half a tab-local watch missed**: the first version
+noticed only a write still in flight when the tab was built, so a reissue that COMPLETED
+while the operator was on Overview left the slot released, nothing to watch, and an
+unshown credential at the head with no note. The same reasoning holds the record of an
+unanswered write (`indeterminateInvitationWrite`), so the "reissue again" verdict is
+still given by a tab rebuilt after the answer failed to arrive. A cancellation landing
+while away raises no note, since its answer carries nothing that could be lost. The
+records clear when a code is shown, when the invitation is cancelled from here, and when
+the store moves to another restaurant.
 
 ### THE SUCCESS ADOPTS THE PROJECTION AND SHOWS THE CODE ONCE
 The reissue response carries the canonical `onboarding` (re-read inside the mutation's
@@ -1687,9 +1711,9 @@ Before raising a PR:
 2. `npm run lint` — clean
 3. `npm run check:tokens` — self-test then the real scan
 4. `npm run check:claim-code` — self-test then the real scan (ADMIN-CLAIM-CODE-00:
-   no production source line writes a raw owner claim code to storage, a log, a URL,
-   router state, the workspace store or a canonical model, and none assembles a claim
-   link — see "Restaurant Creation and the Owner Claim Code")
+   no production statement or template tag writes a raw owner claim code to storage, a
+   log, a URL, router state, the workspace store or a canonical model, and none assembles
+   a claim link — see "Restaurant Creation and the Owner Claim Code")
 5. `npm run test:ci` — headless Chrome
 6. `npm run build:prod` — zero errors
 7. `npm run check:mock-isolation` — **after** the build; it scans `dist/`

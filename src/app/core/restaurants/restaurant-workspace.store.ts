@@ -10,6 +10,19 @@ import { CommercialSummary, OnboardingSummary, RestaurantDetail } from './restau
 /** What the workspace is currently able to show. Four states, never collapsed. */
 export type WorkspaceState = 'idle' | 'loading' | 'loaded' | 'error';
 
+/** The two owner-invitation writes a workspace can have in flight (Step 2G). */
+export type OwnerInvitationWriteAction = 'reissue' | 'cancel';
+
+/**
+ * An owner-invitation write that got NO USABLE ANSWER: which action, and which
+ * invitation it named. Non-secret bookkeeping — the Readiness tab resolves it against
+ * the re-read projection once that lands. See `indeterminateInvitationWrite`.
+ */
+export interface IndeterminateInvitationWrite {
+  readonly action: OwnerInvitationWriteAction;
+  readonly expectedId: string;
+}
+
 /**
  * THE RESTAURANT WORKSPACE'S DETAIL DATA — loaded once, by the parent, for the tab
  * subtree.
@@ -49,6 +62,8 @@ export class RestaurantWorkspaceStore {
   private readonly _loading = signal(false);
   private readonly _mutating = signal(false);
   private readonly _invitationMutating = signal(false);
+  private readonly _unshownCodeInvitationId = signal<string | null>(null);
+  private readonly _indeterminateInvitationWrite = signal<IndeterminateInvitationWrite | null>(null);
   private readonly _superseded = signal(false);
 
   /** The restaurant, once read. Null while loading, and after a failure. */
@@ -113,10 +128,40 @@ export class RestaurantWorkspaceStore {
    * subscription would not un-send it, and the server may still commit while the client
    * discards the response. (The raw claim token in that response is NOT held here: it
    * lives only in the tab's own transient state, so a reissue whose response lands after
-   * the tab was left is a lost credential. That is recoverable by reissuing again, which
-   * is precisely why the backend built reissue as rotation.)
+   * the tab was left is a lost credential. What IS held here is the non-secret fact that
+   * it was lost — `unshownCodeInvitationId` — so the next tab can say so. The recovery is
+   * reissuing again, which is precisely why the backend built reissue as rotation.)
    */
   readonly invitationMutating = this._invitationMutating.asReadonly();
+
+  /**
+   * The invitation whose one-time claim code a write from THIS workspace minted but no
+   * tab could show — or null (Step 2G).
+   *
+   * ── WHY THE WORKSPACE HOLDS IT ────────────────────────────────────────────────────
+   *
+   * A reissue whose answer lands after the Readiness tab was left has two halves in it.
+   * The canonical projection belongs on this store and is adopted; the credential does
+   * not belong anywhere that outlives a tab and is dropped. Review found the consequence
+   * on the REBUILT tab: it read a fresh Pending row, from a rotation the operator had
+   * asked for, with no sign that the row's code had already gone unseen — the first
+   * version of that tab noticed only a write still in flight when it was built, and a
+   * write that had COMPLETED while the operator was on Overview left nothing behind to
+   * notice. So the fact that a code went unseen is recorded HERE, as the invitation's
+   * id — an identifier the canonical read publishes anyway, never the code — and the
+   * Readiness tab renders the note whenever that id is still the unresolved head.
+   *
+   * It clears when a tab shows a code (nothing is unseen any more), when the invitation
+   * is cancelled from here, and when this store moves to a different restaurant.
+   */
+  readonly unshownCodeInvitationId = this._unshownCodeInvitationId.asReadonly();
+
+  /**
+   * The invitation write that got no usable answer, until the operator acts again
+   * (Step 2G). Held here rather than on the tab for the same reason the in-flight flag
+   * is: the tab that sent the write may not be the one that renders the outcome.
+   */
+  readonly indeterminateInvitationWrite = this._indeterminateInvitationWrite.asReadonly();
 
   /**
    * True from the moment the loaded projection is KNOWN to be superseded until the
@@ -208,6 +253,11 @@ export class RestaurantWorkspaceStore {
    */
   load(id: string): void {
     if (this._id() === id && (this._loading() || this._detail() !== null)) return;
+    if (this._id() !== id) {
+      // A record about another restaurant's invitation must not survive into this one.
+      this._unshownCodeInvitationId.set(null);
+      this._indeterminateInvitationWrite.set(null);
+    }
     this._id.set(id);
     this._detail.set(null);
     this.requests.next(id);
@@ -334,5 +384,28 @@ export class RestaurantWorkspaceStore {
   /** Release the invitation slot. Safe after the requesting tab has been destroyed. */
   endInvitationMutation(): void {
     this._invitationMutating.set(false);
+  }
+
+  /**
+   * A reissue landed where no tab could show its code: remember WHICH invitation that
+   * was. Takes the invitation's id and nothing else — see `unshownCodeInvitationId`.
+   */
+  markCodeUnshown(invitationId: string): void {
+    this._unshownCodeInvitationId.set(invitationId);
+  }
+
+  /** A code has been shown, or the invitation it was for is gone. */
+  clearCodeUnshown(): void {
+    this._unshownCodeInvitationId.set(null);
+  }
+
+  /** An invitation write got no usable answer. Recorded here; the caller re-reads. */
+  noteIndeterminateInvitationWrite(write: IndeterminateInvitationWrite): void {
+    this._indeterminateInvitationWrite.set(write);
+  }
+
+  /** The operator has acted again, or the outcome has been superseded by a real one. */
+  clearIndeterminateInvitationWrite(): void {
+    this._indeterminateInvitationWrite.set(null);
   }
 }

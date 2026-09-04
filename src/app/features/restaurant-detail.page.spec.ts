@@ -3059,19 +3059,29 @@ describe('RestaurantOverviewTab — onboarding', () => {
       flush();
     }));
 
-    it('states the claim window beside an unresolved invitation, in EAT', fakeAsync(async () => {
+    it('states when the invitation was issued and, while unresolved, its claim window, in EAT', fakeAsync(async () => {
+      // §14 asks for BOTH timestamps. The issue time is what tells the current credential
+      // from one rotated away; the window is what makes Pending and Expired legible.
+      // Review found the first version stating the window alone.
       await loadedWith(adminOnboarding('pending'));
       expect(panel('onboarding').querySelector('[data-onboarding-invitation-window]')?.textContent?.trim())
-        .toBe('Claim window closes 10:00 EAT · 27 Aug 2026.');
+        .toBe('Issued 10:00 EAT · 20 Aug 2026. Claim window closes 10:00 EAT · 27 Aug 2026.');
 
       await loadedWith(adminOnboarding('expired'));
       expect(panel('onboarding').querySelector('[data-onboarding-invitation-window]')?.textContent?.trim())
-        .toBe('Claim window closed 10:00 EAT · 27 Aug 2026.');
+        .toBe('Issued 10:00 EAT · 20 Aug 2026. Claim window closed 10:00 EAT · 27 Aug 2026.');
 
-      // Resolved heads have no window to state — and NEVER a raw ISO string anywhere.
+      // A resolved head states only when it was issued — its window no longer matters —
+      // and NEVER a raw ISO string anywhere.
       await loadedWith(adminOnboarding('consumed'));
-      expect(panel('onboarding').querySelector('[data-onboarding-invitation-window]')).toBeNull();
+      expect(panel('onboarding').querySelector('[data-onboarding-invitation-window]')?.textContent?.trim())
+        .toBe('Issued 10:00 EAT · 20 Aug 2026.');
       expect(onboardingText()).not.toContain('2026-08-27T');
+      expect(onboardingText()).not.toContain('2026-08-20T');
+
+      // Nothing issued, nothing to date.
+      await loadedWith(adminOnboarding('not_issued'));
+      expect(panel('onboarding').querySelector('[data-onboarding-invitation-window]')).toBeNull();
       flush();
     }));
   });
@@ -3461,7 +3471,15 @@ describe('RestaurantReadinessTab — owner claim', () => {
       }
     }
     expect(TestBed.inject(Router).url).withContext('the URL').not.toContain(TOKEN);
-    expect(JSON.stringify(store().detail())).withContext('the workspace store').not.toContain(TOKEN);
+    expect(
+      JSON.stringify([
+        store().detail(),
+        store().unshownCodeInvitationId(),
+        store().indeterminateInvitationWrite(),
+      ]),
+    )
+      .withContext('the workspace store')
+      .not.toContain(TOKEN);
     for (const anchor of Array.from(el().querySelectorAll('a'))) {
       expect(anchor.getAttribute('href') ?? '').withContext('an anchor').not.toContain(TOKEN);
     }
@@ -3490,7 +3508,9 @@ describe('RestaurantReadinessTab — owner claim', () => {
 
     expect(value('data-claim-owner-control')).toBe('Not established');
     expect(value('data-claim-invitation')).toBe('Pending');
-    expect(value('data-claim-window')).toBe('Claim window closes 10:00 EAT · 27 Aug 2026.');
+    expect(value('data-claim-window')).toBe(
+      'Issued 10:00 EAT · 20 Aug 2026. Claim window closes 10:00 EAT · 27 Aug 2026.',
+    );
     expect(claimText()).not.toContain('Onboarding complete');
     flush();
   }));
@@ -3652,7 +3672,9 @@ describe('RestaurantReadinessTab — owner claim', () => {
     // The row now reports the NEW pending credential from the canonical projection the
     // write returned — never from the request, never guessed.
     expect(value('data-claim-invitation')).toBe('Pending');
-    expect(value('data-claim-window')).toBe('Claim window closes 09:00 EAT · 1 Sept 2026.');
+    expect(value('data-claim-window')).toBe(
+      'Issued 09:00 EAT · 25 Aug 2026. Claim window closes 09:00 EAT · 1 Sept 2026.',
+    );
     expect(store().detail()!.onboarding.invitation.id).toBe(NEW_HEAD_ID);
     // The code is on screen, exactly, in a copyable field — AFTER the adoption above,
     // so the operator can still copy it while the row already reads Pending.
@@ -3899,6 +3921,119 @@ describe('RestaurantReadinessTab — owner claim', () => {
 
     expect(value('data-claim-invitation')).toBe('Cancelled');
     expect(claimPanel().querySelector('[data-claim-orphaned]')).toBeNull();
+    flush();
+  }));
+
+  /** Reissue, leave for Overview, let the answer land THERE, and come back. */
+  async function reissueLandsWhileAway(
+    answer: (pending: Subject<OwnerInvitationReissueResult>) => void,
+  ): Promise<void> {
+    const pending = new Subject<OwnerInvitationReissueResult>();
+    await loadedWith(adminOnboarding('pending'));
+    api.reissueAnswer = () => pending;
+    reissue();
+    expect(api.invitationWrites.length).toBe(1);
+
+    await harness.navigateByUrl(`/restaurants/${ID}`, RestaurantDetailPage);
+    harness.detectChanges();
+    answer(pending);
+    tick();
+    harness.detectChanges();
+    expect(store().invitationMutating()).withContext('the slot was released while away').toBeFalse();
+
+    await harness.navigateByUrl(`/restaurants/${ID}/readiness`, RestaurantDetailPage);
+    harness.detectChanges();
+  }
+
+  it('says so when the reissue COMPLETED while the tab was away, not only while it was still in flight', fakeAsync(async () => {
+    // Review found the half the first version missed. The operator clicks Reissue, goes
+    // to Overview, and the answer lands there: slot released, projection adopted, code
+    // set on a signal nobody renders. Coming back found no write in flight and so
+    // nothing to watch — a fresh Pending row whose code had already gone unseen, with
+    // no note and no way to tell. The fact now lives on the workspace as the
+    // invitation's id, never the code, so the rebuilt tab can still say it.
+    await reissueLandsWhileAway((pending) => {
+      pending.next(reissued());
+      pending.complete();
+    });
+
+    expect(store().unshownCodeInvitationId()).toBe(NEW_HEAD_ID);
+    expect(value('data-claim-invitation')).toBe('Pending');
+    expect(store().detail()!.onboarding.invitation.id).toBe(NEW_HEAD_ID);
+    expect(codePanel()).toBeNull();
+    tokenIsNowhereBut(false);
+    expect(value('data-claim-orphaned')).toContain('no claim code from it could be shown here');
+    expect(value('data-claim-orphaned')).toContain('reissue again');
+    expect(action('Reissue claim code')!.disabled).toBeFalse();
+
+    // Reissuing again — the remedy the note names — shows a code, and the note goes.
+    api.reissueAnswer = () => of(reissued());
+    reissue();
+    expect(codeValue()).toBe(TOKEN);
+    expect(claimPanel().querySelector('[data-claim-orphaned]')).toBeNull();
+    expect(store().unshownCodeInvitationId()).toBeNull();
+    flush();
+  }));
+
+  it('drops the note once the invitation it describes is resolved', fakeAsync(async () => {
+    // The note is about a LIVE credential nobody can show. Once that credential is
+    // cancelled — here by somebody else, seen on a re-read — the statement is moot, and
+    // a note that outlived it would be nagging about a code that no longer works.
+    await reissueLandsWhileAway((pending) => {
+      pending.next(reissued());
+      pending.complete();
+    });
+    expect(claimPanel().querySelector('[data-claim-orphaned]')).toBeTruthy();
+
+    api.answer = () =>
+      of(
+        detail({
+          onboarding: adminOnboarding('cancelled', {
+            invitation: invitation('cancelled', {
+              id: NEW_HEAD_ID,
+              issued_at: NEW_ISSUED_AT,
+              expires_at: NEW_EXPIRES_AT,
+            }),
+          }),
+        }),
+      );
+    store().reload();
+    tick();
+    harness.detectChanges();
+
+    expect(value('data-claim-invitation')).toBe('Cancelled');
+    expect(claimPanel().querySelector('[data-claim-orphaned]')).toBeNull();
+    flush();
+  }));
+
+  it('gives the indeterminate verdict on a tab rebuilt after the answer failed to arrive', fakeAsync(async () => {
+    // What the write asserted lives on the workspace too, so the case an operator is
+    // likeliest to have walked away from — the server went quiet — still resolves on
+    // whichever tab they come back to, and a head nobody has seen is still named.
+    await reissueLandsWhileAway((pending) => {
+      api.answer = () =>
+        of(
+          detail({
+            onboarding: adminOnboarding('pending', {
+              invitation: invitation('pending', {
+                id: NEW_HEAD_ID,
+                issued_at: NEW_ISSUED_AT,
+                expires_at: NEW_EXPIRES_AT,
+              }),
+            }),
+          }),
+        );
+      pending.error({ status: 0, error: null, message: 'Http failure response' });
+    });
+
+    expect(store().indeterminateInvitationWrite()).toEqual({ action: 'reissue', expectedId: HEAD_ID });
+    expect(value('data-claim-indeterminate')).toBe(
+      'A newer claim code is now on record, and it was never shown here. Reissue again to replace it with one you can copy.',
+    );
+    expect(codePanel()).toBeNull();
+    tokenIsNowhereBut(false);
+    expect(action('Reissue claim code')!.disabled).withContext('a deliberate reissue is possible').toBeFalse();
+    expect(api.invitationWrites.length).withContext('and nothing was retried').toBe(1);
     flush();
   }));
 

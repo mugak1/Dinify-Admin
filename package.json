@@ -13,6 +13,7 @@
     "lint": "eslint .",
     "type-check": "tsc --noEmit -p tsconfig.app.json",
     "check:tokens": "node scripts/check-design-tokens.mjs --self-test && node scripts/check-design-tokens.mjs",
+    "check:claim-code": "node scripts/check-claim-code-handling.mjs --self-test && node scripts/check-claim-code-handling.mjs",
     "check:mock-isolation": "node scripts/check-mock-isolation.mjs"
   },
   "dependencies": {

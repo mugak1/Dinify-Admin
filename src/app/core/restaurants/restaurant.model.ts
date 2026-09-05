@@ -559,12 +559,22 @@ export type OwnerControlStatus =
 export type OwnerControlEvidence = 'legacy_attestation' | 'invitation_redeemed';
 
 /**
- * The owner-invitation lifecycle.
+ * The owner-invitation lifecycle, exactly as `onboarding_reads` spells it.
  *
  * `not_applicable` and `not_issued` ARE DIFFERENT FACTS and must never be collapsed:
  * a legacy-adopted restaurant never had an invitation to issue, while an
- * admin-created one has simply not been sent theirs yet. Reading the first as the
+ * admin-created one has simply not had one issued yet. Reading the first as the
  * second invents a missing step for every restaurant that predates the domain.
+ *
+ * `verification_locked` (backend Step 2F.2) is an UNRESOLVED state, like `expired`:
+ * the credential still holds the per-onboarding slot, can still be reissued and can
+ * still be cancelled — it simply can no longer be challenged or redeemed, because its
+ * owner-claim guess budget is spent. The server reports it AHEAD of `expired`
+ * deliberately: both are unclaimable and both are remedied by a reissue, but only one
+ * of them says somebody sat there guessing, and filing a security event as a clock
+ * problem is the wrong way round. This union was stale without it — the Admin
+ * frontend predates that backend step — and a status the type does not know renders
+ * as a humanised code rather than as a compile error.
  */
 export type OwnerInvitationStatus =
   | 'unavailable'
@@ -572,9 +582,40 @@ export type OwnerInvitationStatus =
   | 'not_issued'
   | 'pending'
   | 'expired'
+  | 'verification_locked'
   | 'consumed'
   | 'cancelled'
   | 'superseded';
+
+/** The three UNRESOLVED states — the credential still occupies the slot. */
+export const UNRESOLVED_OWNER_INVITATION_STATUSES: readonly OwnerInvitationStatus[] = [
+  'pending',
+  'expired',
+  'verification_locked',
+];
+
+/**
+ * The invitation axis of the onboarding projection — a state word plus the SAFE
+ * metadata that makes it actionable (backend Step 2E).
+ *
+ * `id` IS THE CONCURRENCY TOKEN: it is exactly what the reissue and cancel routes take
+ * as `expected_invitation_id`, and it is the only way an operator can act on the
+ * invitation they actually reviewed rather than on whatever is current when the POST
+ * arrives. `issued_at` / `expires_at` are what make `pending` and `expired` legible.
+ *
+ * NOTHING ELSE, and nothing else may be added here. No `token_hash`, no raw claim
+ * token, no claim URL, no delivery state, no attempt count, no owner identity. An
+ * invitation id is an opaque handle; the token is a credential; the two must never
+ * become interchangeable because they sit in the same object. All three metadata keys
+ * are present and null for `not_issued` / `not_applicable` / `unavailable`, so a
+ * consumer never has to branch on the status word to know which keys exist.
+ */
+export interface OwnerInvitationProjection {
+  readonly status: OwnerInvitationStatus;
+  readonly id: string | null;
+  readonly issued_at: string | null;
+  readonly expires_at: string | null;
+}
 
 /**
  * The onboarding projection carried by the DETAIL read.
@@ -603,9 +644,7 @@ export interface OnboardingSummary {
     readonly evidence_at: string | null;
   };
 
-  readonly invitation: {
-    readonly status: OwnerInvitationStatus;
-  };
+  readonly invitation: OwnerInvitationProjection;
 }
 
 /** `GET /restaurants/<uuid>/` — the workspace header and the Overview tab. */
@@ -655,3 +694,197 @@ export interface DirectoryQuery {
 
 /** The server's default. Sending it explicitly would only lengthen every URL. */
 export const DEFAULT_PAGE_SIZE = 25;
+
+/**
+ * ══ THE RESTAURANT CREATION CONTRACT (Step 2G, over backend Step 2D) ══════════════
+ *
+ * `POST admin/v1/restaurants/` — the SAME collection route the directory reads,
+ * because creating a restaurant is adding to that collection. There is deliberately
+ * no `/restaurants/create/`, no `/restaurants/new/` API route and no customer-plane
+ * creation path anywhere; the method carries the meaning, not the URL. (The Angular
+ * screen lives at `/restaurants/new` — a UI address, not an API one.)
+ *
+ * ── THE OWNER IS A DISCRIMINATED UNION, AND EACH MODE REFUSES THE OTHER'S FIELDS ──
+ *
+ * The backend reads which keys were SENT, not which were non-blank: a `user_id` key
+ * beside `mode: "new"` is a 400 even when its value is empty, because a key the caller
+ * sent is a claim they made about the request. So the request body is built by a
+ * function that includes only the chosen mode's fields, never by spreading a form
+ * object that happens to hold both drafts — see `restaurant-create.page.ts`.
+ *
+ * "This phone number already exists, so that must be who you meant" is the failure
+ * the split exists to prevent. A phone already in use is a 409
+ * `owner_account_already_exists` carrying ONLY the existing account's UUID, and
+ * attaching that account is a separate, deliberate `mode: "existing"` request naming
+ * it. Nothing on this client ever switches modes on the operator's behalf.
+ *
+ * ── `is_test` IS A JSON BOOLEAN, STRICTLY ─────────────────────────────────────────
+ *
+ * The server's `StrictBooleanField` refuses `1`, `"true"`, `"yes"` and `null`: a
+ * tenant's test classification decides whether it appears in every revenue figure,
+ * and that decision has to be made by an operator saying so. It is typed `boolean`
+ * here and stated explicitly by the form — never inferred from the name, the
+ * location, the owner, the environment or a mock convention.
+ */
+export type OwnerMode = 'new' | 'existing';
+
+/** `mode: "new"` — a brand-new owner identity. Phone is the identity; email is not. */
+export interface NewOwnerSpec {
+  readonly mode: 'new';
+  readonly first_name: string;
+  readonly last_name: string;
+  /** Passed through RAW. Canonicalising a Ugandan MSISDN is `normalise_msisdn`'s job. */
+  readonly phone_number: string;
+  /** Optional. An explicit `null` states its absence rather than omitting the key. */
+  readonly email: string | null;
+}
+
+/** `mode: "existing"` — attach an exact existing account, named by its UUID. */
+export interface ExistingOwnerSpec {
+  readonly mode: 'existing';
+  readonly user_id: string;
+}
+
+export type OwnerSpec = NewOwnerSpec | ExistingOwnerSpec;
+
+export interface CreateRestaurantRequest {
+  readonly restaurant: {
+    readonly name: string;
+    readonly location: string;
+    readonly is_test: boolean;
+  };
+  readonly owner: OwnerSpec;
+  readonly reason: string;
+}
+
+/**
+ * The credential half of a creation or a reissue response.
+ *
+ * `claim_token` IS THE RAW BEARER CREDENTIAL AND THIS IS THE ONLY TIME IT IS EVER
+ * RETURNED. The server persists only its SHA-256 hash, so a lost response is
+ * unrecoverable by design and the remedy is a REISSUE — never recoverable plaintext,
+ * never the hash handed back as a token, never a "retry returns the same token".
+ *
+ * On this side it may exist ONLY in the transient state of the component that shows
+ * it to the authenticated operator. It is never written to localStorage,
+ * sessionStorage, IndexedDB, a cookie, a URL, router navigation state,
+ * `RestaurantWorkspaceStore`, a canonical restaurant model, a notice, a log or an
+ * error object. A refresh loses it, and that is the accepted cost.
+ *
+ * THERE IS NO CLAIM URL. The owner types this code into the restaurant portal's
+ * owner-claim screen; nothing here fabricates a link carrying it.
+ */
+export interface IssuedOwnerInvitation {
+  readonly id: string;
+  readonly issued_at: string;
+  readonly expires_at: string;
+  readonly claim_token: string;
+}
+
+/**
+ * What a successful `POST admin/v1/restaurants/` returns (201).
+ *
+ * `restaurant` is the canonical DETAIL projection, re-read inside the creation
+ * transaction — the same bytes `GET /restaurants/<id>/` returns. The workspace still
+ * loads it through its ordinary read rather than adopting this copy: the screen the
+ * operator lands on must be built from the canonical read, and this object also
+ * travels beside a credential that must not be carried anywhere it does not need to be.
+ *
+ * `owner_account.created` is STATED by the operation, never re-derived — a brand-new
+ * account and a long-standing one are indistinguishable a moment later.
+ */
+export interface RestaurantCreationResult {
+  readonly restaurant: RestaurantDetail;
+  readonly owner_account: {
+    readonly id: string;
+    readonly created: boolean;
+  };
+  readonly owner_invitation: IssuedOwnerInvitation;
+}
+
+/**
+ * The 409 vocabulary of creation — `onboarding_creation.CONFLICT_CODES`.
+ *
+ * A conflict is a well-formed request the platform's current state contradicts, so
+ * the remedy is to look and decide again, never to edit the body blindly. Two of them
+ * carry a `details` object of UUIDs only: `owner_account_already_exists` names the
+ * existing account (so an operator can DELIBERATELY choose `mode: "existing"`), and
+ * `restaurant_already_exists` names the existing restaurant. The email conflict
+ * deliberately names no account at all.
+ */
+export type RestaurantCreationConflictCode =
+  | 'owner_account_already_exists'
+  | 'owner_email_already_in_use'
+  | 'owner_account_not_found'
+  | 'owner_account_inactive'
+  | 'owner_account_not_restaurant_user'
+  | 'restaurant_already_exists';
+
+/**
+ * ══ THE OWNER-INVITATION LIFECYCLE CONTRACT (Step 2G, over backend Step 2E) ═══════
+ *
+ * Two routes, two named operations, ONE body shape — the server shares one
+ * serializer between them because the contract is genuinely identical: the exact
+ * invitation reviewed, plus why.
+ *
+ * `expected_invitation_id` IS AN OPTIMISTIC-CONCURRENCY ASSERTION OF IDENTITY, NOT
+ * STATUS. It says "the invitation I reviewed is still the one this onboarding
+ * presents as its head". It is `OnboardingSummary.invitation.id`, captured when the
+ * operator opened the action and never re-read at submit time; if the head has since
+ * moved to another invitation the server answers 409 `stale_owner_invitation`, and
+ * an old Cancel click can never terminate a credential the operator has never seen.
+ * REQUIRED with no default: an omitted token is a 400, never "act on whatever is
+ * current".
+ *
+ * `reissue`, NOT `resend`. Nothing in this system delivers anything — no email, no
+ * SMS, no notification, no delivery column on the schema. What happens is ROTATION:
+ * the outstanding credential dies and a new raw token is handed to the operator who
+ * asked, exactly once.
+ */
+export interface OwnerInvitationRequest {
+  readonly expected_invitation_id: string;
+  readonly reason: string;
+}
+
+/**
+ * A successful reissue. `onboarding` is the canonical Step-2C projection re-read
+ * inside the same transaction — byte-identical to the next GET — and is adopted;
+ * `owner_invitation` carries the new credential ONCE, in its own object, so no
+ * future change to the canonical projection can start carrying it by accident.
+ * `changed` is always true: a reissue that changed nothing is not a thing.
+ */
+export interface OwnerInvitationReissueResult {
+  readonly changed: true;
+  readonly onboarding: OnboardingSummary;
+  readonly owner_invitation: IssuedOwnerInvitation;
+}
+
+/**
+ * A successful cancellation. NO CREDENTIAL, ever — which is exactly why an EXACT RETRY
+ * is safe here and impossible on reissue: repeating a cancellation answers
+ * `changed: false` with the original timestamp and actor intact, and that is a
+ * SUCCESS, never a failure and never a conflict.
+ */
+export interface OwnerInvitationCancelResult {
+  readonly changed: boolean;
+  readonly onboarding: OnboardingSummary;
+}
+
+/**
+ * The 409 vocabulary of the two invitation routes — `onboarding_invitations`'s
+ * `CONFLICT_CODES` plus the three owner-consistency codes the reissue route flattens
+ * into the same map. Every conflict body carries a fixed operator sentence and the
+ * code, and deliberately NO `details`: naming the current invitation id would invite a
+ * blind retry instead of a reload.
+ */
+export type OwnerInvitationConflictCode =
+  | 'onboarding_not_tracked'
+  | 'owner_invitation_not_applicable'
+  | 'stale_owner_invitation'
+  | 'owner_invitation_not_issued'
+  | 'owner_control_already_established'
+  | 'owner_account_not_found'
+  | 'owner_account_inactive'
+  | 'owner_account_not_restaurant_user'
+  | 'owner_invitation_already_resolved'
+  | OwnerRelationshipStatus;

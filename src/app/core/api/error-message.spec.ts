@@ -1,7 +1,7 @@
 import { HttpErrorResponse } from '@angular/common/http';
 
 import { ELEVATION_REQUIRED_DETAIL } from './api.constants';
-import { extractDetail, extractErrorMessage } from './error-message';
+import { extractDetail, extractErrorMessage, extractNestedFieldErrors } from './error-message';
 
 function httpError(status: number, body: unknown): HttpErrorResponse {
   return new HttpErrorResponse({ status, error: body });
@@ -65,6 +65,57 @@ describe('extractErrorMessage', () => {
   it('handles a non-HTTP error without throwing', () => {
     expect(extractErrorMessage(new Error('boom'))).toBe('Something went wrong.');
     expect(extractErrorMessage(undefined)).toBe('Something went wrong.');
+  });
+});
+
+/**
+ * `extractNestedFieldErrors` reads the creation endpoint's NESTED field errors — DRF
+ * nests them the way the request was nested (`{"owner": {"phone_number": [...]}}`) —
+ * and flattens them to the dotted paths the creation form addresses its controls by.
+ * The flat `extractFieldErrors` stays as it is for every flat-body endpoint.
+ */
+describe('extractNestedFieldErrors', () => {
+  it('flattens a nested owner error to its dotted path', () => {
+    const body = {
+      status: 400,
+      message: 'The restaurant could not be created.',
+      errors: { owner: { phone_number: ['Cannot canonicalise phone number (7 digits).'] } },
+    };
+    expect(extractNestedFieldErrors(httpError(400, body))).toEqual({
+      'owner.phone_number': ['Cannot canonicalise phone number (7 digits).'],
+    });
+  });
+
+  it('keeps top-level fields at their own name, beside the nested ones', () => {
+    const body = {
+      errors: {
+        restaurant: { name: ['This field may not be blank.'], is_test: ['Send true or false.'] },
+        owner: { mode: ['"both" is not a valid choice.'] },
+        reason: ['Please state a reason of at least 10 characters.'],
+        __all__: ['Something about the whole request.'],
+      },
+    };
+    expect(extractNestedFieldErrors(httpError(400, body))).toEqual({
+      'restaurant.name': ['This field may not be blank.'],
+      'restaurant.is_test': ['Send true or false.'],
+      'owner.mode': ['"both" is not a valid choice.'],
+      reason: ['Please state a reason of at least 10 characters.'],
+      __all__: ['Something about the whole request.'],
+    });
+  });
+
+  it('coerces a lone string to a one-message list, as the flat reader does', () => {
+    const body = { errors: { owner: { user_id: 'Enter a valid UUID.' } } };
+    expect(extractNestedFieldErrors(httpError(400, body))).toEqual({
+      'owner.user_id': ['Enter a valid UUID.'],
+    });
+  });
+
+  it('returns nothing for a body with no field errors, or no body at all', () => {
+    expect(extractNestedFieldErrors(httpError(409, { status: 409, message: 'Conflict.' }))).toEqual({});
+    expect(extractNestedFieldErrors(httpError(500, null))).toEqual({});
+    expect(extractNestedFieldErrors(new Error('boom'))).toEqual({});
+    expect(extractNestedFieldErrors(undefined)).toEqual({});
   });
 });
 

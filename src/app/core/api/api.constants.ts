@@ -39,14 +39,50 @@ export const AUTH_ROUTES = {
  * renames it. `detail` is a function because the id is part of the path rather than a
  * query parameter, and it encodes so a malformed id cannot escape the segment.
  *
- * BOTH ARE SAFE METHODS. `GET` needs no `X-CSRFToken` and neither route is
- * elevation-gated — reading the portfolio is ordinary authenticated work, and
+ * `list` AND `detail` ARE SAFE METHODS. `GET` needs no `X-CSRFToken` and neither read
+ * is elevation-gated — reading the portfolio is ordinary authenticated work, and
  * demanding a second factor to look at a list is what trains an operator to elevate
  * reflexively.
+ *
+ * `create` IS THE SAME ADDRESS AS `list`, ON PURPOSE (Step 2G, backend Step 2D).
+ * `admin/v1/restaurants/` is ONE resource with two methods and two authority bars:
+ * `GET` is the directory, `POST` creates a tenant — elevation-gated, CSRF-protected and
+ * audited exactly once. There is deliberately no `/restaurants/create/` and no
+ * `/restaurants/new/` API route; the method carries the meaning, not the URL. It is
+ * named separately here so a reader can grep for the write, and so the transport does
+ * not have to explain why it POSTs to something called `list`.
  */
 export const RESTAURANT_ROUTES = {
   list: '/restaurants/',
+  create: '/restaurants/',
   detail: (id: string): string => `/restaurants/${encodeURIComponent(id)}/`,
+} as const;
+
+/**
+ * The OWNER-INVITATION credential-lifecycle routes (Step 2G, backend Step 2E) —
+ * `platform_admin_app/urls.py`.
+ *
+ * TWO ROUTES, NOT ONE WITH AN `action` SEGMENT. Rotating a live credential and
+ * terminating one are opposite decisions — one hands out authority, the other
+ * withdraws it — and the route should tell a reviewer which a request made without
+ * them reading a body. Same reasoning as the commercial routes above.
+ *
+ * `reissue`, NEVER `resend`. The name is load-bearing in the URL, the audit action and
+ * the client method: this system delivers nothing — no email, no SMS, no notification,
+ * no delivery column on the schema — so a route promising a delivery event would be a
+ * promise the platform cannot keep, made where an operator is most likely to believe
+ * it. What happens is ROTATION: the outstanding credential dies and a new raw token is
+ * handed to the operator who asked for it, once.
+ *
+ * Both are unsafe methods: `X-CSRFToken` rides each POST and both are elevation-gated,
+ * so a 403 carrying `ELEVATION_REQUIRED_DETAIL` is the expected step the classifier's
+ * case 3 handles by replaying the ORIGINAL request — token and reason intact.
+ */
+export const OWNER_INVITATION_ROUTES = {
+  reissue: (id: string): string =>
+    `/restaurants/${encodeURIComponent(id)}/owner-invitation/reissue/`,
+  cancel: (id: string): string =>
+    `/restaurants/${encodeURIComponent(id)}/owner-invitation/cancel/`,
 } as const;
 
 /**

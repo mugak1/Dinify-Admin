@@ -5,10 +5,23 @@ import { catchError, of, Subject, switchMap, tap } from 'rxjs';
 import { AdminServiceStatus } from '../api/service-status';
 import { LoadFailure, reportReadReachable, toLoadFailure } from './load-failure';
 import { RESTAURANT_API } from './restaurant.api';
-import { CommercialSummary, RestaurantDetail } from './restaurant.model';
+import { CommercialSummary, OnboardingSummary, RestaurantDetail } from './restaurant.model';
 
 /** What the workspace is currently able to show. Four states, never collapsed. */
 export type WorkspaceState = 'idle' | 'loading' | 'loaded' | 'error';
+
+/** The two owner-invitation writes a workspace can have in flight (Step 2G). */
+export type OwnerInvitationWriteAction = 'reissue' | 'cancel';
+
+/**
+ * An owner-invitation write that got NO USABLE ANSWER: which action, and which
+ * invitation it named. Non-secret bookkeeping — the Readiness tab resolves it against
+ * the re-read projection once that lands. See `indeterminateInvitationWrite`.
+ */
+export interface IndeterminateInvitationWrite {
+  readonly action: OwnerInvitationWriteAction;
+  readonly expectedId: string;
+}
 
 /**
  * THE RESTAURANT WORKSPACE'S DETAIL DATA — loaded once, by the parent, for the tab
@@ -48,6 +61,9 @@ export class RestaurantWorkspaceStore {
   private readonly _failure = signal<LoadFailure | null>(null);
   private readonly _loading = signal(false);
   private readonly _mutating = signal(false);
+  private readonly _invitationMutating = signal(false);
+  private readonly _unshownCodeInvitationId = signal<string | null>(null);
+  private readonly _indeterminateInvitationWrite = signal<IndeterminateInvitationWrite | null>(null);
   private readonly _superseded = signal(false);
 
   /** The restaurant, once read. Null while loading, and after a failure. */
@@ -57,7 +73,8 @@ export class RestaurantWorkspaceStore {
   readonly loading = this._loading.asReadonly();
 
   /**
-   * True while a service-configuration write is in flight for THIS restaurant.
+   * True while a COMMERCIAL write is in flight for THIS restaurant — either service
+   * axis, or any of the three subscription-terms operations.
    *
    * ── WHY THE FLAG LIVES HERE AND NOT ON THE TAB ────────────────────────────────────
    *
@@ -84,6 +101,69 @@ export class RestaurantWorkspaceStore {
   readonly mutating = this._mutating.asReadonly();
 
   /**
+   * True while an OWNER-INVITATION write — a reissue or a cancellation — is in flight
+   * for THIS restaurant (Step 2G).
+   *
+   * ── A SECOND SLOT, NOT THE COMMERCIAL ONE, AND DELIBERATELY SO ───────────────────
+   *
+   * The commercial slot exists because every commercial write returns the WHOLE
+   * canonical `commercial` object, so two of them in flight could land out of order and
+   * the older snapshot would repaint the newer change. An invitation write returns the
+   * canonical `onboarding` object and touches `commercial` not at all, so the two
+   * domains cannot repaint each other and there is no race between them to prevent.
+   * Sharing one slot would have been mechanically easy and semantically false: it would
+   * shut the Readiness controls while a terms write ran on Overview, for a reason that
+   * does not exist, and the docstring above would stop being true.
+   *
+   * What IS true within the domain is exactly the commercial argument: reissue and
+   * cancel both return the whole `onboarding` projection, a reissue in flight beside a
+   * cancel is pointless, and the second to land would repaint the first. So it is ONE
+   * invitation mutation at a time for this workspace.
+   *
+   * ── AND IT LIVES HERE FOR THE SAME REASON THE COMMERCIAL FLAG DOES ───────────────
+   *
+   * The Readiness tab is a sibling route: switching to Overview destroys it while the
+   * reissue keeps running, and a rebuilt tab with a local flag would start a second one.
+   * The request is deliberately not torn down with the component — cancelling the
+   * subscription would not un-send it, and the server may still commit while the client
+   * discards the response. (The raw claim token in that response is NOT held here: it
+   * lives only in the tab's own transient state, so a reissue whose response lands after
+   * the tab was left is a lost credential. What IS held here is the non-secret fact that
+   * it was lost — `unshownCodeInvitationId` — so the next tab can say so. The recovery is
+   * reissuing again, which is precisely why the backend built reissue as rotation.)
+   */
+  readonly invitationMutating = this._invitationMutating.asReadonly();
+
+  /**
+   * The invitation whose one-time claim code a write from THIS workspace minted but no
+   * tab could show — or null (Step 2G).
+   *
+   * ── WHY THE WORKSPACE HOLDS IT ────────────────────────────────────────────────────
+   *
+   * A reissue whose answer lands after the Readiness tab was left has two halves in it.
+   * The canonical projection belongs on this store and is adopted; the credential does
+   * not belong anywhere that outlives a tab and is dropped. Review found the consequence
+   * on the REBUILT tab: it read a fresh Pending row, from a rotation the operator had
+   * asked for, with no sign that the row's code had already gone unseen — the first
+   * version of that tab noticed only a write still in flight when it was built, and a
+   * write that had COMPLETED while the operator was on Overview left nothing behind to
+   * notice. So the fact that a code went unseen is recorded HERE, as the invitation's
+   * id — an identifier the canonical read publishes anyway, never the code — and the
+   * Readiness tab renders the note whenever that id is still the unresolved head.
+   *
+   * It clears when a tab shows a code (nothing is unseen any more), when the invitation
+   * is cancelled from here, and when this store moves to a different restaurant.
+   */
+  readonly unshownCodeInvitationId = this._unshownCodeInvitationId.asReadonly();
+
+  /**
+   * The invitation write that got no usable answer, until the operator acts again
+   * (Step 2G). Held here rather than on the tab for the same reason the in-flight flag
+   * is: the tab that sent the write may not be the one that renders the outcome.
+   */
+  readonly indeterminateInvitationWrite = this._indeterminateInvitationWrite.asReadonly();
+
+  /**
    * True from the moment the loaded projection is KNOWN to be superseded until the
    * fresh read replacing it has settled.
    *
@@ -107,6 +187,12 @@ export class RestaurantWorkspaceStore {
    * A guard built on `loading` alone would also disable controls during every ordinary
    * retry, which is a different and weaker statement. This flag says the specific thing:
    * what you are looking at has been replaced.
+   *
+   * IT IS SHARED BY EVERY DOMAIN ON THE WORKSPACE, unlike the two write slots. A 409
+   * on an invitation write reloads the WHOLE detail, and until that read lands the
+   * commercial panel is rendering a projection that is known stale too — so both panels
+   * gate their controls on this one flag, and a stale invitation conflict cannot leave
+   * a stale commercial editor openable underneath it.
    */
   readonly detailSuperseded = this._superseded.asReadonly();
 
@@ -167,6 +253,11 @@ export class RestaurantWorkspaceStore {
    */
   load(id: string): void {
     if (this._id() === id && (this._loading() || this._detail() !== null)) return;
+    if (this._id() !== id) {
+      // A record about another restaurant's invitation must not survive into this one.
+      this._unshownCodeInvitationId.set(null);
+      this._indeterminateInvitationWrite.set(null);
+    }
     this._id.set(id);
     this._detail.set(null);
     this.requests.next(id);
@@ -223,8 +314,46 @@ export class RestaurantWorkspaceStore {
   }
 
   /**
-   * Claim the single service-configuration write slot. False when one is already in
-   * flight, in which case the caller must not send anything.
+   * Adopt the canonical `onboarding` projection a successful OWNER-INVITATION write
+   * returned (Step 2G) — the same move as `adoptCommercial`, for the same reasons.
+   *
+   * The reissue and cancel endpoints re-read the projection INSIDE the mutation's own
+   * transaction through the same `onboarding_summary` the detail read uses, so what
+   * comes back is byte-identical to the next GET and cannot race the write. It is
+   * adopted rather than refetched.
+   *
+   * ── IT REPLACES `onboarding`, AND KEEPS THE OWNER'S COMPATIBILITY ALIASES IN STEP ─
+   *
+   * `owner.claim_tracked` / `owner.claim_status` are derived by the server from the
+   * onboarding projection (`restaurant_reads.serialize_owner`: `tracked`, and the
+   * owner-control status while tracked). Nothing in this application renders them, but
+   * leaving them stale beside a fresh `onboarding` would hold two answers to one
+   * question in the same object — the exact disagreement the model warns against. So
+   * they are re-derived here by the server's own rule, and only they: no other owner
+   * field is touched, and no other part of the detail is guessed at.
+   *
+   * WHAT IT NEVER CARRIES: the raw claim token. A reissue response holds the credential
+   * in a separate `owner_invitation` object, and the caller hands ONLY the projection
+   * here. This store outlives every tab beneath it, which is exactly why a bearer
+   * credential must not be parked in it.
+   */
+  adoptOnboarding(onboarding: OnboardingSummary): void {
+    const current = this._detail();
+    if (current === null) return;
+    const owner =
+      current.owner === null
+        ? null
+        : {
+            ...current.owner,
+            claim_tracked: onboarding.tracked,
+            claim_status: onboarding.tracked ? onboarding.owner_control.status : null,
+          };
+    this._detail.set({ ...current, onboarding, owner });
+  }
+
+  /**
+   * Claim the single COMMERCIAL write slot. False when one is already in flight, in
+   * which case the caller must not send anything.
    */
   beginMutation(): boolean {
     if (this._mutating()) return false;
@@ -233,11 +362,50 @@ export class RestaurantWorkspaceStore {
   }
 
   /**
-   * Release the slot. Safe to call from a callback whose component has since been
-   * destroyed — which is the ordinary case when an operator navigates away mid-write,
-   * and precisely why the flag is held here.
+   * Release the commercial slot. Safe to call from a callback whose component has since
+   * been destroyed — which is the ordinary case when an operator navigates away
+   * mid-write, and precisely why the flag is held here.
    */
   endMutation(): void {
     this._mutating.set(false);
+  }
+
+  /**
+   * Claim the single OWNER-INVITATION write slot. False when a reissue or a cancel is
+   * already in flight, in which case the caller must not send anything — the claim is
+   * the guard, not a separate `pending()` check that could disagree with it.
+   */
+  beginInvitationMutation(): boolean {
+    if (this._invitationMutating()) return false;
+    this._invitationMutating.set(true);
+    return true;
+  }
+
+  /** Release the invitation slot. Safe after the requesting tab has been destroyed. */
+  endInvitationMutation(): void {
+    this._invitationMutating.set(false);
+  }
+
+  /**
+   * A reissue landed where no tab could show its code: remember WHICH invitation that
+   * was. Takes the invitation's id and nothing else — see `unshownCodeInvitationId`.
+   */
+  markCodeUnshown(invitationId: string): void {
+    this._unshownCodeInvitationId.set(invitationId);
+  }
+
+  /** A code has been shown, or the invitation it was for is gone. */
+  clearCodeUnshown(): void {
+    this._unshownCodeInvitationId.set(null);
+  }
+
+  /** An invitation write got no usable answer. Recorded here; the caller re-reads. */
+  noteIndeterminateInvitationWrite(write: IndeterminateInvitationWrite): void {
+    this._indeterminateInvitationWrite.set(write);
+  }
+
+  /** The operator has acted again, or the outcome has been superseded by a real one. */
+  clearIndeterminateInvitationWrite(): void {
+    this._indeterminateInvitationWrite.set(null);
   }
 }

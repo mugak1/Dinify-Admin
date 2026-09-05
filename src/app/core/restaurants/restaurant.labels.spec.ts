@@ -13,6 +13,7 @@ import {
   ownerControlNote,
   ownerInvitationIsNotable,
   ownerInvitationLabel,
+  ownerInvitationNote,
   ownerRelationshipIsNotable,
   ownerRelationshipLabel,
   ownerRelationshipNote,
@@ -367,6 +368,21 @@ describe('restaurant labels', () => {
       expect(activityActionLabel('admin.auth.lockout_cleared')).toBe('Lockout cleared');
     });
 
+    it('translates the three Step 2G actions without a delivery word', () => {
+      expect(activityActionLabel('admin.restaurant.created')).toBe('Restaurant created');
+      expect(activityActionLabel('admin.restaurant.owner_invitation_reissued')).toBe(
+        'Owner claim code reissued',
+      );
+      expect(activityActionLabel('admin.restaurant.owner_invitation_cancelled')).toBe(
+        'Owner invitation cancelled',
+      );
+      // `reissued`, never `resent`: the audit action records a ROTATION, and the label
+      // must not turn it into a delivery event that never happened.
+      expect(activityActionLabel('admin.restaurant.owner_invitation_reissued')).not.toContain(
+        'sent',
+      );
+    });
+
     it('humanises an action it does not know, rather than rendering nothing', () => {
       // `audit_actions.py` grows as capability lands. A blank row is worse than a
       // slightly mechanical one.
@@ -547,6 +563,7 @@ describe('restaurant labels', () => {
       ['not_issued', 'Not issued'],
       ['pending', 'Pending'],
       ['expired', 'Expired'],
+      ['verification_locked', 'Verification locked'],
       ['consumed', 'Redeemed'],
       ['cancelled', 'Cancelled'],
       ['superseded', 'Superseded'],
@@ -559,6 +576,33 @@ describe('restaurant labels', () => {
       });
     }
 
+    it('never describes an invitation as sent, delivered or resendable', () => {
+      // ISSUANCE IS NOT DELIVERY. The platform hands a claim code to the operator and
+      // delivers nothing, so no status word may imply a message went anywhere.
+      for (const [status] of CASES) {
+        for (const forbidden of ['Sent', 'Delivered', 'Resend', 'Resent', 'Emailed', 'SMS']) {
+          expect(ownerInvitationLabel(status)).withContext(`${status}: ${forbidden}`).not.toContain(forbidden);
+          expect(ownerInvitationNote(status) ?? '').withContext(`${status}: ${forbidden}`).not.toContain(forbidden);
+        }
+      }
+    });
+
+    it('explains every actionable state in a sentence, and stays silent where the label suffices', () => {
+      expect(ownerInvitationNote('not_issued')).toContain('No claim code has been issued');
+      expect(ownerInvitationNote('pending')).toContain('enter the claim code in the restaurant portal');
+      expect(ownerInvitationNote('expired')).toContain('can no longer be redeemed');
+      // LOCKED IS NOT EXPIRED. Both are unclaimable and both are remedied by a reissue,
+      // but only one of them says somebody sat there guessing — the backend gives it
+      // precedence over `expired` for exactly that reason, and the note says why.
+      expect(ownerInvitationNote('verification_locked')).toContain('failed verification attempts');
+      expect(ownerInvitationNote('verification_locked')).not.toContain('expired');
+      expect(ownerInvitationNote('consumed')).toContain('redeemed');
+      expect(ownerInvitationNote('cancelled')).toContain('cannot be redeemed');
+      expect(ownerInvitationNote('superseded')).toContain('replaced by a later one');
+      expect(ownerInvitationNote('not_applicable')).toBeNull();
+      expect(ownerInvitationNote('unavailable')).toBeNull();
+    });
+
     it('NEVER collapses not_applicable into not_issued', () => {
       // A legacy-adopted restaurant never had an invitation to issue. Reading the first
       // as the second invents a missing step for every tenant that predates the domain.
@@ -567,8 +611,12 @@ describe('restaurant labels', () => {
       );
     });
 
-    it('marks only an expired invitation as notable', () => {
+    it('marks exactly the two unclaimable-but-unresolved states as notable', () => {
+      // Step 2C marked ONLY `expired`; Step 2G added `verification_locked`, which is the
+      // same operational situation — a credential still holding the slot that can no
+      // longer be redeemed — arrived at by an attacker rather than a clock.
       expect(ownerInvitationIsNotable('expired')).toBeTrue();
+      expect(ownerInvitationIsNotable('verification_locked')).toBeTrue();
       // Pending is waiting, not failing; cancelled and superseded were decisions.
       for (const quiet of [
         'unavailable',
@@ -597,7 +645,7 @@ describe('restaurant labels', () => {
         ...(['unavailable', 'not_established', 'attested', 'invitation_redeemed', 'stale_attestation'] as const).map(
           ownerControlLabel,
         ),
-        ...(['unavailable', 'not_applicable', 'not_issued', 'pending', 'expired', 'consumed', 'cancelled', 'superseded'] as const).map(
+        ...(['unavailable', 'not_applicable', 'not_issued', 'pending', 'expired', 'verification_locked', 'consumed', 'cancelled', 'superseded'] as const).map(
           ownerInvitationLabel,
         ),
         ownerControlEvidenceLabel('legacy_attestation') ?? '',

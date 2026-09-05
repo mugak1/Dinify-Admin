@@ -12,6 +12,9 @@ import {
   CommercialSummary,
   DirectoryQuery,
   OnboardingSummary,
+  OwnerInvitationCancelResult,
+  OwnerInvitationReissueResult,
+  RestaurantCreationResult,
   RestaurantDetail,
   RestaurantDirectoryPage,
   RestaurantRow,
@@ -115,7 +118,9 @@ const SPARSE_ONBOARDING: OnboardingSummary = {
   recorded_at: '2026-08-22T09:14:33+03:00',
   owner_relationship: { status: 'consistent' },
   owner_control: { status: 'not_established', evidence: null, evidence_at: null },
-  invitation: { status: 'not_applicable' },
+  // The Step 2E metadata keys are PRESENT AND NULL where no invitation applies —
+  // a client never branches on the status word to learn which keys exist.
+  invitation: { status: 'not_applicable', id: null, issued_at: null, expires_at: null },
 };
 
 const DETAIL: RestaurantDetail = {
@@ -371,7 +376,7 @@ describe('RestaurantHttp', () => {
         recorded_at: null,
         owner_relationship: { status: 'unavailable' },
         owner_control: { status: 'unavailable', evidence: null, evidence_at: null },
-        invitation: { status: 'unavailable' },
+        invitation: { status: 'unavailable', id: null, issued_at: null, expires_at: null },
       };
 
       let received: RestaurantDetail | undefined;
@@ -413,7 +418,12 @@ describe('RestaurantHttp', () => {
           evidence: 'legacy_attestation',
           evidence_at: '2026-06-02T08:30:00+03:00',
         },
-        invitation: { status: 'superseded' },
+        invitation: {
+          status: 'superseded',
+          id: '4d5e6f70-8192-4a3b-9c4d-000000000007',
+          issued_at: '2026-06-01T08:00:00+03:00',
+          expires_at: '2026-06-08T08:00:00+03:00',
+        },
       };
 
       let received: RestaurantDetail | undefined;
@@ -1013,6 +1023,9 @@ describe('RestaurantHttp', () => {
         'recordSubscriptionTerms',
         'replaceSubscriptionTerms',
         'endSubscriptionTerms',
+        'createRestaurant',
+        'reissueOwnerInvitation',
+        'cancelOwnerInvitation',
       ]) {
         expect(typeof surface[named]).withContext(`${named} is part of the port`).toBe('function');
       }
@@ -1029,11 +1042,322 @@ describe('RestaurantHttp', () => {
         'updateSubscriptionTerms',
         'deleteSubscriptionTerms',
         'cancelSubscription',
+        // Step 2G. `reissue`, never `resend` — nothing is delivered, so no method may
+        // promise a delivery event; and never one generic invitation mutator.
+        'resendOwnerInvitation',
+        'resendInvitation',
+        'sendOwnerInvitation',
+        'sendInvitation',
+        'deliverOwnerInvitation',
+        'ownerInvitationAction',
+        'mutateInvitation',
+        'mutateOwnerInvitation',
+        'updateOwner',
+        'updateOwnerInvitation',
+        'searchOwners',
+        'findOwner',
+        'lookupOwner',
       ]) {
         expect(typeof surface[forbidden])
           .withContext(`${forbidden} must not be part of the public API`)
           .not.toBe('function');
       }
+    });
+
+    it('is exactly TEN named operations, and no method name promises delivery', () => {
+      const names = Object.getOwnPropertyNames(RestaurantHttp.prototype).filter(
+        (name) => name !== 'constructor',
+      );
+      expect(names.sort()).toEqual(
+        [
+          'list',
+          'detail',
+          'setPaymentTiming',
+          'setPaymentCollectionMode',
+          'recordSubscriptionTerms',
+          'replaceSubscriptionTerms',
+          'endSubscriptionTerms',
+          'createRestaurant',
+          'reissueOwnerInvitation',
+          'cancelOwnerInvitation',
+        ].sort(),
+      );
+      for (const name of names) {
+        expect(name).withContext(name).not.toMatch(/send|deliver|notify|mail|sms/i);
+      }
+    });
+  });
+
+  // ── RESTAURANT CREATION (Step 2G, backend Step 2D) ─────────────────────────────
+
+  describe('restaurant creation', () => {
+    const CREATED_ID = '9a7f1cf0-4b2e-4f3a-9c1d-f00000000001';
+
+    /** The 201 envelope, as `restaurant_creation.success_body` builds it. */
+    function created(): { status: number; message: string; data: RestaurantCreationResult } {
+      return {
+        status: 201,
+        message: 'Restaurant created.',
+        data: {
+          restaurant: { ...DETAIL, id: CREATED_ID, name: 'Speke Road Cafe' },
+          owner_account: { id: '1f2e3d4c-5b6a-4978-8899-f00000000001', created: true },
+          owner_invitation: {
+            id: '4d5e6f70-8192-4a3b-9c4d-f00000000001',
+            issued_at: '2026-08-25T09:00:00+00:00',
+            expires_at: '2026-09-01T09:00:00+00:00',
+            claim_token: 'AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AbCdEfGhIjKlMnOpQrStUvWxYz01',
+          },
+        },
+      };
+    }
+
+    it('POSTs the COLLECTION route — the same address the directory reads — with the exact body', () => {
+      // One resource, two methods, two authority bars. There is deliberately no
+      // `/restaurants/create/`: the method carries the meaning.
+      http
+        .createRestaurant({
+          restaurant: { name: 'Speke Road Cafe', location: 'Kampala', is_test: false },
+          owner: {
+            mode: 'new',
+            first_name: 'Miriam',
+            last_name: 'Nakato',
+            phone_number: '0772140388',
+            email: null,
+          },
+          reason: 'Signed pilot agreement, March cohort',
+        })
+        .subscribe();
+
+      const request = controller.expectOne(LIST_URL);
+      expect(request.request.method).toBe('POST');
+      expect(request.request.body).toEqual({
+        restaurant: { name: 'Speke Road Cafe', location: 'Kampala', is_test: false },
+        owner: {
+          mode: 'new',
+          first_name: 'Miriam',
+          last_name: 'Nakato',
+          phone_number: '0772140388',
+          email: null,
+        },
+        reason: 'Signed pilot agreement, March cohort',
+      });
+      request.flush(created(), { status: 201, statusText: 'Created' });
+    });
+
+    it('TRANSMITS is_test AS A JSON BOOLEAN and a blank email as an explicit null', () => {
+      // `StrictBooleanField` refuses `"false"`, `0` and `null`: the test classification
+      // is decided by an operator saying so, never by a coercion table. And `email`
+      // is nullable-but-present, so absence is stated rather than dropped by
+      // `JSON.stringify`.
+      http
+        .createRestaurant({
+          restaurant: { name: 'Demo Kitchen', location: 'Internal', is_test: true },
+          owner: { mode: 'new', first_name: 'A', last_name: 'B', phone_number: '0700000001', email: null },
+          reason: 'Internal rehearsal tenant',
+        })
+        .subscribe();
+
+      const wire = JSON.stringify(controller.expectOne(LIST_URL).request.body);
+      expect(wire).toContain('"is_test":true');
+      expect(wire).not.toContain('"is_test":"true"');
+      expect(wire).toContain('"email":null');
+    });
+
+    it('sends EXACTLY the existing-owner keys for mode=existing', () => {
+      // The server refuses a `first_name` beside `mode: "existing"` by reading the keys
+      // that were SENT, blank or not. The transport passes the typed body through; the
+      // page builds it with only that mode's keys, and this pins the wire.
+      http
+        .createRestaurant({
+          restaurant: { name: 'Second Branch', location: 'Jinja', is_test: false },
+          owner: { mode: 'existing', user_id: '1f2e3d4c-5b6a-4978-8899-000000000002' },
+          reason: 'Existing owner opening a second site',
+        })
+        .subscribe();
+
+      const body = controller.expectOne(LIST_URL).request.body as { owner: object };
+      expect(Object.keys(body.owner)).toEqual(['mode', 'user_id']);
+    });
+
+    it('unwraps the 201 envelope and hands the claim token on EXACTLY as it arrived', () => {
+      let received: RestaurantCreationResult | undefined;
+      http
+        .createRestaurant({
+          restaurant: { name: 'Speke Road Cafe', location: 'Kampala', is_test: false },
+          owner: { mode: 'new', first_name: 'Miriam', last_name: 'Nakato', phone_number: '0772140388', email: null },
+          reason: 'Signed pilot agreement, March cohort',
+        })
+        .subscribe((value) => (received = value));
+
+      controller.expectOne(LIST_URL).flush(created(), { status: 201, statusText: 'Created' });
+
+      expect(received).toEqual(created().data);
+      expect(received?.owner_invitation.claim_token).toBe(created().data.owner_invitation.claim_token);
+      // The transport is a pipe. It holds nothing back and keeps nothing: no field of
+      // the instance carries the credential after the response has been handed on.
+      for (const [field, held] of Object.entries(http)) {
+        expect(typeof held === 'string' ? held : '')
+          .withContext(`RestaurantHttp.${field}`)
+          .not.toContain(created().data.owner_invitation.claim_token);
+      }
+    });
+
+    it('surfaces a 409 with its code and the ONE safe detail the server attaches', () => {
+      const seen: { status: number; code: unknown; details: unknown }[] = [];
+      http
+        .createRestaurant({
+          restaurant: { name: 'Speke Road Cafe', location: 'Kampala', is_test: false },
+          owner: { mode: 'new', first_name: 'Miriam', last_name: 'Nakato', phone_number: '0772140388', email: null },
+          reason: 'Signed pilot agreement, March cohort',
+        })
+        .subscribe({
+          next: () => fail('a conflict must not produce a value'),
+          error: (error: { status: number; error: { code?: string; details?: unknown } }) =>
+            seen.push({ status: error.status, code: error.error?.code, details: error.error?.details }),
+        });
+
+      controller.expectOne(LIST_URL).flush(
+        {
+          status: 409,
+          message:
+            'An account already uses that phone number. Review it and, if it is the intended owner, create the restaurant with that account instead.',
+          code: 'owner_account_already_exists',
+          details: { owner_user_id: '1f2e3d4c-5b6a-4978-8899-000000000002' },
+        },
+        { status: 409, statusText: 'Conflict' },
+      );
+
+      expect(seen).toEqual([
+        {
+          status: 409,
+          code: 'owner_account_already_exists',
+          details: { owner_user_id: '1f2e3d4c-5b6a-4978-8899-000000000002' },
+        },
+      ]);
+    });
+  });
+
+  // ── OWNER INVITATION (Step 2G, backend Step 2E) ────────────────────────────────
+
+  describe('owner-invitation writes', () => {
+    const REISSUE_URL = `/api/admin/v1/restaurants/${DETAIL_ID}/owner-invitation/reissue/`;
+    const CANCEL_URL = `/api/admin/v1/restaurants/${DETAIL_ID}/owner-invitation/cancel/`;
+    const HEAD_ID = '4d5e6f70-8192-4a3b-9c4d-000000000001';
+    const REQUEST = { expected_invitation_id: HEAD_ID, reason: 'Owner lost the original code' };
+
+    function onboardingWith(status: OnboardingSummary['invitation']['status']): OnboardingSummary {
+      return {
+        ...SPARSE_ONBOARDING,
+        source: 'admin_created',
+        invitation: {
+          status,
+          id: '4d5e6f70-8192-4a3b-9c4d-000000000002',
+          issued_at: '2026-08-25T09:00:00+00:00',
+          expires_at: '2026-09-01T09:00:00+00:00',
+        },
+      };
+    }
+
+    it('POSTs a reissue to the REISSUE route — never a resend, never an action segment', () => {
+      http.reissueOwnerInvitation(DETAIL_ID, REQUEST).subscribe();
+
+      const request = controller.expectOne(REISSUE_URL);
+      expect(request.request.method).toBe('POST');
+      expect(request.request.body).toEqual(REQUEST);
+      expect(request.request.url).not.toContain('resend');
+      request.flush({
+        status: 200,
+        message: 'Owner invitation reissued.',
+        data: {
+          changed: true,
+          onboarding: onboardingWith('pending'),
+          owner_invitation: {
+            id: '4d5e6f70-8192-4a3b-9c4d-000000000002',
+            issued_at: '2026-08-25T09:00:00+00:00',
+            expires_at: '2026-09-01T09:00:00+00:00',
+            claim_token: 'new-raw-code',
+          },
+        },
+      });
+    });
+
+    it('POSTs a cancel to the CANCEL route, with the same body shape', () => {
+      http.cancelOwnerInvitation(DETAIL_ID, REQUEST).subscribe();
+
+      const request = controller.expectOne(CANCEL_URL);
+      expect(request.request.method).toBe('POST');
+      expect(request.request.body).toEqual(REQUEST);
+      request.flush({
+        status: 200,
+        message: 'Owner invitation cancelled.',
+        data: { changed: true, onboarding: onboardingWith('cancelled') },
+      });
+    });
+
+    it('transmits expected_invitation_id BYTE FOR BYTE — it is an identity, not a value', () => {
+      http.reissueOwnerInvitation(DETAIL_ID, REQUEST).subscribe();
+      const wire = JSON.stringify(controller.expectOne(REISSUE_URL).request.body);
+      expect(wire).toContain(`"expected_invitation_id":"${HEAD_ID}"`);
+    });
+
+    it('unwraps a reissue to {changed, onboarding, owner_invitation} with the raw code intact', () => {
+      let received: OwnerInvitationReissueResult | undefined;
+      http.reissueOwnerInvitation(DETAIL_ID, REQUEST).subscribe((value) => (received = value));
+
+      const data: OwnerInvitationReissueResult = {
+        changed: true,
+        onboarding: onboardingWith('pending'),
+        owner_invitation: {
+          id: '4d5e6f70-8192-4a3b-9c4d-000000000002',
+          issued_at: '2026-08-25T09:00:00+00:00',
+          expires_at: '2026-09-01T09:00:00+00:00',
+          claim_token: 'new-raw-code',
+        },
+      };
+      controller.expectOne(REISSUE_URL).flush({ status: 200, message: 'Owner invitation reissued.', data });
+
+      expect(received).toEqual(data);
+      // The CANONICAL projection rides beside the credential, never inside it — so the
+      // caller can adopt `onboarding` into the workspace without the token going with it.
+      expect(JSON.stringify(received?.onboarding)).not.toContain('new-raw-code');
+    });
+
+    it('passes a cancel no-op through as a SUCCESS with changed:false', () => {
+      let received: OwnerInvitationCancelResult | undefined;
+      let errored = false;
+      http
+        .cancelOwnerInvitation(DETAIL_ID, REQUEST)
+        .subscribe({ next: (value) => (received = value), error: () => (errored = true) });
+
+      controller.expectOne(CANCEL_URL).flush({
+        status: 200,
+        message: 'Owner invitation cancelled.',
+        data: { changed: false, onboarding: onboardingWith('cancelled') },
+      });
+
+      expect(errored).toBeFalse();
+      expect(received?.changed).toBeFalse();
+      expect(received?.onboarding.invitation.status).toBe('cancelled');
+    });
+
+    it('surfaces a 409 with its code and NO details — the server names no row', () => {
+      const seen: { status: number; code: unknown; details: unknown }[] = [];
+      http.cancelOwnerInvitation(DETAIL_ID, REQUEST).subscribe({
+        next: () => fail('a conflict must not produce a value'),
+        error: (error: { status: number; error: { code?: string; details?: unknown } }) =>
+          seen.push({ status: error.status, code: error.error?.code, details: error.error?.details }),
+      });
+
+      controller.expectOne(CANCEL_URL).flush(
+        {
+          status: 409,
+          message: 'The owner invitation changed since it was loaded.',
+          code: 'stale_owner_invitation',
+        },
+        { status: 409, statusText: 'Conflict' },
+      );
+
+      expect(seen).toEqual([{ status: 409, code: 'stale_owner_invitation', details: undefined }]);
     });
   });
 });

@@ -44,6 +44,15 @@ jobs:
       - name: Design-token gate
         run: npm run check:tokens
 
+      # The claim-code gate (ADMIN-CLAIM-CODE-00), also before the suite. A raw owner
+      # claim code is a bearer credential the server returns once and keeps only as a
+      # hash; this fails the build if any production statement or template tag writes
+      # one to storage, a log, a URL, router state, the workspace store, a canonical
+      # model, or assembles a claim link. `--self-test` runs first, for the same reason
+      # as above.
+      - name: Claim-code gate
+        run: npm run check:claim-code
+
       - name: Test
         run: npm run test:ci
 

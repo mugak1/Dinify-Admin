@@ -24,9 +24,12 @@ conventions change.
 workspace), the READ half of STEP 2C (the onboarding and owner-control projection),
 STEP 3E.1 (the canonical commercial READ migration), STEP 3E.2 (the
 service-configuration WRITE controls) and STEP 3E.3 (the subscription-terms WRITE
-controls), all rendered on Overview.** Step 2 as a whole is NOT complete — nothing in
-this repo creates a restaurant, adopts one, attests owner control or issues an
-invitation.
+controls), all rendered on Overview — and STEP 2G, the operator side of the ownership
+chain: restaurant creation at `/restaurants/new` with the one-time owner claim code,
+and the owner-invitation REISSUE and CANCEL controls on the Readiness tab.** Step 2 as
+a whole is still NOT complete — nothing in this repo adopts a pre-existing restaurant,
+attests owner control, reassigns an owner or delivers anything; owner claim itself
+lives in the restaurant portal.
 
 **STEP 3E IS NOW COMPLETE ON THE FRONTEND: all five commercial writes exist.** That is a
 statement about THIS repo's commercial surface and nothing else. It does NOT mean
@@ -78,17 +81,34 @@ Steps 3–10 are otherwise not built.
   same no-optimistic-UI rule as 3E.2. The concurrency token is a ROW ID
   (`expected_terms_id`), not a value, and Record deliberately carries none. See "The
   Subscription-Terms Writes" below.
-- **Readiness, Billing, Support and Activity tabs: ❌ still placeholders** with
-  written empty states (spec §15 steps 3, 7, 6 and 8).
-- **Restaurant creation, restaurant adoption, owner-control attestation, owner
-  invitation (issue / reissue / cancel), owner reassignment, the readiness ENGINE,
-  lifecycle controls, delegated drill-in, support triage, receivables, INVOICES, owner
-  APPROVAL of commercial terms, the Activity screen, Home needs-attention and portfolio
-  metrics: ❌ NOT BUILT.** Spec §15 steps 2–10. Step 2C gave this repo the onboarding
-  facts to READ; every write in that domain is still unbuilt. And 3E being complete says
-  nothing about the four commercial-adjacent items in that list — recorded terms are not
-  an invoice, a receivable, a payment or an owner's agreement, and there is no model on
-  the server behind any of them.
+- **Step 2G restaurant creation: ✅ BUILT.** `/restaurants/new` creates a tenant
+  through the EXISTING `POST /api/admin/v1/restaurants/` collection write — an explicit
+  new-or-existing owner mode, an explicit real-or-test classification, a stated reason —
+  and then shows the owner claim code the 201 carries ONCE, in a copyable field, with
+  the way into the new restaurant's workspace. A phone already in use is shown as the
+  refusal it is, with one deliberate step to the existing account and no automatic
+  reuse. See "Restaurant Creation and the Owner Claim Code" below.
+- **Step 2G owner-invitation writes: ✅ BUILT.** The Readiness tab carries an Owner
+  claim panel that renders owner control and the invitation as two separate axes and
+  offers REISSUE (rotation, with the new code shown once) and CANCEL (withdrawal, no
+  replacement) exactly where the server would accept them — two named endpoints, the
+  reviewed `expected_invitation_id` as the concurrency token, elevation and audit through
+  the existing machinery, one invitation write at a time per workspace, and the same
+  409-then-reload gate the commercial writes use. Overview reports the state and links
+  there. See "The Owner-Invitation Writes" below.
+- **Readiness (the ENGINE half), Billing, Support and Activity tabs: ❌ still
+  placeholders** with written empty states (spec §15 steps 3, 7, 6 and 8). The
+  Readiness tab is no longer empty — the owner claim panel sits above the engine's
+  placeholder — but the checklist it will one day evaluate is still not built.
+- **Restaurant adoption, owner-control attestation, owner reassignment, delivery of a
+  claim code, the readiness ENGINE, lifecycle controls, delegated drill-in, support
+  triage, receivables, INVOICES, owner APPROVAL of commercial terms, the Activity
+  screen, Home needs-attention and portfolio metrics: ❌ NOT BUILT.** Spec §15 steps
+  3–10, and the remainder of step 2. 3E being complete says nothing about the four
+  commercial-adjacent items in that list — recorded terms are not an invoice, a
+  receivable, a payment or an owner's agreement, and there is no model on the server
+  behind any of them. And 2G being complete says nothing about delivery: the platform
+  hands a code to an operator and sends nothing to anyone.
 - **Deployment: 0C.1 ✅ EMPIRICALLY ACCEPTED (2026-08-20) · 0C.2 ✅ EMPIRICALLY
   ACCEPTED (2026-08-21).** `.github/workflows/deploy.yml` deploys over GitHub OIDC →
   private S3 → AWS SSM. The real Angular application is live on
@@ -265,15 +285,33 @@ the case study for why `--self-test` exists.
 ```
 /                                 /support
 /restaurants                      /support/:issueId
-/restaurants/:id                  /receivables
-/restaurants/:id/readiness        /receivables/:invoiceId
-/restaurants/:id/billing          /activity
-/restaurants/:id/support          /login
-/restaurants/:id/activity         /unavailable
+/restaurants/new                  /receivables
+/restaurants/:id                  /receivables/:invoiceId
+/restaurants/:id/readiness        /activity
+/restaurants/:id/billing          /login
+/restaurants/:id/support          /unavailable
+/restaurants/:id/activity
 ```
 
 Plus a `**` → `/` fallback, which is not a destination — it stops a mistyped URL
 rendering a blank frame. `app.routes.spec.ts` pins the exact set.
+
+- **`/restaurants/new` is declared BEFORE `/restaurants/:id`**, and a spec pins the
+  order: the router matches in declaration order, and declared after the parameterised
+  route the creation screen would open a workspace for a restaurant whose id is the
+  string "new". It is a UI route over the existing `POST /restaurants/` collection
+  write, has no children, no persistent header and no `RestaurantWorkspaceStore` —
+  there is no restaurant yet.
+- **The creation screen and the Readiness tab are LAZY** (`loadComponent`), and the
+  Readiness tab lives in its own file, `features/restaurant-readiness.tab.ts`, for
+  that reason alone. Step 2G's eager code pushed the production initial bundle from
+  481 kB to 526 kB, past the 500 kB warning budget in `angular.json`; lazy-loading a
+  rare, deliberate creation screen and a tab opened for one restaurant at a time
+  brought it back under, without touching the budget. The Readiness tab is still a
+  CHILD of the persistent workspace header and still reads the route-scoped store —
+  laziness changes when the code arrives, not where the state lives. The tab imports
+  the shared panel styles, `invitationWindowLine` (Overview renders it too) and
+  `readStatus` from `restaurant-tabs.pages.ts` rather than copying them.
 
 - `/login` and `/unavailable` sit **outside** the shell. Everything else is behind
   `authGuard` on the shell parent — one guard, not twelve that can drift apart.
@@ -448,9 +486,10 @@ GET /api/admin/v1/restaurants/            -> {status, data: {results[], paginati
 GET /api/admin/v1/restaurants/<uuid>/     -> {status, data: {...detail}}
 ```
 
-(`RestaurantApi` also carries the five commercial WRITES from steps 3E.2 and 3E.3 —
-seven named operations in total. Those are elevation-gated and audited, and are documented
-in their own sections below. The files here are the read half.)
+(`RestaurantApi` also carries the five commercial WRITES from steps 3E.2 and 3E.3, the
+restaurant CREATION and the two owner-invitation writes from step 2G — ten named
+operations in total. The writes are elevation-gated and audited, and are documented in
+their own sections below. The files here are the read half.)
 
 Shaped like the auth seam and for the same reason — a PORT (`RESTAURANT_API`) plus a
 typed transport, so `npm start` renders both screens with no backend and everything above
@@ -650,10 +689,12 @@ lifecycle state, or `is_test`. `is_test` affects portfolio visibility later; it 
 rewrite the commercial facts a restaurant has recorded.
 
 ### THE COMMERCIAL WRITES THAT EXIST, AND THE ONES THAT DO NOT
-**FIVE NAMED OPERATIONS, AND THE COUNT IS NOW CLOSED.** 3E.2 added `setPaymentTiming` and
-`setPaymentCollectionMode`; 3E.3 added `recordSubscriptionTerms`,
-`replaceSubscriptionTerms` and `endSubscriptionTerms`. With the two reads that is a port
-of SEVEN operations, and a test enumerates it.
+**FIVE NAMED COMMERCIAL OPERATIONS, AND THAT COUNT IS CLOSED.** 3E.2 added
+`setPaymentTiming` and `setPaymentCollectionMode`; 3E.3 added `recordSubscriptionTerms`,
+`replaceSubscriptionTerms` and `endSubscriptionTerms`. With the two reads, and Step 2G's
+`createRestaurant`, `reissueOwnerInvitation` and `cancelOwnerInvitation`, that is a port
+of TEN operations, and a test enumerates it by name and asserts no method name promises
+delivery.
 
 Permanently absent, and the reason has not changed: any generic `post()`, `write()`,
 `mutateCommercial`, `setAxis`, `setCommercialField`, `updateSubscriptionTerms` or
@@ -844,9 +885,10 @@ sessionStorage.setItem('dinify-admin.mock-commercial', 'stale')
 
 ### THE DIRECTORY STAYS READ-ONLY
 No write controls on `/restaurants`. Writes belong inside the workspace, where the
-restaurant's identity and context stay visible while the change is made. The directory's
-stub API THROWS on all FIVE write methods, so a control added there fails a test rather than
-quietly working.
+restaurant's identity and context stay visible while the change is made — and creation
+belongs on its own screen, which the directory reaches by a plain anchor to
+`/restaurants/new`. The directory's stub API THROWS on all EIGHT write methods, so a
+control added there fails a test rather than quietly working.
 
 ## The Subscription-Terms Writes — spec §15 step 3E.3
 
@@ -1061,13 +1103,224 @@ that MIRROR `onboarding` (`tracked`, and the owner-control status while tracked)
 stay in the typed model and nothing renders them. Two panels answering one question is
 how a screen starts disagreeing with itself.
 
-**THERE ARE NO ONBOARDING WRITES IN THIS REPO.** No adopt, no attest, no invite, no
-reissue, no cancel, no owner reassignment, no restaurant creation — and no disabled
-buttons standing in for them. This claim used to rest on Overview shipping ZERO buttons,
-which stopped being true at 3E.2. It now rests on something sharper: a test pins the tab's
-EXACT control set for each commercial state (`['Change', 'Change', 'Record terms']` with
-no open terms, `['Change', 'Change', 'Replace terms', 'End terms']` with them) and asserts
-every onboarding verb is absent from the rendered text.
+**OVERVIEW CARRIES NO ONBOARDING WRITES.** Step 2G put the two that exist — reissue
+and cancel — on the READINESS tab (spec §14), and creation on its own screen; Overview
+gained exactly one ANCHOR ("Manage the owner claim on Readiness", shown for an
+admin-created restaurant only) and no button. A test pins Overview's EXACT control set
+for each commercial state (`['Change', 'Change', 'Record terms']` with no open terms,
+`['Change', 'Change', 'Replace terms', 'End terms']` with them), pins the onboarding
+panel's single anchor, and asserts the delivery vocabulary is absent from the rendered
+text. Still absent everywhere in this repo, and not standing in as disabled buttons:
+adopt, attest, owner reassignment, and delivery of any kind.
+
+
+## Restaurant Creation and the Owner Claim Code — spec §15 step 2, Admin Step 2G
+
+`/restaurants/new` is the operator side of an ownership chain that already existed end
+to end on the server and in the restaurant portal: backend Step 2D creates the tenant
+and mints a claim credential, Step 2E rotates or withdraws it, Steps 2F.1–2F.3 let the
+owner redeem it in the restaurant portal (`/owner-claim`: paste the code, verify a
+phone OTP, choose a password) and bootstrap a session. This screen calls the EXISTING
+collection write and adds no API surface of its own.
+
+```
+POST /api/admin/v1/restaurants/
+{ "restaurant": { "name", "location", "is_test": true|false },
+  "owner": { "mode": "new", "first_name", "last_name", "phone_number", "email": "…"|null }
+         | { "mode": "existing", "user_id": "<uuid>" },
+  "reason": "…" }
+  -> 201 { restaurant: <the canonical detail>, owner_account: { id, created },
+           owner_invitation: { id, issued_at, expires_at, claim_token } }   no-store
+```
+
+### THE BODY IS BUILT FROM THE CHOSEN MODE, NEVER SPREAD FROM A FORM OBJECT
+The server reads the owner block by the keys the caller SENT: a `user_id` key beside
+`mode: "new"` is refused, blank or not, and so is a `first_name` beside
+`mode: "existing"`. So the page keeps both drafts in memory (switching back must not
+lose what was typed) and `buildOwner()` emits exactly one mode's keys — the other is
+unrepresentable on the wire. Three facts are stated by the operator and defaulted by
+nobody: the **classification** (`is_test`, a JSON boolean — the server's
+`StrictBooleanField` refuses `"true"`, `1` and `null`, because a coercion table must not
+decide whether a tenant appears in every revenue figure), the **owner mode**, and the
+**reason**. Both radios start with nothing selected. A blank email is sent as an explicit
+`null`; the phone is sent as typed, because canonicalising a Ugandan number is the
+server's job and there is exactly one place that does it.
+
+### A COLLISION NEVER BECOMES A REUSE
+A phone already in use is a 409 `owner_account_already_exists` whose `details` carry
+the existing account's UUID and nothing else. The page shows the server's sentence and
+the id, states that nothing was reused, and offers ONE step — "Use this existing
+account", which switches the mode and fills the id — after which the operator reviews
+the form and submits again. Nothing switches modes on its own and nothing resubmits; a
+spec pins that the switch sends no request and that the next body is
+`{mode: "existing", user_id}` alone. An email collision names no account and offers no
+switch (email is not identity, and pointing at an account would invite exactly the
+inference the contract refuses); `owner_account_not_found` / `_inactive` show the id
+without the switch; `restaurant_already_exists` links to the EXISTING restaurant's
+Readiness tab, where a code lost to a double submission is reissued. **There is no owner
+search** and this screen must not become one.
+
+### THE CLAIM CODE IS TRANSIENT, AND ONLY HERE
+The raw token from the 201 lives in one component signal for as long as the success
+state is on screen, is rendered into a READONLY input (selectable with one click, no
+autocomplete, no spellcheck) beside a Copy button, and is cleared in `DestroyRef`. A 201
+that lands AFTER the operator has navigated away is DROPPED — the restaurant exists, the
+code is unknown, and the workspace's reissue is the repair — rather than parked somewhere
+that outlives the screen. It is never written to localStorage, sessionStorage,
+IndexedDB, a cookie, the URL, router state, the workspace store, a notice, a defect
+report or a log, and **no claim URL is fabricated**: the portal's claim screen is NAMED
+in prose and takes a pasted code. `scripts/check-claim-code-handling.mjs`
+(ADMIN-CLAIM-CODE-00, `npm run check:claim-code`, in `verify.sh` and CI) enforces the
+source-level half of that — a STATEMENT, or an inline template's start tag, however many
+lines either spans, naming a claim-code identifier beside a sink; any assembled
+`owner-claim?…` / `token=` link, concatenated pieces included; or a claim-code identifier
+in the store or a canonical model fails the build. **It judges units, not lines**: the
+first version compared each source line with itself, and review found the hole in one
+sentence — an ordinarily formatted multi-line `setItem(` call had the sink on one line
+and the credential on the next and passed. It now parses every file with the TypeScript
+compiler API (the repo's own `typescript` devDependency), takes the innermost enclosing
+unit around each credential occurrence (statement, class member, type member, decorator,
+parameter) with nested units and sibling callbacks blanked out — so
+`subscribe({ next: r => …claim_token…, error: e => this.defects.report(e) })` is not a
+credential reaching the defect channel — reads each template start tag as one unit,
+checks the URL shapes against a squashed copy of each unit too (so `'/owner-claim' + '?'
++ 'token='` reads as the link it builds), is comment-aware, carries a `--self-test` whose
+cases include the multi-line shapes, and excludes specs, which assert the negative and
+legitimately name sinks beside fixture tokens. It is syntax, not taint analysis: a
+credential copied into another variable and then stored still passes. The runtime half is
+the specs' `tokenIsNowhereBut` sweep over storage, the URL, the store (its two
+invitation-write records included), every anchor and the rendered markup. The panel's copy states the
+consequence exactly: shown once, not retrievable, reissue from the Readiness tab if
+lost; and it says what issuance is not — not delivery (the operator hands the code
+over) and not owner control (established only when the owner redeems it).
+
+### A LOST ANSWER IS NOT A FAILURE
+A 5xx or a dead socket after the POST is INDETERMINATE: the server may have committed
+all six rows, and the only copy of the credential was in the response that never
+arrived. The screen therefore never says "failed", never re-POSTs on its own (a spec
+lets a minute pass and counts one request), keeps the draft for a deliberate decision,
+raises the shared outage state with the request id, and points at the directory first —
+"Look for it in the directory", pre-filtered on the name typed. A restaurant that
+exists without a known code is repaired by REISSUE, which is precisely why the backend
+built reissue as rotation. The two elevation outcomes keep the draft and say nothing was
+created; a 400 keeps the form with the server's NESTED field errors flattened to the
+dotted paths the form addresses its controls by (`extractNestedFieldErrors` —
+`owner.phone_number`, `restaurant.is_test`, `reason`, `__all__`).
+
+### ONE SUBMIT PATH
+The Create button is a `type="submit"` button with NO click handler of its own; the
+form's submit event is the one way in, so a click and an Enter keypress cannot become
+two requests, and `pending` shuts every control while the request is in flight. There
+is no workspace slot here because there is no restaurant yet: the page is the only
+writer and the flag is local.
+
+### WHAT CREATION DOES NOT DO
+It delivers nothing, establishes no owner control, makes nothing live (the restaurant
+starts `onboarding`, and `check_go_live_readiness` still fails closed, so it cannot go
+live at all until the engine lands — the accepted, stated cost of creation shipping
+ahead of spec §15's step 3), and creates no commercial, readiness, menu, table, QR or
+lifecycle state. The success copy says all four.
+
+## The Owner-Invitation Writes — spec §14, Admin Step 2G
+
+The Readiness tab's **Owner claim** panel: owner control and the invitation as two
+rows, the issue and expiry window in EAT, a note per state, and — where the server would
+accept them — two actions.
+
+```
+POST /api/admin/v1/restaurants/<uuid>/owner-invitation/reissue/   -> { changed: true, onboarding, owner_invitation: { id, issued_at, expires_at, claim_token } }
+POST /api/admin/v1/restaurants/<uuid>/owner-invitation/cancel/    -> { changed, onboarding }
+{ "expected_invitation_id": "<uuid>", "reason": "…" }
+```
+
+### TWO NAMED OPERATIONS — `reissue`, NEVER `resend`
+`reissueOwnerInvitation` and `cancelOwnerInvitation`, mirroring two named routes; never
+`ownerInvitationAction(kind)`, `mutateInvitation`, `updateOwner` or anything with
+`send`/`resend`/`deliver` in its name, and a spec sweeps the transport's method names
+for those words. Nothing is delivered — here, or on the server, which has no delivery
+model at all — so a method promising a delivery event would put a claim in the code
+that the platform cannot keep. The vocabulary throughout is issue / reissue / cancel /
+claim code / copy code; the words Sent, Delivered, Resend and "claim link" appear on no
+screen, and specs sweep the rendered text for them.
+
+### THE CONTROLS FOLLOW THE SERVER'S RULES
+`invitationControlsFor` mirrors the domain's refusals so that no button's only possible
+outcome is a 409: **reissue** needs an admin-created restaurant with an issued head,
+owner control NOT established by the current owner (`invitation_redeemed` withholds it —
+"already claimed"), a consistent owner relationship, and a usable owner account (present
+and active); where it is withheld for a reason the operator can act on, the reason is
+stated. **Cancel** needs an UNRESOLVED head — `pending`, `expired` or
+`verification_locked` — so a cancelled, consumed or superseded invitation cannot be
+cancelled. A legacy adoption gets no controls and a note that no claim code applies; an
+untracked tenant gets the untracked note. A spec enumerates the whole matrix.
+
+### `expected_invitation_id` IS AN IDENTITY, CAPTURED WHEN THE ACTION OPENS
+It asserts "the invitation I reviewed is still the head" — identity, not status — and
+is captured into a plain signal when the action opens, never re-read at submit and never
+substituted from the store or a reload: a spec adopts a different head underneath an
+open form and pins that the request still names the reviewed id, because "act on
+whatever is current" is the stale-screen overwrite the token exists to prevent. The
+elevation replay carries it byte for byte (`error.interceptor.spec.ts`), so a TOTP
+prompt between review and write cannot change what is asserted.
+
+### ONE INVITATION WRITE AT A TIME, HELD BY THE WORKSPACE
+`RestaurantWorkspaceStore.invitationMutating` is a SECOND slot beside the commercial
+one, and the separation is deliberate: the commercial slot exists because every
+commercial write returns the whole `commercial` object and two in flight could repaint
+each other; an invitation write returns `onboarding` and touches `commercial` not at
+all, so sharing the slot would shut the Readiness controls while a terms write ran on
+Overview for a reason that does not exist. Within the domain the commercial argument
+applies unchanged. It lives on the route-scoped store because the tabs are sibling
+routes: a reissue in flight survives a tab switch, the rebuilt tab reads the flag and
+starts nothing, and `takeUntilDestroyed` would be worse (cancelling the subscription
+does not un-send the request). **A reissue that lands after its tab was left adopts the
+projection into the store and LOSES ITS CODE** — the credential is never parked in a
+store that outlives every tab. What the dead instance records on the store instead is
+the NON-SECRET fact: the id of the invitation whose code went unseen
+(`RestaurantWorkspaceStore.unshownCodeInvitationId`, via `markCodeUnshown`), and the
+Readiness tab renders the note (`data-claim-orphaned`) while that id is still the
+unresolved head, instead of presenting a fresh Pending row with no explanation; the
+remedy is to reissue again, and showing a code clears the record. **The record is on the
+store because review found the half a tab-local watch missed**: the first version
+noticed only a write still in flight when the tab was built, so a reissue that COMPLETED
+while the operator was on Overview left the slot released, nothing to watch, and an
+unshown credential at the head with no note. The same reasoning holds the record of an
+unanswered write (`indeterminateInvitationWrite`), so the "reissue again" verdict is
+still given by a tab rebuilt after the answer failed to arrive. A cancellation landing
+while away raises no note, since its answer carries nothing that could be lost. The
+records clear when a code is shown, when the invitation is cancelled from here, and when
+the store moves to another restaurant.
+
+### THE SUCCESS ADOPTS THE PROJECTION AND SHOWS THE CODE ONCE
+The reissue response carries the canonical `onboarding` (re-read inside the mutation's
+transaction, byte-identical to the next GET) BESIDE the credential, in a separate
+object. `adoptOnboarding` takes only the projection — replacing `onboarding` and
+re-deriving the owner's two compatibility aliases by the server's own rule, touching
+nothing else — while the raw code goes into the TAB's own transient signal, stays
+copyable through the row change (the row already reads Pending with the new window
+while the code is still on screen), and is cleared by Done, by a cancel, by a 409 and
+by destruction. `changed: false` on a cancel is a SUCCESS ("already cancelled, nothing
+was changed"), never a conflict.
+
+### THE OUTCOMES
+| outcome | what happens |
+|---|---|
+| 409 | exactly one attempt; the action is discarded, any code on screen is cleared, the SERVER'S sentence is rendered (nine distinct refusals and only it can tell them apart) with "Review the current invitation before trying again", and `reloadSuperseded()` runs — no new action until the read lands, and the next one captures the FRESH id |
+| 404 | discarded, `reloadSuperseded()` |
+| 400 | form and draft stay, the server's field errors beside the field |
+| elevation cancelled / abandoned | draft kept, "Nothing was changed." |
+| 5xx / status 0 | INDETERMINATE: never "failed", never retried, the outage state raised, the projection re-read — and what the re-read shows is stated once it has settled (`indeterminateResolution`): an unchanged head means nothing was minted; a NEW head means a credential exists that was never shown here, and the operator is told to reissue again to replace it with one they can copy |
+
+### THE MOCK RUNS THE SERVER'S RULES, AND MINTS WITHOUT KEEPING
+`MockRestaurantApi` implements creation (shape, the domain's phone and email refusals,
+the four owner conflicts, the duplicate-restaurant conflict, then the commit — with the
+new restaurant projected DOWN to a directory row so the two reads cannot disagree) and
+both invitation writes (target, body, then the head-resolution conflicts, then each
+operation's own preconditions in the domain's order, with the cancel no-op checked
+before any lever). The corpus gained `verification_locked`, an invitation consumed by a
+PREVIOUS owner beside not-established control, and a pending invitation whose owner is
+deactivated, so the controls have somewhere to come apart. See the levers under Mock
+Mode.
 
 ## The Error Classifier — one place, four cases
 
@@ -1324,8 +1577,8 @@ made.
 
 Only the TRANSPORTS are mocked. `AdminAuthService`, the login component, both
 interceptors, the elevation queue, the directory page, the workspace store, the five
-commercial editors, the labels and the formatting are the same code in both modes, so
-what gets reviewed is the real flow.
+commercial editors, the creation screen, the owner-claim panel, the labels and the
+formatting are the same code in both modes, so what gets reviewed is the real flow.
 
 **A MOCK IS NEVER A FALLBACK.** It is chosen at build time by `DEV_PROVIDERS`, never
 reached for when a request fails. A control plane that quietly substitutes fixtures for
@@ -1388,6 +1641,31 @@ The detail 404 needs no lever: navigate to `/restaurants/<any-other-uuid>`. `err
 `empty` are separate levers on purpose — telling "the read failed" apart from "there is
 nothing here" is the whole point of keeping those states distinct.
 
+```js
+// CREATION (Step 2G) — the INDETERMINATE outcome, both truths behind it
+sessionStorage.setItem('dinify-admin.mock-create', 'lost')   // COMMITS, then answers 500
+sessionStorage.setItem('dinify-admin.mock-create', 'down')   // answers 500, commits nothing
+
+// OWNER INVITATION (Step 2G) — the next reissue or cancel
+sessionStorage.setItem('dinify-admin.mock-invitation', 'stale')  // 409, once
+sessionStorage.setItem('dinify-admin.mock-invitation', 'lost')   // COMMITS, then 500
+sessionStorage.setItem('dinify-admin.mock-invitation', 'down')   // 500, commits nothing
+```
+
+All of them fire once and disarm. After `create … lost` the restaurant IS in the
+directory with a pending invitation whose code nobody saw — the case the creation
+screen's "Outcome unknown" copy and the Readiness tab's reissue exist for. After
+`invitation … lost` on a reissue, the canonical read shows a newer head that was never
+displayed, and the panel says to reissue again. None of the levers ever overrides a
+no-op: cancelling an already-cancelled invitation answers `changed: false` whatever
+the lever says. Conflicts need no lever — state an owner phone the corpus holds (Ankole
+Grill House's owner is `256772140388`) for `owner_account_already_exists`, or a name and
+location that already exist for `restaurant_already_exists`. The mock mints a fresh
+64-character claim code per response from the browser's CSPRNG and **keeps none of
+them** — no plaintext, no hash — because nothing in it ever verifies a redemption and a
+credential in a fixture map is exactly the shape production code could one day consume
+by accident.
+
 ### MOCK-MODE ERRORS ARE NOT `HttpErrorResponse` — DUCK-TYPE OR IT IS DEAD CODE
 Both mocks throw `MockHttpError` (`src/app/dev/mock-http-error.ts` — one shape, one
 place), an `Error` subclass carrying `status` and, where the failure reached a server, a
@@ -1432,12 +1710,16 @@ Before raising a PR:
 1. `npm run type-check` — zero errors
 2. `npm run lint` — clean
 3. `npm run check:tokens` — self-test then the real scan
-4. `npm run test:ci` — headless Chrome
-5. `npm run build:prod` — zero errors
-6. `npm run check:mock-isolation` — **after** the build; it scans `dist/`
+4. `npm run check:claim-code` — self-test then the real scan (ADMIN-CLAIM-CODE-00:
+   no production statement or template tag writes a raw owner claim code to storage, a
+   log, a URL, router state, the workspace store or a canonical model, and none assembles
+   a claim link — see "Restaurant Creation and the Owner Claim Code")
+5. `npm run test:ci` — headless Chrome
+6. `npm run build:prod` — zero errors
+7. `npm run check:mock-isolation` — **after** the build; it scans `dist/`
 
 `.github/workflows/ci.yml` (job `validate`, on `pull_request` to `main` **and on push
-to `main`**) runs all six on Node 20 with plain `npm ci`. `.github/workflows/audit.yml`
+to `main`**) runs all seven on Node 20 with plain `npm ci`. `.github/workflows/audit.yml`
 runs a weekly `npm audit --audit-level=high` — scheduled and manual only, never a PR
 check.
 
@@ -1685,6 +1967,28 @@ defect class backend PR #283 closed after a deploy reported success while the bo
   left for Phase 1 (see the backend's lifecycle section).
 - The transition endpoint is elevation-gated (`IsRecentlyElevated`) — which is exactly
   the 403 the error classifier's case 3 exists for.
+- **THE HEAD INVITATION IS ONE SERVER-SIDE DEFINITION** (`select_head_invitation`, backend
+  Step 2E): the single unresolved row, else an invitation consumed BY THE CURRENT OWNER,
+  else the latest resolved row, else `not_issued`. Its `id` is what `expected_invitation_id`
+  must name, and the projection's `verification_locked` takes precedence over `expired`
+  (both are unclaimable and both are remedied by a reissue, but only one says somebody sat
+  there guessing). Owner control is computed by an INDEPENDENT lookup, so `invitation:
+  consumed` beside `owner_control: not_established` is a legitimate pair.
+- **REISSUE IS ROTATION, AND A LOST RESPONSE IS RECOVERED BY ROTATING AGAIN.** The server
+  persists only the token hash; a reissue supersedes the unresolved head (an expired or
+  locked one included — it still holds the per-onboarding slot), mints for the CURRENT
+  canonical owner, and returns the raw code once. It is refused when the current owner has
+  already claimed, when the owner relationship has drifted, and when the owner account is
+  missing, inactive or not a restaurant user. Cancel deliberately does NOT require owner
+  consistency. Neither touches `customer_access_state`.
+- **CREATION IS SIX ROWS OR NONE**, elevation-gated and audited once, on the same
+  collection route the directory reads. `owner_account_already_exists` carries the
+  existing account's UUID and nothing else; `owner_email_already_in_use` names no
+  account; `restaurant_already_exists` carries the restaurant's UUID. A new owner gets
+  `customer_access_state = pending_initial_claim` and NO password until they redeem; an
+  existing owner is never modified. The owner redeems in the restaurant portal
+  (`/owner-claim`, backend Steps 2F.1–2F.3) with the pasted code plus a phone OTP — the
+  Admin portal never sees that half.
 
 ## Available Slash Commands
 None specific to this repo yet.

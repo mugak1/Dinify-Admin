@@ -1298,9 +1298,10 @@ object. `adoptOnboarding` takes only the projection — replacing `onboarding` a
 re-deriving the owner's two compatibility aliases by the server's own rule, touching
 nothing else — while the raw code goes into the TAB's own transient signal, stays
 copyable through the row change (the row already reads Pending with the new window
-while the code is still on screen), and is cleared by Done, by a cancel, by a 409 and
-by destruction. `changed: false` on a cancel is a SUCCESS ("already cancelled, nothing
-was changed"), never a conflict.
+while the code is still on screen), and is cleared by Done, by a cancel, by a 409, by
+destruction, and by every outcome that leaves its validity unknown (see the next
+section). `changed: false` on a cancel is a SUCCESS ("already cancelled, nothing was
+changed"), never a conflict.
 
 ### THE OUTCOMES
 | outcome | what happens |
@@ -1309,7 +1310,64 @@ was changed"), never a conflict.
 | 404 | discarded, `reloadSuperseded()` |
 | 400 | form and draft stay, the server's field errors beside the field |
 | elevation cancelled / abandoned | draft kept, "Nothing was changed." |
-| 5xx / status 0 | INDETERMINATE: never "failed", never retried, the outage state raised, the projection re-read — and what the re-read shows is stated once it has settled (`indeterminateResolution`): an unchanged head means nothing was minted; a NEW head means a credential exists that was never shown here, and the operator is told to reissue again to replace it with one they can copy |
+| 5xx / status 0 | INDETERMINATE: never "failed", never retried, the outage state raised, any displayed code DISCARDED, the projection re-read — and what the re-read shows is stated once it has settled (`indeterminateResolution`): an unchanged head means nothing was minted; a NEW head means a credential exists that was never shown here, and the operator is told to reissue again to replace it with one they can copy |
+
+### A DISPLAYED CODE ACROSS A LATER MUTATION — spec §14, Admin Step 2G.1
+
+**A CLAIM CODE IS NEVER PRESENTED AS USABLE ONCE ITS VALIDITY IS UNKNOWN.** That is the
+whole rule, and it exists because of a real sequence: a reissue shows code B, the
+operator then reissues or cancels B, and that second write gets no usable answer. Step 2G
+went on rendering B as a copyable credential — while Admin no longer knew whether B
+worked, since the write may well have committed and superseded or withdrawn it. An
+operator reading that screen hands over a code that may already be dead.
+
+So a displayed code has THREE states, and the distinction between the last two is the
+point:
+
+- **SUPPRESSED** while a consequential write against it is unresolved.
+  `codeSuppressed` is set the moment `save` puts the request out, and the panel is
+  REMOVED from the DOM rather than dimmed — so the value is not in the markup to be
+  copied, selected or read out — with one sentence in its place: *This claim code is
+  temporarily unavailable while the invitation change is in progress.* It does not claim
+  the code is dead, nor that the change committed.
+- **PRESENTED AGAIN** after an outcome that PROVES the invitation was not touched: a
+  cancelled or abandoned re-authentication (the POST was refused for stale elevation,
+  which mutates nothing, and the replay never went out) and an ordinary 400 (the server
+  refused the body). The code stays in the tab's existing signal for exactly this, so a
+  dismissed dialog does not cost a valid credential and a rotation nobody needed.
+  **Suppressed, never destroyed at submit time** — that is why the flag exists rather
+  than an early clear.
+- **DISCARDED, permanently**, by everything else: a success (the code is dead either
+  way), a 409 or 404 (the world moved under the screen), an indeterminate answer, and
+  the unclassified tail. `discardClaimCode` is the one place it happens, and it moves
+  the token, the window shown beside it and the flag together.
+
+**THE CANONICAL RE-READ NEVER BRINGS IT BACK.** A GET carries no plaintext, and a head
+whose id happens to be unchanged is not proof that this bearer credential survived an
+unanswered consequential request — so `The invitation on record is unchanged` is said
+without resurrecting the code it describes. The recovery is the one the projection
+already offers: read the state, then reissue deliberately. Nothing retries.
+
+The unclassified tail discards too, and the trade is stated rather than hidden:
+`classifyTransportFailure` has already claimed status 0 and every 5xx, so what is left
+is a 401 on the way out, a refusal status this surface has no contract for, and anything
+thrown with no status. Several of those did leave the invitation alone, and a
+rate-limited refusal will cost a still-valid code — one deliberate reissue, which is the
+cheaper mistake than presenting a credential on the strength of a status nobody reasoned
+about.
+
+**THE SECRET BOUNDARY IS UNCHANGED.** The plaintext still lives in one signal on the
+active tab and nowhere wider: no store, storage, URL, router state, service, canonical
+model, notice, log or defect report. There is deliberately NO "previous claim code"
+field, no recovery cache and no hidden survivor — the suppression is a boolean, not a
+second copy. Destruction now clears the token and its window EXPLICITLY, and
+deliberately leaves the workspace's non-secret records (the slot, the unshown-code id,
+the indeterminate write) alone: those exist precisely because the request outlives the
+tab.
+
+Twelve regressions pin it (`restaurant-detail.page.spec.ts`), and the negative control
+is recorded: restoring Step 2G's behaviour — no suppression at submit, an indeterminate
+outcome that leaves the plaintext in place — fails 8 of them.
 
 ### THE MOCK RUNS THE SERVER'S RULES, AND MINTS WITHOUT KEEPING
 `MockRestaurantApi` implements creation (shape, the domain's phone and email refusals,

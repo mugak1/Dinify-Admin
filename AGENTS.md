@@ -14,7 +14,7 @@ Before making changes:
 5. Do not make broad refactors unless explicitly requested.
 6. Run `./scripts/verify.sh` before preparing a PR and paste the output.
 
-Eight rules that are easy to break by habit:
+Nine rules that are easy to break by habit:
 - Global navigation is FIVE destinations. New capability becomes a restaurant-detail
   tab or a needs-attention condition, never a sixth sidebar item.
 - Filters go in the URL via `core/url/query-param.ts`, never in component state.
@@ -38,6 +38,12 @@ Eight rules that are easy to break by habit:
   notice, or a fabricated claim link. `scripts/check-claim-code-handling.mjs` enforces
   it, and the vocabulary is issue / reissue / cancel — never send, resend, sent or
   delivered, because nothing is delivered.
+- A displayed claim code does NOT stay available while a mutation that could invalidate
+  it is unresolved, and an indeterminate mutation discards the displayed plaintext for
+  good. Only an outcome that PROVES no write happened — a cancelled or abandoned
+  re-authentication, an ordinary 400 — may present it again. The canonical re-read never
+  restores it: a GET carries no plaintext, and an unchanged head is not proof the
+  credential survived. See CLAUDE.md › A DISPLAYED CODE ACROSS A LATER MUTATION.
 
 For Codex Desktop work:
 - Use Worktree mode by default.

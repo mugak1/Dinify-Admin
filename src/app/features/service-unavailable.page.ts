@@ -5,6 +5,7 @@ import { AdminServiceStatus } from '../core/api/service-status';
 import { AdminAuthService } from '../core/auth/admin-auth.service';
 import { sanitiseReturnUrl } from '../core/auth/return-url';
 import { SessionStore } from '../core/auth/session.store';
+import { AuthShellComponent } from '../shell/auth-shell.component';
 import { AdminButtonComponent } from '../ui/button.component';
 
 /**
@@ -32,57 +33,60 @@ import { AdminButtonComponent } from '../ui/button.component';
  * chase Apache, wait, or call someone — and a screen that quietly re-attempts every
  * few seconds hides exactly that. The button reports its own progress and nothing
  * else does.
+ *
+ * ── IT SHARES `/login`'s FRAME DELIBERATELY ───────────────────────────────────────
+ *
+ * These are the two screens outside the router shell, and `/login` NAVIGATES here when
+ * a verified session cannot be read back — so an operator crosses the seam mid-flow,
+ * mid-sign-in, at the worst possible moment to wonder whether they are still in the
+ * same application. `AuthShellComponent` is what stops the two drifting apart, and
+ * nothing about the outage reasoning above changed with it: still no form, still no
+ * auto-retry, still no full-screen spinner.
  */
 @Component({
   selector: 'app-service-unavailable-page',
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [AdminButtonComponent],
+  imports: [AdminButtonComponent, AuthShellComponent],
   template: `
-    <div class="flex min-h-screen items-center justify-center bg-chrome p-4">
-      <main class="w-full max-w-md rounded-lg bg-surface p-6 shadow-admin-lg">
-        <div class="flex items-center gap-2">
-          <span
-            class="flex h-5 w-5 items-center justify-center rounded-sm bg-admin-accent
-                   text-admin-micro text-admin-accent-fg"
-            aria-hidden="true"
-            >D</span
-          >
-          <span class="text-admin-label text-ink">Dinify Admin</span>
-        </div>
+    <app-auth-shell
+      eyebrow="Control plane status"
+      heading="Not answering"
+      lede="It did not answer, or answered with an error."
+    >
+      <p class="mt-6 text-admin-body text-ink-muted">
+        This is not a sign-in problem — nothing was rejected, nothing was changed, and no
+        session was ended.
+      </p>
 
-        <h1 class="mt-5 text-admin-page text-ink">The admin control plane is unavailable</h1>
-
-        <p class="mt-2 text-admin-body text-ink-muted">
-          It did not answer, or answered with an error. This is not a sign-in problem —
-          nothing was rejected, nothing was changed, and no session was ended.
+      @if (status.requestId(); as requestId) {
+        <p
+          class="mt-4 rounded-auth-control border border-auth-line bg-surface-sunken px-3.5 py-3
+                 text-admin-meta text-ink-muted"
+        >
+          Request
+          <span class="tabular-figures select-all text-ink">{{ requestId }}</span>
+          — quote this when reporting it.
         </p>
+      } @else {
+        <!-- No request id means the request never reached the server: there is no
+             server-side log line to correlate with, and saying so is more useful
+             than an empty field. -->
+        <p class="mt-4 text-admin-meta text-ink-subtle">
+          The request did not reach the server, so there is no request id to quote.
+        </p>
+      }
 
-        @if (status.requestId(); as requestId) {
-          <p class="mt-3 rounded bg-surface-sunken px-3 py-2 text-admin-meta text-ink-muted">
-            Request
-            <span class="tabular-figures select-all text-ink">{{ requestId }}</span>
-            — quote this when reporting it.
-          </p>
-        } @else {
-          <!-- No request id means the request never reached the server: there is no
-               server-side log line to correlate with, and saying so is more useful
-               than an empty field. -->
-          <p class="mt-3 text-admin-meta text-ink-subtle">
-            The request did not reach the server, so there is no request id to quote.
-          </p>
-        }
-
-        <div class="mt-5">
-          <app-admin-button
-            variant="primary"
-            [block]="true"
-            [pending]="!auth.bootstrapped()"
-            (pressed)="retry()"
-            >Try again</app-admin-button
-          >
-        </div>
-      </main>
-    </div>
+      <div class="mt-6">
+        <app-admin-button
+          size="auth"
+          variant="primary"
+          [block]="true"
+          [pending]="!auth.bootstrapped()"
+          (pressed)="retry()"
+          >Try again</app-admin-button
+        >
+      </div>
+    </app-auth-shell>
   `,
 })
 export class ServiceUnavailablePage {

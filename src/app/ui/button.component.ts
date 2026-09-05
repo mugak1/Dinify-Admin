@@ -2,9 +2,45 @@ import { ChangeDetectionStrategy, Component, computed, input, output } from '@an
 
 export type ButtonVariant = 'primary' | 'secondary' | 'destructive' | 'ghost';
 
+/**
+ * `control` is the button of the control plane — 40px, `text-admin-label`, 5px corner.
+ * `auth` is the sign-in tier's call to action: taller, heavier, softer-cornered, and
+ * carrying the accent's glow.
+ *
+ * IT IS A SIZE, NOT A FIFTH VARIANT. The variants say what a button MEANS (do this /
+ * secondary / this destroys something / recede) and every one of them still applies
+ * here; a `primary`-shaped size would have made "the CTA on the sign-in card" and "an
+ * accent button" two ways of saying one thing, and the next screen that wants a
+ * destructive control at auth scale would have had nowhere to go.
+ *
+ * `auth` also opens the `btn` group, which is how a projected arrow can nudge on hover
+ * without the page reaching inside this component. Scoped to this size deliberately:
+ * a bare `group` on every button in the application is a named scope anything could
+ * accidentally match.
+ */
+export type ButtonSize = 'control' | 'auth';
+
 const BASE =
-  'inline-flex h-control items-center justify-center gap-2 rounded px-3 ' +
-  'text-admin-label transition-colors disabled:cursor-not-allowed disabled:opacity-55';
+  'inline-flex items-center justify-center gap-2 ' +
+  'transition-colors disabled:cursor-not-allowed disabled:opacity-55';
+
+const SIZES: Record<ButtonSize, string> = {
+  control: 'h-control rounded px-3 text-admin-label',
+  auth: 'group/btn h-auth-cta rounded-auth-control px-4 text-auth-cta',
+};
+
+/**
+ * Emphasis that only makes sense at `auth` size, keyed by variant.
+ *
+ * Only `primary` has an entry, because the glow is cast from the ACCENT and would be a
+ * false signal under any other variant. The map exists rather than a hardcoded class in
+ * `SIZES.auth` so that stays true by construction: the day something needs a
+ * destructive call to action at this size it gets its own token, deliberately, instead
+ * of silently inheriting a red-accent halo. No token is invented ahead of a caller.
+ */
+const AUTH_EMPHASIS: Partial<Record<ButtonVariant, string>> = {
+  primary: 'shadow-auth-cta',
+};
 
 const VARIANTS: Record<ButtonVariant, string> = {
   // Every one of these reads --admin-accent or --admin-danger and nothing else.
@@ -26,8 +62,20 @@ const VARIANTS: Record<ButtonVariant, string> = {
  * It is appearance only: an anchor using it must still supply its own focus and
  * disabled behaviour, which is why this is a helper and not a directive.
  */
-export function adminButtonClasses(variant: ButtonVariant, block = false): string {
-  return [BASE, block ? 'w-full' : '', VARIANTS[variant]].filter(Boolean).join(' ');
+export function adminButtonClasses(
+  variant: ButtonVariant,
+  block = false,
+  size: ButtonSize = 'control',
+): string {
+  return [
+    BASE,
+    SIZES[size],
+    block ? 'w-full' : '',
+    VARIANTS[variant],
+    size === 'auth' ? (AUTH_EMPHASIS[variant] ?? '') : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
 }
 
 /**
@@ -51,6 +99,10 @@ export function adminButtonClasses(variant: ButtonVariant, block = false): strin
  *
  * `h-control` is 40px — §16 asks for 40–44px rather than the WCAG 2.2 minimum, and
  * the height is a spacing token so it cannot drift from the rows it sits beside.
+ *
+ * `size="auth"` is the sign-in tier's 50px call to action and is the ONLY place that
+ * size is used; see `ButtonSize`. It changes the geometry and nothing else — `pending`
+ * still means exactly what it means above.
  */
 @Component({
   selector: 'app-admin-button',
@@ -81,6 +133,8 @@ export function adminButtonClasses(variant: ButtonVariant, block = false): strin
 })
 export class AdminButtonComponent {
   readonly variant = input<ButtonVariant>('secondary');
+  /** Control-plane geometry by default; `auth` is the sign-in card's CTA. */
+  readonly size = input<ButtonSize>('control');
   readonly type = input<'button' | 'submit'>('button');
   readonly disabled = input(false);
   /** In flight: disabled and visibly progressing. See the class comment. */
@@ -89,5 +143,7 @@ export class AdminButtonComponent {
 
   readonly pressed = output<void>();
 
-  protected readonly classes = computed(() => adminButtonClasses(this.variant(), this.block()));
+  protected readonly classes = computed(() =>
+    adminButtonClasses(this.variant(), this.block(), this.size()),
+  );
 }

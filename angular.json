@@ -45,7 +45,7 @@
               "aot": true,
               "extractLicenses": true,
               "budgets": [
-                { "type": "initial", "maximumWarning": "500kb", "maximumError": "2mb" },
+                { "type": "initial", "maximumWarning": "560kb", "maximumError": "2mb" },
                 { "type": "anyComponentStyle", "maximumWarning": "4kb", "maximumError": "8kb" }
               ]
             },

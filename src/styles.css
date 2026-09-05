@@ -50,6 +50,18 @@
     --admin-accent-hover: 358 78% 51%;
     --admin-accent-fg: 0 0% 100%;
     --admin-accent-soft: 0 100% 96%;
+    /*
+     * THE SAME ACCENT, AT TEXT CONTRAST ON A LIGHT GROUND. Brand red is ~3.3:1 on the
+     * cream sign-in field, which fails for the 11px eyebrow and for any small red
+     * label; this reads ~6:1 and is what small red TEXT uses. It is not
+     * `--admin-danger`, which means "this destroys something" and would misreport an
+     * ordinary heading as a warning.
+     *
+     * It is part of the accent, so §16's brand-red review re-derives it in the same
+     * change — moving `--admin-accent` and leaving this behind is how the sign-in
+     * screen ends up a different red from every button in the shell.
+     */
+    --admin-accent-ink: 358 80% 42%;
 
     /* Destructive ONLY — never the accent. White on this is ~6.4:1; white on brand
        red is only ~3.7:1, so small white-on-red text must land here. */
@@ -84,6 +96,34 @@
     --admin-state-test: 207 88% 35%;
     --admin-state-test-fg: 0 0% 100%;
 
+    /*
+     * --- THE SIGN-IN TIER ---
+     *
+     * `/login` and `/unavailable` render outside the shell to a signed-out operator:
+     * one card on an empty page, with no working area to frame. The dark chrome above
+     * exists to bound a light working area, and used on an empty page it made a bare
+     * grey form on a black field. So the signed-out environment is warm paper instead,
+     * matching Dinify-Frontend's sign-in at this application's density.
+     *
+     * This does NOT relax §16's distinctness rule — the chrome, the dense scale, the
+     * tight radii and the single typeface still govern every AUTHENTICATED surface,
+     * which is where the delegated-support hazard actually lives. See the `auth-*`
+     * note at the top of tailwind.config.js.
+     */
+    --admin-auth-paper: 34 70% 96%;
+    --admin-auth-paper-deep: 34 56% 90%;
+    /* The top-right wash. Warm apricot, NOT a second red — a red bloom on a sign-in
+       page reads as an alert about a screen where nothing has gone wrong. */
+    --admin-auth-glow: 18 100% 74%;
+    /* A warm hairline. `--admin-border` is a cool grey and turns visibly dirty against
+       cream, which is the whole reason this is a separate token. */
+    --admin-auth-line: 33 25% 88%;
+    /* Placeholder text, and a field icon at rest before focus tints it. */
+    --admin-auth-quiet: 30 11% 69%;
+    /* Every sign-in shadow is cast from THIS, not --admin-shadow: a cool grey drop on
+       a cream field reads as a smudge rather than a lift. */
+    --admin-auth-shadow: 30 50% 16%;
+
     --admin-shadow: 220 20% 10%;
 
     /* Three radius steps, 8px maximum — far tighter than the sibling's 20px
@@ -91,6 +131,13 @@
     --admin-radius-sm: 3px;
     --admin-radius-md: 5px;
     --admin-radius-lg: 8px;
+
+    /* The sign-in tier, and the only place above the 8px ceiling. A lone 420px card is
+       not a control plane at density; an 8px corner on it reads as an unstyled dialog
+       rather than as rigour. Every authenticated surface still uses the three steps
+       above. */
+    --admin-radius-auth-control: 10px;
+    --admin-radius-auth-card: 18px;
   }
 
   html {

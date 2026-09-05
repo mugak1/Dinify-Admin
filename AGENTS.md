@@ -14,7 +14,7 @@ Before making changes:
 5. Do not make broad refactors unless explicitly requested.
 6. Run `./scripts/verify.sh` before preparing a PR and paste the output.
 
-Nine rules that are easy to break by habit:
+Ten rules that are easy to break by habit:
 - Global navigation is FIVE destinations. New capability becomes a restaurant-detail
   tab or a needs-attention condition, never a sixth sidebar item.
 - Filters go in the URL via `core/url/query-param.ts`, never in component state.
@@ -32,6 +32,13 @@ Nine rules that are easy to break by habit:
   showing a portfolio that does not exist.
 - Templates are inline, so a BACKTICK inside one terminates the TypeScript template
   literal — including inside an HTML comment. Write prose, or single quotes.
+- The `auth-*` design tier (28px display, 18px card corner, the warm environment) is for
+  the two SIGNED-OUT screens only — `/login` and `/unavailable`, both via
+  `app-auth-shell`. Never reach for it inside the shell: §16's dark chrome, dense scale
+  and 8px radii still govern every authenticated surface. And never render that shell
+  without the ADMIN half of the lockup — on those screens it is what tells an operator
+  with both portals open which plane is about to take their credentials, and it is the
+  reason the warm environment is safe to use at all.
 - A raw owner claim code is a BEARER CREDENTIAL shown once. It may live in a
   component's transient state to be displayed and copied, and nowhere else — never
   storage, the URL, router state, the workspace store, a canonical model, a log, a

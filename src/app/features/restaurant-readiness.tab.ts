@@ -272,19 +272,34 @@ const INVITATION_COPY: Record<
             <!-- THE ONE-TIME CREDENTIAL, held in this tab's own state and nowhere else.
                  It stays until Done, through the canonical adoption underneath it, so
                  the operator can copy it while the invitation row already reports the
-                 new pending credential. -->
+                 new pending credential.
+
+                 SUPPRESSED WHILE A WRITE AGAINST IT IS UNRESOLVED (Step 2G.1). The
+                 panel is REMOVED from the DOM rather than dimmed or disabled, so the
+                 value is not in the markup to be copied, selected or read out while
+                 Admin does not know whether the code still works. See codeSuppressed. -->
             @if (claimToken(); as token) {
-              <app-owner-claim-code
-                heading="Claim code reissued"
-                intro="Any earlier claim code no longer works."
-                [claimToken]="token"
-                [issuedAt]="issued()?.issued_at ?? null"
-                [expiresAt]="issued()?.expires_at ?? null"
-              >
-                <app-admin-button variant="primary" (pressed)="dismissClaimCode()" data-claim-done
-                  >Done</app-admin-button
+              @if (codeSuppressed()) {
+                <p
+                  class="mt-3 max-w-prose text-admin-body text-admin-warning"
+                  data-claim-code-suppressed
                 >
-              </app-owner-claim-code>
+                  This claim code is temporarily unavailable while the invitation change is in
+                  progress.
+                </p>
+              } @else {
+                <app-owner-claim-code
+                  heading="Claim code reissued"
+                  intro="Any earlier claim code no longer works."
+                  [claimToken]="token"
+                  [issuedAt]="issued()?.issued_at ?? null"
+                  [expiresAt]="issued()?.expires_at ?? null"
+                >
+                  <app-admin-button variant="primary" (pressed)="dismissClaimCode()" data-claim-done
+                    >Done</app-admin-button
+                  >
+                </app-owner-claim-code>
+              }
             }
 
             @if (writeError(); as message) {
@@ -488,6 +503,13 @@ export class RestaurantReadinessTab {
   constructor() {
     inject(DestroyRef).onDestroy(() => {
       this.destroyed = true;
+      // THE SECRET BOUNDARY, STATED RATHER THAN INFERRED (Step 2G.1). A destroyed tab
+      // is already unreachable, so this changes no behaviour — it makes the rule
+      // explicit and stops the plaintext outliving the component that owned it.
+      // Deliberately NOT the workspace's records (the slot, the unshown-code id, the
+      // indeterminate write): those are non-secret and exist precisely because the
+      // request outlives this tab.
+      this.discardClaimCode();
     });
   }
 
@@ -552,6 +574,46 @@ export class RestaurantReadinessTab {
    */
   protected readonly claimToken = signal<string | null>(null);
   protected readonly issued = signal<{ issued_at: string; expires_at: string } | null>(null);
+
+  /**
+   * IS THE DISPLAYED CODE CURRENTLY UNSAFE TO PRESENT? (Step 2G.1)
+   *
+   * ── THE RULE ──────────────────────────────────────────────────────────────────────
+   *
+   * A CLAIM CODE IS NEVER PRESENTED AS USABLE ONCE ITS VALIDITY IS UNKNOWN.
+   *
+   * The moment a reissue or a cancellation is submitted, the code on screen is the one
+   * that write is about to invalidate — a reissue supersedes it, a cancellation
+   * withdraws it — so from the submit until the outcome is known, Admin cannot honestly
+   * say the code still works. It is therefore taken off the screen for the duration.
+   *
+   * ── SUPPRESSED, NOT DESTROYED, AND WHY THE DISTINCTION EARNS ITS KEEP ─────────────
+   *
+   * Two of the outcomes PROVE no write happened: a cancelled or unreachable
+   * re-authentication (the request was refused for stale elevation, which mutates
+   * nothing, and the replay never went out) and an ordinary 400 (the server answered by
+   * refusing the body). Destroying the plaintext at submit time would lose a
+   * still-valid credential to a dialog the operator simply dismissed, and the only
+   * recovery would be a rotation nobody needed. So the code stays in THIS SIGNAL —
+   * ephemeral state of the active tab, exactly where Step 2G put it, and nowhere wider
+   * — and only its PRESENTATION is withdrawn.
+   *
+   * Every other outcome discards it for good: a success (the code is dead either way),
+   * a 409 or 404 (the world moved under the screen), an indeterminate answer (the write
+   * may have committed) and an unclassified failure (the client cannot establish what
+   * happened). `discardClaimCode` is the one place that happens.
+   *
+   * ── IT IS NOT DERIVED FROM THE MUTATION SLOT ─────────────────────────────────────
+   *
+   * `workspace.invitationMutating()` would look equivalent and is not: it is
+   * concurrency control over a workspace, true for a write a PREVIOUS instance of this
+   * tab submitted, and reading credential presentation off it would make this
+   * invariant an accident of that slot's lifetime. It is cleared by `settleWrite`
+   * beside the slot, so no terminal path can release one and forget the other, and
+   * forgetting fails safe: a code that stays hidden is a nuisance, one that stays
+   * visible is the defect.
+   */
+  protected readonly codeSuppressed = signal(false);
 
   /** The panel-level failure sentence, with a progress clause only while the re-read is in flight. */
   protected readonly panelMessage = computed(() => {
@@ -634,8 +696,30 @@ export class RestaurantReadinessTab {
 
   /** The operator has copied the code, or chosen not to. It is gone from this screen. */
   protected dismissClaimCode(): void {
+    this.discardClaimCode();
+  }
+
+  /**
+   * THE ONE PLACE A RAW CREDENTIAL IS DROPPED. The token and the metadata shown beside
+   * it move together — a path that cleared one and left the other would render a window
+   * for a code that is gone — and the suppression flag goes with them, so a discard can
+   * never leave the panel stuck on its temporary sentence.
+   */
+  private discardClaimCode(): void {
     this.claimToken.set(null);
     this.issued.set(null);
+    this.codeSuppressed.set(false);
+  }
+
+  /**
+   * A write has reached a terminal outcome: release the workspace slot and stop
+   * suppressing the code. Called at the top of every outcome handler, so the two can
+   * never drift apart. What the code does NEXT — reappear, be replaced, or be discarded
+   * — is that outcome's decision.
+   */
+  private settleWrite(): void {
+    this.workspace.endInvitationMutation();
+    this.codeSuppressed.set(false);
   }
 
   protected save(action: InvitationAction, submission: OwnerInvitationActionSubmission): void {
@@ -648,6 +732,9 @@ export class RestaurantReadinessTab {
     // The slot is claimed BEFORE anything is sent, and the claim is the guard.
     if (!this.workspace.beginInvitationMutation()) return;
     this.clearOutcome();
+    // From here the request is genuinely out and the displayed code is the one it may
+    // invalidate, so it stops being presented as usable. See `codeSuppressed`.
+    this.codeSuppressed.set(true);
 
     const request = { expected_invitation_id: expected, reason: submission.reason };
     if (action === 'reissue') {
@@ -688,7 +775,7 @@ export class RestaurantReadinessTab {
    */
   private onReissued(result: OwnerInvitationReissueResult): void {
     this.workspace.adoptOnboarding(result.onboarding);
-    this.workspace.endInvitationMutation();
+    this.settleWrite();
     this.workspace.clearIndeterminateInvitationWrite();
     if (this.destroyed) {
       this.workspace.markCodeUnshown(result.owner_invitation.id);
@@ -714,12 +801,11 @@ export class RestaurantReadinessTab {
    */
   private onCancelled(result: OwnerInvitationCancelResult): void {
     this.workspace.adoptOnboarding(result.onboarding);
-    this.workspace.endInvitationMutation();
+    this.settleWrite();
     this.workspace.clearIndeterminateInvitationWrite();
     this.workspace.clearCodeUnshown();
     this.discardAction();
-    this.claimToken.set(null);
-    this.issued.set(null);
+    this.discardClaimCode();
     this.writeError.set(null);
     this.confirmation.set(
       result.changed
@@ -735,10 +821,16 @@ export class RestaurantReadinessTab {
    * conflict is a well-formed answer rather than a defect.
    */
   private onWriteFailed(error: unknown, action: InvitationAction, expected: string): void {
-    this.workspace.endInvitationMutation();
+    // Releasing the slot also stops suppressing the code; whether it comes BACK is
+    // decided per outcome below. The two elevation outcomes and a 400 are the only
+    // ones that prove the invitation was not touched, so they are the only ones that
+    // leave the plaintext in place.
+    this.settleWrite();
 
-    // Re-authentication dismissed. NOTHING was sent, so the draft is kept and the form
-    // stays open.
+    // Re-authentication dismissed. NOTHING was sent — the first POST was refused for
+    // stale elevation, which mutates nothing, and the replay never went out — so the
+    // draft is kept, the form stays open, and the code the operator was already holding
+    // is theirs again.
     if (error instanceof ElevationCancelledError) {
       this.writeError.set('Re-authentication was cancelled. Nothing was changed.');
       return;
@@ -762,8 +854,7 @@ export class RestaurantReadinessTab {
     if (status === 409) {
       this.serviceStatus.markReachable();
       this.discardAction();
-      this.claimToken.set(null);
-      this.issued.set(null);
+      this.discardClaimCode();
       this.writeError.set(
         `${extractErrorMessage(error, 'The owner invitation changed since it was loaded.')} ` +
           'Review the current invitation before trying again.',
@@ -777,14 +868,14 @@ export class RestaurantReadinessTab {
     if (status === 404) {
       this.serviceStatus.markReachable();
       this.discardAction();
-      this.claimToken.set(null);
-      this.issued.set(null);
+      this.discardClaimCode();
       this.workspace.reloadSuperseded();
       return;
     }
 
-    // Validation. The form and the draft stay open, the server's words beside the
-    // field they name.
+    // Validation. The server answered by refusing the body, so the invitation was not
+    // touched: the form and the draft stay open with the server's words beside the
+    // field they name, and the displayed code is presented again.
     if (status === 400) {
       this.serviceStatus.markReachable();
       this.writeFieldErrors.set(extractFieldErrors(error));
@@ -800,6 +891,15 @@ export class RestaurantReadinessTab {
     if (classifyTransportFailure(error) === 'unavailable') {
       this.serviceStatus.reportUnavailable(extractRequestId(error));
       this.discardAction();
+      // THE CODE IS GONE FOR GOOD, and not because it is known to be dead — because it
+      // is no longer known to be alive. The write may have committed, in which case a
+      // reissue superseded it or a cancellation withdrew it. The canonical re-read
+      // cannot bring it back either: a GET carries no plaintext, and a head whose id
+      // happens to be unchanged is not proof that this bearer credential survived an
+      // unanswered consequential request. The recovery is the one the projection
+      // already offers — read the state, then reissue deliberately if a usable code is
+      // needed.
+      this.discardClaimCode();
       this.workspace.noteIndeterminateInvitationWrite({ action, expectedId: expected });
       this.writeError.set(
         action === 'reissue'
@@ -812,7 +912,16 @@ export class RestaurantReadinessTab {
 
     // A 401 is owned by the global classifier; anything else unexpected reaches the
     // defect machinery through the same interceptor. The operator is still told.
+    //
+    // THE CODE IS DISCARDED HERE TOO. This is the branch that could not establish what
+    // happened: `classifyTransportFailure` has already claimed status 0 and every 5xx,
+    // so what is left is a 401 on the way to being signed out, a refusal status this
+    // surface has no contract for, and anything thrown with no status at all. Several
+    // of those did leave the invitation alone, and a rate-limited refusal will cost a
+    // still-valid code — one deliberate reissue — which is the cheaper mistake than
+    // presenting a credential on the strength of a status nobody reasoned about.
     this.serviceStatus.markReachable();
+    this.discardClaimCode();
     this.writeError.set(extractErrorMessage(error, 'The request could not be applied.'));
   }
 }

@@ -4,11 +4,15 @@ import {
   provideRouter,
   withComponentInputBinding,
 } from '@angular/router';
+import { By } from '@angular/platform-browser';
 import { RouterTestingHarness } from '@angular/router/testing';
 import { Observable, Subject, of, throwError } from 'rxjs';
 
 import { AdminServiceStatus } from '../core/api/service-status';
-import { ElevationCancelledError } from '../core/auth/elevation.service';
+import {
+  ElevationAbandonedError,
+  ElevationCancelledError,
+} from '../core/auth/elevation.service';
 import { formatEat } from '../core/formatting/time';
 import {
   RESTAURANT_API,
@@ -4286,6 +4290,423 @@ describe('RestaurantReadinessTab — owner claim', () => {
 
       expect(value('data-claim-indeterminate')).toContain('unchanged');
       expect(action('Reissue claim code')!.disabled).toBeFalse();
+      flush();
+    }));
+  });
+
+  // ── STEP 2G.1: A DISPLAYED CODE ACROSS A LATER MUTATION ──────────────────────────
+  //
+  // THE DEFECT THESE PIN. A reissue shows raw code B. The operator then reissues or
+  // cancels B, and that second write gets no usable answer. Before Step 2G.1 the panel
+  // went on presenting B as a copyable credential — while Admin no longer knew whether
+  // B worked, because the write may well have committed and superseded or withdrawn it.
+  //
+  // The rule is one sentence: A CLAIM CODE IS NEVER PRESENTED AS USABLE ONCE ITS
+  // VALIDITY IS UNKNOWN. Which makes three states, and the tests below are organised
+  // around telling them apart — suppressed while a write is unresolved, presented again
+  // after an outcome that PROVES no write happened, discarded for good after one that
+  // does not.
+  describe('a displayed claim code while a later invitation write is unresolved', () => {
+    // Code C, distinct from B (TOKEN) so a replacement can be told from a survival.
+    // Deliberately not a substring of TOKEN in either direction: the sweeps match on
+    // containment, and two tokens that overlapped would make them meaningless.
+    const THIRD_HEAD_ID = '4d5e6f70-8192-4a3b-9c4d-000000000003';
+    const THIRD_ISSUED_AT = '2026-08-28T14:30:00+03:00';
+    const THIRD_EXPIRES_AT = '2026-09-04T14:30:00+03:00';
+    const TOKEN_C = 'Qq7ZzYyXxWwVvUuTtSsRrQqPpOoNnMmLlKkJjIiHhGgFfEeDdCcBbAa9876543210-_z';
+    const SUPPRESSED =
+      'This claim code is temporarily unavailable while the invitation change is in progress.';
+
+    /** The head as the canonical read reports it after a reissue: pending invitation B. */
+    function headB(): OnboardingSummary {
+      return adminOnboarding('pending', {
+        invitation: invitation('pending', {
+          id: NEW_HEAD_ID,
+          issued_at: NEW_ISSUED_AT,
+          expires_at: NEW_EXPIRES_AT,
+        }),
+      });
+    }
+
+    /** A SECOND successful reissue: head C, and a code that is not B. */
+    function reissuedAgain(): OwnerInvitationReissueResult {
+      return {
+        changed: true,
+        onboarding: adminOnboarding('pending', {
+          invitation: invitation('pending', {
+            id: THIRD_HEAD_ID,
+            issued_at: THIRD_ISSUED_AT,
+            expires_at: THIRD_EXPIRES_AT,
+          }),
+        }),
+        owner_invitation: {
+          id: THIRD_HEAD_ID,
+          issued_at: THIRD_ISSUED_AT,
+          expires_at: THIRD_EXPIRES_AT,
+          claim_token: TOKEN_C,
+        },
+      };
+    }
+
+    /** Load a pending invitation, reissue it, and leave raw code B on screen. */
+    async function withVisibleCode(): Promise<void> {
+      await loadedWith(adminOnboarding('pending'));
+      reissue();
+      expect(codeValue()).withContext('B is on screen to begin with').toBe(TOKEN);
+      expect(api.invitationWrites.length).toBe(1);
+    }
+
+    /** Submit a second write against B and hold it in flight. */
+    function inflightReissue(): Subject<OwnerInvitationReissueResult> {
+      const inflight = new Subject<OwnerInvitationReissueResult>();
+      api.reissueAnswer = () => inflight;
+      reissue('Rotating again before the owner was reached');
+      return inflight;
+    }
+    function inflightCancel(): Subject<OwnerInvitationCancelResult> {
+      const inflight = new Subject<OwnerInvitationCancelResult>();
+      api.cancelAnswer = () => inflight;
+      cancel('Withdrawing the credential for review');
+      return inflight;
+    }
+
+    /** The code is off the screen entirely, and the temporary sentence explains why. */
+    function assertSuppressed(): void {
+      expect(codePanel()).withContext('the code panel is unmounted').toBeNull();
+      expect(codeValue()).withContext('there is no field to copy from').toBeNull();
+      expect(value('data-claim-code-suppressed')).toBe(SUPPRESSED);
+      // The value is not merely hidden — it is not in the document at all.
+      tokenIsNowhereBut(false);
+    }
+
+    /** The code is gone for good: no panel, and no temporary sentence promising it back. */
+    function assertDiscarded(): void {
+      expect(codePanel()).withContext('the code panel is unmounted').toBeNull();
+      expect(codeValue()).toBeNull();
+      expect(claimPanel().querySelector('[data-claim-code-suppressed]'))
+        .withContext('nothing implies it is coming back')
+        .toBeNull();
+      tokenIsNowhereBut(false);
+    }
+
+    // ── CASE 1 ─────────────────────────────────────────────────────────────────────
+
+    it('CASE 1: suppresses B while a second reissue is in flight, then discards it PERMANENTLY when the answer never comes', fakeAsync(async () => {
+      await withVisibleCode();
+
+      const inflight = inflightReissue();
+      assertSuppressed();
+
+      // The re-read is held open, so the gate can be observed rather than inferred.
+      const reload = new Subject<RestaurantDetail>();
+      api.answer = () => reload;
+      inflight.error({ status: 0, error: null, message: 'Http failure response' });
+      harness.detectChanges();
+
+      // Already gone, and gone for good: not waiting on the reload to decide.
+      assertDiscarded();
+      expect(value('data-claim-panel-error')).toBe(
+        'The admin service did not answer, so it is not known whether a new claim code was issued. Reloading…',
+      );
+      expect(store().detailSuperseded()).withContext('no new decision until it settles').toBeTrue();
+      expect(action('Reissue claim code')!.disabled).toBeTrue();
+      expect(claimPanel().querySelector('[data-claim-indeterminate]'))
+        .withContext('no verdict before the re-read lands')
+        .toBeNull();
+
+      // The re-read shows the SAME head B. That is NOT permission to resurrect B.
+      reload.next(detail({ onboarding: headB() }));
+      reload.complete();
+      harness.detectChanges();
+
+      expect(store().detailSuperseded()).toBeFalse();
+      expect(store().detail()!.onboarding.invitation.id).toBe(NEW_HEAD_ID);
+      assertDiscarded();
+      expect(value('data-claim-indeterminate')).toBe(
+        'The invitation on record is unchanged, so no new claim code was issued.',
+      );
+      // The remedy is a deliberate reissue, and nothing was retried on its own.
+      expect(action('Reissue claim code')!.disabled).toBeFalse();
+      tick(60_000);
+      expect(api.invitationWrites.length).withContext('two writes, both deliberate').toBe(2);
+      flush();
+    }));
+
+    // ── CASE 2 ─────────────────────────────────────────────────────────────────────
+
+    it('CASE 2: keeps B gone when the lost answer turns out to have committed, and never fabricates C', fakeAsync(async () => {
+      await withVisibleCode();
+
+      const inflight = inflightReissue();
+      assertSuppressed();
+
+      // The write DID commit; only its answer was lost. The head is now C, whose code
+      // this session has never seen and cannot see.
+      api.answer = () =>
+        of(
+          detail({
+            onboarding: adminOnboarding('pending', {
+              invitation: invitation('pending', {
+                id: THIRD_HEAD_ID,
+                issued_at: THIRD_ISSUED_AT,
+                expires_at: THIRD_EXPIRES_AT,
+              }),
+            }),
+          }),
+        );
+      inflight.error(new WireError(502));
+      tick();
+      harness.detectChanges();
+
+      assertDiscarded();
+      expect(claimPanel().innerHTML).withContext('C is not invented either').not.toContain(TOKEN_C);
+      expect(value('data-claim-indeterminate')).toBe(
+        'A newer claim code is now on record, and it was never shown here. Reissue again to replace it with one you can copy.',
+      );
+      expect(action('Reissue claim code')!.disabled)
+        .withContext('a deliberate reissue is the recovery')
+        .toBeFalse();
+      tick(60_000);
+      expect(api.invitationWrites.length).withContext('no automatic third write').toBe(2);
+      flush();
+    }));
+
+    // ── CASE 3 ─────────────────────────────────────────────────────────────────────
+
+    it('CASE 3: suppresses B while a cancellation is in flight, then discards it when the answer never comes', fakeAsync(async () => {
+      await withVisibleCode();
+
+      const inflight = inflightCancel();
+      assertSuppressed();
+
+      api.answer = () =>
+        of(
+          detail({
+            onboarding: adminOnboarding('cancelled', {
+              invitation: invitation('cancelled', {
+                id: NEW_HEAD_ID,
+                issued_at: NEW_ISSUED_AT,
+                expires_at: NEW_EXPIRES_AT,
+              }),
+            }),
+          }),
+        );
+      inflight.error({ status: 0, error: null, message: 'Http failure response' });
+      tick();
+      harness.detectChanges();
+
+      assertDiscarded();
+      expect(value('data-claim-invitation')).toBe('Cancelled');
+      expect(value('data-claim-indeterminate')).toBe('The invitation on record is now cancelled.');
+      flush();
+    }));
+
+    // ── CASE 4 ─────────────────────────────────────────────────────────────────────
+
+    it('CASE 4: does NOT restore B when an indeterminate cancellation turns out to have changed nothing', fakeAsync(async () => {
+      // The canonical state says the invitation was not cancelled — and that is still
+      // not proof that this plaintext survived an unanswered consequential request. The
+      // read carries no credential, so certainty is preferred over resurrection.
+      await withVisibleCode();
+
+      const inflight = inflightCancel();
+      assertSuppressed();
+
+      api.answer = () => of(detail({ onboarding: headB() }));
+      inflight.error({ status: 0, error: null, message: 'Http failure response' });
+      tick();
+      harness.detectChanges();
+
+      expect(store().detail()!.onboarding.invitation.id).toBe(NEW_HEAD_ID);
+      expect(value('data-claim-invitation')).toBe('Pending');
+      assertDiscarded();
+      expect(value('data-claim-indeterminate')).toBe('The invitation on record was not cancelled.');
+      flush();
+    }));
+
+    // ── CASE 5 ─────────────────────────────────────────────────────────────────────
+
+    it('CASE 5: gives B back, byte for byte, when re-authentication is cancelled on a reissue', fakeAsync(async () => {
+      // NOTHING was sent that could touch the invitation: the POST was refused for
+      // stale elevation and the replay never went out. Destroying a valid credential
+      // because a dialog was dismissed would cost a rotation nobody needed.
+      await withVisibleCode();
+
+      const inflight = inflightReissue();
+      assertSuppressed();
+
+      inflight.error(new ElevationCancelledError());
+      harness.detectChanges();
+
+      expect(codePanel()).withContext('the panel is back').toBeTruthy();
+      expect(codeValue()).withContext('the exact same code').toBe(TOKEN);
+      tokenIsNowhereBut(true);
+      expect(claimPanel().querySelector('[data-claim-code-suppressed]')).toBeNull();
+      expect(editorText()).toContain('Re-authentication was cancelled. Nothing was changed.');
+      expect(store().detailSuperseded()).withContext('nothing to re-read').toBeFalse();
+      expect(api.invitationWrites.length).withContext('and no further write').toBe(2);
+      flush();
+    }));
+
+    it('CASE 5: gives B back on a cancellation whose re-authentication is abandoned', fakeAsync(async () => {
+      // The other elevation outcome, and the other action — the suppression state is
+      // shared, so both halves of the matrix are worth pinning.
+      await withVisibleCode();
+
+      const inflight = inflightCancel();
+      assertSuppressed();
+
+      inflight.error(
+        new ElevationAbandonedError('unavailable', 'The admin service is unreachable.'),
+      );
+      harness.detectChanges();
+
+      expect(codeValue()).toBe(TOKEN);
+      tokenIsNowhereBut(true);
+      expect(editorText()).toContain('Re-authentication could not be completed');
+      expect(api.invitationWrites.length).toBe(2);
+      flush();
+    }));
+
+    // ── CASE 6 ─────────────────────────────────────────────────────────────────────
+
+    it('CASE 6: gives B back on a 400 — the server refused the body and touched nothing', fakeAsync(async () => {
+      await withVisibleCode();
+
+      const inflight = inflightReissue();
+      assertSuppressed();
+
+      inflight.error(
+        new WireError(400, {
+          status: 400,
+          message: 'The request could not be applied.',
+          errors: { reason: ['Please state a reason of at least 10 characters.'] },
+        }),
+      );
+      harness.detectChanges();
+
+      expect(codeValue()).withContext('the code was never at risk').toBe(TOKEN);
+      tokenIsNowhereBut(true);
+      // The form and its draft stay, with the server's words beside the field.
+      expect(editor()).toBeTruthy();
+      expect(
+        Array.from(editor()!.querySelectorAll('[data-invitation-field-error]')).map((node) =>
+          node.textContent?.trim(),
+        ),
+      ).toContain('Please state a reason of at least 10 characters.');
+      expect(store().detailSuperseded()).withContext('no reload is invented').toBeFalse();
+      expect(api.detailCalls.length).toBe(1);
+      flush();
+    }));
+
+    // ── CASE 7 ─────────────────────────────────────────────────────────────────────
+
+    it('CASE 7: discards B on a 409, holds the reload gate, and captures the FRESH id next time', fakeAsync(async () => {
+      await withVisibleCode();
+
+      const inflight = inflightReissue();
+      assertSuppressed();
+
+      const reload = new Subject<RestaurantDetail>();
+      api.answer = () => reload;
+      inflight.error(new WireError(409, { code: 'stale_owner_invitation', message: 'The owner invitation changed since it was loaded.' }));
+      harness.detectChanges();
+
+      assertDiscarded();
+      expect(value('data-claim-panel-error')).toContain('Review the current invitation before trying again.');
+      expect(store().detailSuperseded()).toBeTrue();
+      expect(action('Reissue claim code')!.disabled).withContext('no decision while stale').toBeTrue();
+
+      // The reload lands on a head neither the operator nor this screen had seen.
+      reload.next(detail({ onboarding: headB() }));
+      reload.complete();
+      harness.detectChanges();
+      assertDiscarded();
+
+      api.reissueAnswer = () => of(reissuedAgain());
+      reissue('Rotating against the invitation now on record');
+      expect(api.invitationWrites.length).toBe(3);
+      expect(api.invitationWrites[2].body['expected_invitation_id'])
+        .withContext('the FRESH id, never the one the 409 refused')
+        .toBe(NEW_HEAD_ID);
+      flush();
+    }));
+
+    // ── CASE 8 ─────────────────────────────────────────────────────────────────────
+
+    it('CASE 8: a successful second reissue replaces B with C, and B is nowhere', fakeAsync(async () => {
+      await withVisibleCode();
+
+      api.reissueAnswer = () => of(reissuedAgain());
+      reissue('Rotating again for the replacement owner');
+
+      expect(codeValue()).withContext('C is the only copyable credential').toBe(TOKEN_C);
+      tokenIsNowhereBut(false);
+      expect(store().detail()!.onboarding.invitation.id).toBe(THIRD_HEAD_ID);
+      expect(claimPanel().querySelector('[data-claim-code-suppressed]')).toBeNull();
+      flush();
+    }));
+
+    it('CASE 8: a successful cancellation leaves no credential at all', fakeAsync(async () => {
+      await withVisibleCode();
+
+      api.cancelAnswer = () => of(cancelled(true));
+      cancel('Withdrawing the credential for review');
+
+      assertDiscarded();
+      expect(value('data-claim-invitation')).toBe('Cancelled');
+      expect(value('data-claim-confirmation')).toContain('The claim code no longer works.');
+      flush();
+    }));
+
+    // ── CASE 9 ─────────────────────────────────────────────────────────────────────
+
+    it('CASE 9: destruction clears the raw credential state, and leaves the workspace records alone', fakeAsync(async () => {
+      await withVisibleCode();
+
+      // The signal itself is read off the instance, because that is precisely the claim:
+      // the plaintext does not outlive the component that owned it. `protected` is a
+      // compile-time boundary, so the cast is how a spec observes it.
+      const tab = harness.routeDebugElement!.query(By.directive(RestaurantReadinessTab))
+        .componentInstance as unknown as {
+        claimToken: () => string | null;
+        issued: () => unknown;
+      };
+      expect(tab.claimToken()).toBe(TOKEN);
+
+      await harness.navigateByUrl(`/restaurants/${ID}`, RestaurantDetailPage);
+      harness.detectChanges();
+
+      expect(tab.claimToken()).withContext('the plaintext is gone with the tab').toBeNull();
+      expect(tab.issued()).withContext('and the window shown beside it').toBeNull();
+      expect(JSON.stringify(store().detail())).not.toContain(TOKEN);
+      flush();
+    }));
+
+    it('CASE 9: destruction does NOT clear the non-secret bookkeeping a live write depends on', fakeAsync(async () => {
+      // The 291b5f4 architecture: the request outlives the tab, so the slot and the
+      // unshown-code record must too. Destroying the tab must clear the credential and
+      // nothing else.
+      await withVisibleCode();
+      const inflight = inflightReissue();
+
+      await harness.navigateByUrl(`/restaurants/${ID}`, RestaurantDetailPage);
+      harness.detectChanges();
+      expect(store().invitationMutating()).withContext('the slot survives the tab').toBeTrue();
+
+      inflight.next(reissuedAgain());
+      inflight.complete();
+      tick();
+      harness.detectChanges();
+
+      expect(store().invitationMutating()).toBeFalse();
+      expect(store().unshownCodeInvitationId())
+        .withContext('the code nobody could be shown is still recorded, by id')
+        .toBe(THIRD_HEAD_ID);
+      expect(store().detail()!.onboarding.invitation.id).toBe(THIRD_HEAD_ID);
+      expect(JSON.stringify([store().detail(), store().unshownCodeInvitationId()])).not.toContain(
+        TOKEN_C,
+      );
       flush();
     }));
   });

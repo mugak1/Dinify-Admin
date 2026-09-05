@@ -301,17 +301,30 @@ label. It is NOT `--admin-danger` (that means "this destroys something" and woul
 misreport a heading as a warning), and it is part of the accent — so §16's brand-red
 review moves both lines or neither.
 
-**The 500 kB initial-bundle warning became 560 kB in the same change.** The redesign
-costs ~13.6 kB raw (~3.3 kB gzipped) and 500 kB left 0.67 kB of headroom, which is a
-tripwire for whoever edits next. Step 2G's answer — lazy-load the screen — does not
-apply: `/unavailable` must never be a lazy chunk, because a total network loss is one
-of the three outages it exists to explain and it would then fail to load; and `/login`
-is the most-visited screen of an unauthenticated session. **THE NEXT TIME THIS BUDGET IS
-APPROACHED THE ANSWER IS NOT ANOTHER RAISE.** It is to make the AUTHENTICATED shell
+**THE 500 kB INITIAL-BUNDLE WARNING STAYS AT 500 kB, AND THE REDESIGN LEFT ~0.6 kB
+UNDER IT.** The `auth-*` tier costs ~13.6 kB raw (~3.3 kB gzipped): 485.76 → 499.42 kB.
+Raising the budget to 560 kB was tried in this change and **reverted in review** — the
+reasoning is recorded because it is easy to make again.
+
+`maximumWarning` PRINTS A WARNING AND EXITS 0 (verified: a build over it returns 0;
+only `maximumError`, at 2 mb, fails). So the thin margin is not a broken build waiting
+for the next contributor — it is a SIGNAL that fires the moment this bundle grows
+again, which is exactly what it is for. Raising it would have bought ~60 kB of silent
+drift and, worse, contradicted the paragraph below in the same commit: a note saying
+the next pressure must be answered structurally is worth nothing if the mechanism that
+announces the pressure has been removed.
+
+**WHEN IT FIRES, THE ANSWER IS NOT A RAISE.** It is to make the AUTHENTICATED shell
 lazy (`loadChildren` on the `authGuard` parent) — a signed-out operator currently
 downloads Home, Restaurants, the whole workspace, Support, Receivables and Activity
 before they can type a username, which is backwards. That is a routing change with its
 own reasoning about bootstrap ordering, so it wants its own PR.
+
+Step 2G's answer — lazy-load the screen itself — does NOT apply to these two, and both
+halves were measured rather than assumed: `/unavailable` must never be a lazy chunk,
+because a total network loss is one of the three outages it exists to explain and it
+would then fail to load; and lazy-loading `/login` reclaims only ~3.9 kB, since the
+Tailwind output is one global stylesheet either way.
 
 ### The token guard — `scripts/check-design-tokens.mjs`
 Modelled on Dinify-Frontend's `scripts/check-platform-roles.mjs`, **including its

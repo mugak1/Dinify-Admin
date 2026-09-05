@@ -88,6 +88,20 @@ describe('LoginPage', () => {
     fixture.detectChanges();
   }
 
+  function el<T extends HTMLElement>(selector: string): T | null {
+    return (fixture.nativeElement as HTMLElement).querySelector<T>(selector);
+  }
+
+  /** Two REAL refusals at step 2 return the operator to step 1. */
+  async function failSecondFactorTwice(): Promise<void> {
+    auth.verifyAnswer = () =>
+      Promise.reject(new WireError(401, { status: 401, message: 'Invalid or expired verification.' }));
+    await submitSecondFactor();
+    fixture.detectChanges();
+    await submitSecondFactor();
+    fixture.detectChanges();
+  }
+
   it('says the control plane is unreachable rather than "Invalid credentials."', async () => {
     auth.loginAnswer = () => Promise.reject(new WireError(0));
 
@@ -185,5 +199,70 @@ describe('LoginPage', () => {
     // Never back to step 2: the challenge cookie was cleared by the successful verify,
     // so a retry there can only fail.
     expect(text()).toContain('Password');
+  });
+
+  /**
+   * THIS SCREEN SHARES ITS LOOK WITH THE RESTAURANT PORTAL'S SIGN-IN, DELIBERATELY.
+   *
+   * §16 makes visual distinctness a SAFETY requirement, and the redesign moved where
+   * that distinctness lives on the two signed-out screens: from an environment nobody
+   * could confuse to WORDS an operator reads before typing. Three carry it — the ADMIN
+   * lockup, the eyebrow naming the plane, and the route title. If a later tidy-up drops
+   * one for balance, an operator with both portals open loses the cue at the exact
+   * moment it matters, so the two this component owns are pinned here.
+   */
+  it('names the plane on the sign-in step, beside the ADMIN lockup', () => {
+    expect(text()).toContain('Admin');
+    expect(text()).toContain('Platform control plane');
+  });
+
+  it('masks the password until asked, and re-masks on a return to step 1', async () => {
+    expect(el<HTMLInputElement>('input#password')?.type).toBe('password');
+
+    el<HTMLButtonElement>('[aria-label="Show password"]')?.click();
+    fixture.detectChanges();
+    expect(el<HTMLInputElement>('input#password')?.type).toBe('text');
+
+    await reachSecondFactor();
+    await failSecondFactorTwice();
+
+    // Back on step 1 after a challenge died. Carrying the reveal across would leave a
+    // password legible on a screen the operator did not choose to be on.
+    expect(el<HTMLInputElement>('input#password')?.type).toBe('password');
+  });
+
+  /**
+   * "CAREFUL, NOTHING ANSWERED" AND "WHAT YOU TYPED WAS REFUSED" MUST NOT LOOK ALIKE.
+   *
+   * The whole reason the transport check sits above the message path is that an outage
+   * answered as a refusal costs the operator an afternoon. Rendering the two in one
+   * treatment gives that back visually, so the hues are pinned as well as the copy:
+   * §16 reserves the danger token for a refusal and the warning token for careful.
+   */
+  it('renders an outage in the warning treatment, never the refusal one', async () => {
+    auth.loginAnswer = () => Promise.reject(new WireError(0));
+
+    await submitCredentials();
+    fixture.detectChanges();
+
+    const notice = el('[role="alert"]');
+    expect(notice?.textContent).toContain('The admin control plane is not answering');
+    expect(notice?.className).toContain('admin-warning');
+    expect(notice?.className).not.toContain('text-admin-danger');
+  });
+
+  it('renders a refusal in the danger treatment, and adds nothing to it', async () => {
+    auth.loginAnswer = () =>
+      Promise.reject(new WireError(401, { status: 401, message: 'Invalid credentials.' }));
+
+    await submitCredentials();
+    fixture.detectChanges();
+
+    const refusal = el('[role="alert"]');
+    expect(refusal?.className).toContain('text-admin-danger');
+    expect(refusal?.className).not.toContain('admin-warning');
+    // VERBATIM. The uniform message is a disclosure control, so the styled block that
+    // carries it must not have grown a prefix, a severity word or a hint around it.
+    expect(refusal?.textContent?.trim()).toBe('Invalid credentials.');
   });
 });

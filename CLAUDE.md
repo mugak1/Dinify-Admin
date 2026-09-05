@@ -47,7 +47,15 @@ Steps 3–10 are otherwise not built.
 - Operator-visible auth observability: ✅ the service-unavailable view, the
   mid-session outage banner, the notice channel (low recovery codes, cleared
   lockout), and Re-authenticate in the operator menu
-- Design tokens + the guard that enforces them: ✅
+- **The two SIGNED-OUT screens: ✅ REDESIGNED.** `/login` and `/unavailable` now share
+  `app-auth-shell` — a warm paper environment, a floating card and the Dinify | Admin
+  lockup, mirroring Dinify-Frontend's sign-in at this application's density. Behaviour is
+  untouched: both login states, the break-glass branch, the transport-first
+  classification, the verbatim uniform failure message and the three bootstrap outcomes
+  all work exactly as documented below. See "The `auth-*` tier" under Design Tokens for
+  why this does not weaken §16's distinctness rule, and what carries it instead
+- Design tokens + the guard that enforces them: ✅ — plus the `auth-*` tier and
+  `app-auth-shell`, the shared frame for the two signed-out screens, see "Design Tokens"
 - Primitives (status pill, table, button): ✅ — the table now also takes
   page-projected cell templates, see "Primitives"
 - Formatting (UGX, EAT time, server-anchored relative time): ✅
@@ -259,6 +267,64 @@ a single typeface.
   outline in the accent, so nothing has to remember to add it and nothing can suppress
   it by omission. An element managing its own ring opts out with
   `data-focus-ring="self"` (the table does, so the ring sits inside the row bounds).
+
+### The `auth-*` tier — the two SIGNED-OUT screens
+`/login` and `/unavailable` render outside the shell to a signed-out operator: one card
+on an empty page, with no working area to frame. The control-plane scale above is tuned
+for the opposite problem (dense tables, read all day), and applied to a lone sign-in
+card it produced a small grey form on a near-black field. So those two screens have
+their own tier, scoped by name: `text-auth-display` (28) / `-lede` (14) / `-eyebrow`
+(11, uppercase, tracked 0.16em) / `-label` (13) / `-field` (15) / `-cta` (15);
+`rounded-auth-card` (18) / `rounded-auth-control` (10); `h-auth-field` (48) /
+`h-auth-cta` (50) / `w-auth-gutter` (44); `max-w-auth-card` (420); the
+`bg-auth-environment` gradient and `bg-auth-grain` texture; and `shadow-auth-*`, cast
+from a WARM shadow because a cool grey drop on cream reads as a smudge.
+
+**IT DOES NOT RELAX THE DISTINCTNESS RULE — IT RELOCATES IT, AND THAT IS THE WHOLE
+ARGUMENT.** §16's hazard is a delegated support session with two WORKING surfaces open
+at once, where confusing them means acting on the wrong tenant. Every authenticated
+surface still carries the chrome, the dense scale, the 3/5/8 radii and the single
+typeface. A signed-out screen has no restaurant on it to act on by mistake; what has to
+be unmistakable THERE is which plane is about to receive a set of credentials, and that
+is carried by **the word ADMIN in the lockup, the eyebrow naming the control plane, and
+the route title**. Two of the three are pinned by spec (`auth-shell.component.spec.ts`
+and `login.page.spec.ts`) precisely because they look like decoration and are not.
+
+Values mirror Dinify-Frontend's sign-in AT THIS APPLICATION'S DENSITY — roughly 0.85x,
+the ratio the two type scales already sit at (28 against its 33, a 48px field against
+its 52, an 18px card corner against its 22). Copying its numbers verbatim would have
+imported its 14px root's arithmetic with them.
+
+**`--admin-accent-ink` is the accent AT TEXT CONTRAST on a light ground** (~6:1). Brand
+red is ~3.3:1 on the cream field, which fails for the 11px eyebrow and any small red
+label. It is NOT `--admin-danger` (that means "this destroys something" and would
+misreport a heading as a warning), and it is part of the accent — so §16's brand-red
+review moves both lines or neither.
+
+**THE 500 kB INITIAL-BUNDLE WARNING STAYS AT 500 kB, AND THE REDESIGN LEFT ~0.6 kB
+UNDER IT.** The `auth-*` tier costs ~13.6 kB raw (~3.3 kB gzipped): 485.76 → 499.42 kB.
+Raising the budget to 560 kB was tried in this change and **reverted in review** — the
+reasoning is recorded because it is easy to make again.
+
+`maximumWarning` PRINTS A WARNING AND EXITS 0 (verified: a build over it returns 0;
+only `maximumError`, at 2 mb, fails). So the thin margin is not a broken build waiting
+for the next contributor — it is a SIGNAL that fires the moment this bundle grows
+again, which is exactly what it is for. Raising it would have bought ~60 kB of silent
+drift and, worse, contradicted the paragraph below in the same commit: a note saying
+the next pressure must be answered structurally is worth nothing if the mechanism that
+announces the pressure has been removed.
+
+**WHEN IT FIRES, THE ANSWER IS NOT A RAISE.** It is to make the AUTHENTICATED shell
+lazy (`loadChildren` on the `authGuard` parent) — a signed-out operator currently
+downloads Home, Restaurants, the whole workspace, Support, Receivables and Activity
+before they can type a username, which is backwards. That is a routing change with its
+own reasoning about bootstrap ordering, so it wants its own PR.
+
+Step 2G's answer — lazy-load the screen itself — does NOT apply to these two, and both
+halves were measured rather than assumed: `/unavailable` must never be a lazy chunk,
+because a total network loss is one of the three outages it exists to explain and it
+would then fail to load; and lazy-loading `/login` reclaims only ~3.9 kB, since the
+Tailwind output is one global stylesheet either way.
 
 ### The token guard — `scripts/check-design-tokens.mjs`
 Modelled on Dinify-Frontend's `scripts/check-platform-roles.mjs`, **including its
@@ -1566,6 +1632,25 @@ same shape, not before.
 exactly once in `ShellComponent` and are never composed into a screen — three global
 channels holding at most one message each (a live outage state, one defect, one composed
 notice). A primitive is something screens reach for; these are things the frame owns.
+
+**`app-auth-shell` (`shell/auth-shell.component.ts`) is shell furniture too, for the
+frame OUTSIDE the router shell.** It owns the signed-out environment, the card and the
+Dinify | Admin lockup, takes an optional eyebrow, a required heading and an optional
+lede, and projects everything else. It has exactly two hosts — `/login` and
+`/unavailable` — and it exists so they cannot drift: `/login` NAVIGATES to
+`/unavailable` when a verified session cannot be read back, so an operator crosses that
+seam mid-sign-in, which is the worst moment to wonder whether they are still in the same
+application. It holds no state, no form and no behaviour. **The `Admin` half of the
+lockup has no input that can suppress it**, and a spec asserts it survives when both
+optional lines are absent. The wordmark is inline SVG drawn from `currentColor` in two
+groups (accent emblem, ink logotype) rather than carrying the source asset's brand-red
+hex — the token gate cannot see a fill that was never written, so a spec asserts it.
+
+`app-admin-button` grew a `size` — `control` (40px, the whole control plane) and `auth`
+(50px, the sign-in card's CTA). **A SIZE, NOT A FIFTH VARIANT**: the variants say what a
+button MEANS and all four still apply at either size. The accent glow is keyed by
+variant in `AUTH_EMPHASIS` rather than baked into the size, so a future destructive
+call to action at auth scale cannot silently inherit a red-accent halo.
 
 ### `Restaurant.is_test` NOW EXISTS, and is what drives the TEST pill
 Migration `restaurants_app/0057` (backend PR #290) added it: **platform-owned** metadata

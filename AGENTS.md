@@ -14,7 +14,7 @@ Before making changes:
 5. Do not make broad refactors unless explicitly requested.
 6. Run `./scripts/verify.sh` before preparing a PR and paste the output.
 
-Ten rules that are easy to break by habit:
+Twelve rules that are easy to break by habit:
 - Global navigation is FIVE destinations. New capability becomes a restaurant-detail
   tab or a needs-attention condition, never a sixth sidebar item.
 - Filters go in the URL via `core/url/query-param.ts`, never in component state.
@@ -45,7 +45,11 @@ Ten rules that are easy to break by habit:
   brand-red and white fills and `src/assets` is outside the token gate, which is how a
   one-line accent retint quietly stops being one. Only the LOGOTYPE takes a `tone`; the
   emblem is the accent on both grounds.
-
+- The sidebar lockup links to `/` with a PLAIN `href`, never `routerLink`. It is meant
+  to be a full document load — the session read re-runs and every root service is
+  rebuilt — and a soft navigation would refresh nothing. Both spellings render
+  `href="/"`, so the spec pins the absence of the `RouterLink` directive; do not
+  "modernise" it.
 - A raw owner claim code is a BEARER CREDENTIAL shown once. It may live in a
   component's transient state to be displayed and copied, and nowhere else — never
   storage, the URL, router state, the workspace store, a canonical model, a log, a

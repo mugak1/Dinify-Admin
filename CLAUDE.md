@@ -305,8 +305,8 @@ label. It is NOT `--admin-danger` (that means "this destroys something" and woul
 misreport a heading as a warning), and it is part of the accent — so §16's brand-red
 review moves both lines or neither.
 
-**THE 500 kB INITIAL-BUNDLE WARNING STAYS AT 500 kB, AND THE REDESIGN LEFT ~0.6 kB
-UNDER IT.** The `auth-*` tier costs ~13.6 kB raw (~3.3 kB gzipped): 485.76 → 499.42 kB.
+**THE 500 kB INITIAL-BUNDLE WARNING STAYS AT 500 kB. The redesign left ~0.6 kB under
+it; the sidebar logo link has since taken the bundle 251 bytes OVER — see below.** The `auth-*` tier costs ~13.6 kB raw (~3.3 kB gzipped): 485.76 → 499.42 kB.
 Raising the budget to 560 kB was tried in this change and **reverted in review** — the
 reasoning is recorded because it is easy to make again.
 
@@ -323,6 +323,21 @@ lazy (`loadChildren` on the `authGuard` parent) — a signed-out operator curren
 downloads Home, Restaurants, the whole workspace, Support, Receivables and Activity
 before they can type a username, which is backwards. That is a routing change with its
 own reasoning about bootstrap ordering, so it wants its own PR.
+
+**IT HAS NOW FIRED, AND THIS IS THE RECORD OF IT.** The sidebar logo link
+(499.95 → 500.25 kB) crossed the line by **251 bytes**. Nothing about that change is
+wasteful — ~0.14 kB of template and ~0.16 kB of Tailwind for one anchor — which is the
+point: the eager graph was already at the limit, so the next ordinary change was always
+going to be the one that tripped it, and it was.
+
+Two things follow, and neither is a raise. **CI is not blocked**: `maximumWarning`
+prints and exits 0, verified again on that build, so the warning is a standing signal
+rather than a broken pipeline. And **the answer is still the lazy authenticated shell**,
+which is now DUE rather than hypothetical — it was deliberately not folded into the logo
+change, because a routing change with its own bootstrap-ordering reasoning does not
+belong inside a two-line template edit. Until it lands, every further eager change
+widens the overage; the number to beat is 500.00 kB, and the honest way there is
+structural.
 
 Step 2G's answer — lazy-load the screen itself — does NOT apply to these two, and both
 halves were measured rather than assumed: `/unavailable` must never be a lazy chunk,
@@ -1681,9 +1696,31 @@ Three things about it are load-bearing:
 **The sidebar lockup is that mark, a hairline and ADMIN** — the same three parts the
 signed-out card carries, at chrome tone and chrome density (`h-5` against the card's
 `h-7`). It replaced a red rounded square holding the letter D beside the words "Dinify
-Admin". It is deliberately **NOT a link**: §9 is exactly five destinations and Home is
-already the first of them, so a lockup that navigated would be a sixth way in that the
-navigation does not claim to have.
+Admin".
+
+**IT IS A LINK, AND THE `href` IS LOAD-BEARING.** Clicking it is a FULL DOCUMENT LOAD
+to `/` — a bare `href`, never `routerLink`. Angular leaves a plain href alone, so the
+app initializer re-runs `GET /auth/session/` and every root service is rebuilt; a
+`routerLink` would be a soft navigation that re-renders a route and refreshes nothing,
+which is the one thing this control exists to do. It matches the restaurant portal
+sidebar logo, which is an `href` for the same reason.
+
+**BOTH SPELLINGS EMIT `href="/"` INTO THE DOM**, so a spec asserting the attribute
+cannot tell them apart — `sidebar.component.spec.ts` pins the ABSENCE of the
+`RouterLink` directive on the node, and the negative control is recorded: swapping in
+`routerLink="/"` leaves the "link to the root" assertion passing and fails only that
+one. Converting it is the obvious Angular tidy-up, which is exactly why it is pinned.
+
+**It is NOT a sixth destination.** §9 counts the navigation LIST, which is still five,
+and logo-goes-home is a shortcut to the first of them rather than a new place to be.
+An earlier revision refused the link on §9 grounds and was over-reading the rule; the
+same spec now COUNTS the list (five entries, named) instead of trusting that prose.
+
+The click target is the lockup itself, not the whole 56px bar — a full load discards an
+in-flight write's response and the recovery-code notice (the notice-channel gap below),
+so the surface that does it is the logo an operator aims at, not the empty space beside
+it. That is no worse than the browser reload button, and it is not a new hazard; it is
+simply one more way to reach an existing one.
 
 `app-admin-button` grew a `size` — `control` (40px, the whole control plane) and `auth`
 (50px, the sign-in card's CTA). **A SIZE, NOT A FIFTH VARIANT**: the variants say what a

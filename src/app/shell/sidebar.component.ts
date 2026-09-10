@@ -46,13 +46,32 @@ import { NAV_DESTINATIONS } from './navigation';
            app-auth-shell through app-dinify-wordmark so an operator crossing the
            sign-in seam does not meet two different marks.
 
-           NOT A LINK: §9 is exactly five destinations and Home is already the first
-           of them, so a lockup that navigated would be a sixth way in that the
-           navigation does not claim to have. -->
-      <div class="flex h-topbar items-center gap-2.5 border-b border-chrome-border px-4">
-        <app-dinify-wordmark class="h-5" tone="chrome" />
-        <span aria-hidden="true" class="h-4 w-px bg-chrome-border"></span>
-        <span class="text-admin-label text-chrome-fg-muted">Admin</span>
+           A PLAIN href, NEVER routerLink — AND THAT IS THE POINT, NOT AN OVERSIGHT.
+           Angular leaves a bare href alone, so this is a FULL DOCUMENT LOAD: the app
+           initializer re-runs the session read, every root service is rebuilt, and the
+           operator gets a real refresh. routerLink would be a soft navigation and
+           would refresh nothing, which is the one thing this control exists to do. It
+           is also exactly what the restaurant portal sidebar logo does. Pinned by
+           sidebar.component.spec.ts, because converting it is the obvious tidy-up.
+
+           IT IS NOT A SIXTH DESTINATION. §9 counts the navigation LIST, which is still
+           five; logo-goes-home is a shortcut to the first of them, not a new place to
+           be. The previous revision refused the link on those grounds and was
+           over-reading the rule — a spec now counts the list instead of trusting prose.
+
+           Known, accepted, and no worse than the browser reload button beside it: a
+           full load discards an in-flight write response and the recovery-code notice,
+           which is why the click target is the lockup and not the whole bar. -->
+      <div class="flex h-topbar items-center border-b border-chrome-border px-4">
+        <a
+          href="/"
+          aria-label="Dinify Admin home"
+          class="flex items-center gap-2.5 rounded-sm transition-opacity hover:opacity-80"
+        >
+          <app-dinify-wordmark class="h-5" tone="chrome" />
+          <span aria-hidden="true" class="h-4 w-px bg-chrome-border"></span>
+          <span class="text-admin-label text-chrome-fg-muted">Admin</span>
+        </a>
       </div>
 
       <ul class="flex-1 space-y-0.5 p-2">

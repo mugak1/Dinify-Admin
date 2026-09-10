@@ -4,6 +4,7 @@ import { RouterLink, RouterLinkActive } from '@angular/router';
 import { AdminAuthService } from '../core/auth/admin-auth.service';
 import { ElevationService } from '../core/auth/elevation.service';
 import { SessionStore } from '../core/auth/session.store';
+import { DinifyWordmarkComponent } from './dinify-wordmark.component';
 import { NAV_DESTINATIONS } from './navigation';
 
 /**
@@ -34,20 +35,24 @@ import { NAV_DESTINATIONS } from './navigation';
 @Component({
   selector: 'app-sidebar',
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink, RouterLinkActive],
+  imports: [RouterLink, RouterLinkActive, DinifyWordmarkComponent],
   template: `
     <nav
       class="flex h-full w-sidebar shrink-0 flex-col bg-chrome text-chrome-fg"
       aria-label="Primary"
     >
-      <div class="flex h-topbar items-center gap-2 border-b border-chrome-border px-4">
-        <span
-          class="flex h-5 w-5 items-center justify-center rounded-sm bg-admin-accent
-                 text-admin-micro text-admin-accent-fg"
-          aria-hidden="true"
-          >D</span
-        >
-        <span class="text-admin-label text-chrome-fg">Dinify Admin</span>
+      <!-- THE LOCKUP — the same three parts the signed-out card carries (mark,
+           hairline, ADMIN), at chrome tone and chrome density. Shared with
+           app-auth-shell through app-dinify-wordmark so an operator crossing the
+           sign-in seam does not meet two different marks.
+
+           NOT A LINK: §9 is exactly five destinations and Home is already the first
+           of them, so a lockup that navigated would be a sixth way in that the
+           navigation does not claim to have. -->
+      <div class="flex h-topbar items-center gap-2.5 border-b border-chrome-border px-4">
+        <app-dinify-wordmark class="h-5" tone="chrome" />
+        <span aria-hidden="true" class="h-4 w-px bg-chrome-border"></span>
+        <span class="text-admin-label text-chrome-fg-muted">Admin</span>
       </div>
 
       <ul class="flex-1 space-y-0.5 p-2">

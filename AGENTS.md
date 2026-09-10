@@ -39,6 +39,13 @@ Ten rules that are easy to break by habit:
   without the ADMIN half of the lockup — on those screens it is what tells an operator
   with both portals open which plane is about to take their credentials, and it is the
   reason the warm environment is safe to use at all.
+- The Dinify mark is ONE component, `app-dinify-wordmark`, rendered by both frames —
+  the dark sidebar lockup and the signed-out card. It is INLINE SVG drawn from
+  `currentColor`: never an `<img>` pointing at an asset, because the source files bake
+  brand-red and white fills and `src/assets` is outside the token gate, which is how a
+  one-line accent retint quietly stops being one. Only the LOGOTYPE takes a `tone`; the
+  emblem is the accent on both grounds.
+
 - A raw owner claim code is a BEARER CREDENTIAL shown once. It may live in a
   component's transient state to be displayed and copied, and nowhere else — never
   storage, the URL, router state, the workspace store, a canonical model, a log, a

@@ -56,6 +56,10 @@ Steps 3–10 are otherwise not built.
   why this does not weaken §16's distinctness rule, and what carries it instead
 - Design tokens + the guard that enforces them: ✅ — plus the `auth-*` tier and
   `app-auth-shell`, the shared frame for the two signed-out screens, see "Design Tokens"
+- **The sidebar lockup: ✅ the real Dinify mark.** The letter-D placeholder is gone; the
+  chrome now carries `app-dinify-wordmark` + hairline + ADMIN, the same lockup as the
+  signed-out card, from ONE shared inline-SVG component. Nothing else about the sidebar
+  moved — still five destinations, still Re-authenticate and Sign out. See "Primitives"
 - Primitives (status pill, table, button): ✅ — the table now also takes
   page-projected cell templates, see "Primitives"
 - Formatting (UGX, EAT time, server-anchored relative time): ✅
@@ -1642,9 +1646,44 @@ lede, and projects everything else. It has exactly two hosts — `/login` and
 seam mid-sign-in, which is the worst moment to wonder whether they are still in the same
 application. It holds no state, no form and no behaviour. **The `Admin` half of the
 lockup has no input that can suppress it**, and a spec asserts it survives when both
-optional lines are absent. The wordmark is inline SVG drawn from `currentColor` in two
-groups (accent emblem, ink logotype) rather than carrying the source asset's brand-red
-hex — the token gate cannot see a fill that was never written, so a spec asserts it.
+optional lines are absent. The wordmark it renders is `app-dinify-wordmark`, below.
+
+**`app-dinify-wordmark` (`shell/dinify-wordmark.component.ts`) is the third piece of
+shell furniture, and it is NOT a fourth primitive** — §16 is still three. Same argument
+as the banners and the auth shell: screens do not reach for it, the two FRAMES own it.
+Its hosts are the dark sidebar of `ShellComponent` and the signed-out card, and it
+exists so the mark an operator sees before signing in is the mark they see after.
+
+Three things about it are load-bearing:
+
+- **IT IS INLINE SVG, NEVER `<img src="assets/...">`.** Dinify-Frontend renders its
+  sidebar logo from an asset file, and copying that across would park the source
+  asset's literal brand-red and white fills in `src/assets` — OUTSIDE
+  `check-design-tokens.mjs` scope. §16's brand-red review is only cheap while retinting
+  is one line in `src/styles.css`, so that is precisely the drift the gate exists to
+  prevent, moved somewhere the gate cannot look. Both halves are drawn from
+  `currentColor` and carry no fill of their own; **the gate cannot see an attribute that
+  was never written**, so `dinify-wordmark.component.spec.ts` asserts it instead — no
+  path spells a colour, and both groups really do read `currentColor` rather than
+  falling back to SVG's default black (invisible on chrome, off-brand on the card).
+- **`tone` is REQUIRED, and only the LOGOTYPE takes it.** The two hosts sit on opposite
+  grounds, so there is no default that is merely suboptimal on the other — ink on dark
+  chrome is an invisible logotype. A required input makes that a compile error rather
+  than a silent one. The EMBLEM takes no tone at all: it reads `--admin-accent` on both
+  grounds, which is what keeps it inside the one-line retint.
+- **The viewBox is MEASURED (`395 385 510 130`), not rounded.** It was 500 wide while
+  inlined in the auth shell, ending at x=895 against content reaching 898, so the mark
+  had been rendering with the tail of the "y" shaved off — sub-pixel, invisible to every
+  gate here, and still a clipped brand mark. It was WIDENED rather than re-cropped, so
+  the vertical scale is identical and the sign-in card did not change. A spec measures
+  it, and fails on the old box.
+
+**The sidebar lockup is that mark, a hairline and ADMIN** — the same three parts the
+signed-out card carries, at chrome tone and chrome density (`h-5` against the card's
+`h-7`). It replaced a red rounded square holding the letter D beside the words "Dinify
+Admin". It is deliberately **NOT a link**: §9 is exactly five destinations and Home is
+already the first of them, so a lockup that navigated would be a sixth way in that the
+navigation does not claim to have.
 
 `app-admin-button` grew a `size` — `control` (40px, the whole control plane) and `auth`
 (50px, the sign-in card's CTA). **A SIZE, NOT A FIFTH VARIANT**: the variants say what a

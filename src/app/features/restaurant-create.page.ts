@@ -107,10 +107,12 @@ const KNOWN_FIELDS: Record<OwnerMode, readonly string[]> = {
  *
  * ── TWO DECISIONS HAVE NO DEFAULT ────────────────────────────────────────────────
  *
- * `is_test` decides whether this tenant's orders are FLAGGED as test orders (a test
- * restaurant can still do everything a live one can — the flag limits nothing there),
- * and the owner MODE decides whether an identity is minted or an existing person is
- * attached. Both
+ * `is_test` decides whether this tenant's orders are FLAGGED as test orders and whether
+ * Dinify's own portfolio and financial figures in this portal leave it out (spec §11 and
+ * §16). Inside the restaurant it limits nothing — a test restaurant can do everything a
+ * live one can — and the Test option's copy says both halves, because it is the only
+ * explanation an operator reads before choosing. The owner MODE decides whether an
+ * identity is minted or an existing person is attached. Both
  * are radios with nothing pre-selected: the server wants each stated by an operator,
  * and a defaulted "real" or a defaulted "new" would be this screen deciding.
  *
@@ -290,8 +292,9 @@ const KNOWN_FIELDS: Record<OwnerMode, readonly string[]> = {
                   <span [class]="label">Test restaurant</span>
                   <span [class]="note"
                     >For demos and testing. It works exactly like a real restaurant —
-                    ordering, the kitchen, reviews and reports — and its orders are
-                    marked as test orders.</span
+                    ordering, the kitchen, reviews and its own reports — and its orders
+                    are marked as test orders. It is left out of Dinify’s own portfolio
+                    and financial figures.</span
                   >
                 </span>
               </label>

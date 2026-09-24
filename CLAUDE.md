@@ -1750,10 +1750,17 @@ switched off: its flagged orders count in its own reports and dashboards, can be
 reviewed and are matched to customers exactly like a live restaurant's. Only a
 PRACTICE order — a test order at a restaurant that is NOT a test restaurant, such as a
 rehearsal before a real restaurant went live — is left out of that restaurant's
-figures. The creation screen says so in its Test option ("works exactly like a real
-restaurant"), and a spec keeps the retired "Excluded from every revenue figure" claim
-from coming back. Dinify's own platform-wide portfolio figures (spec §11, not built)
-are the one place test restaurants are meant to be left out.
+figures. **The classification is still not a no-op**: spec §11 and §16 leave test
+restaurants out of every portfolio and financial figure in THIS portal — Dinify's own
+numbers (the Home portfolio summary, portfolio metrics, receivables; none built yet),
+never the restaurant's. The creation screen's Test option says BOTH halves ("works
+exactly like a real restaurant — ordering, the kitchen, reviews and its own reports"
+and "left out of Dinify’s own portfolio and financial figures"), because it is the only
+explanation an operator reads before choosing, and a commercial customer classified as
+test by mistake would otherwise vanish from Dinify's figures without warning (Codex
+review on PR #27). A spec pins both halves, and its negatives are the retired claims
+word for word ("Excluded from every revenue figure", "commercially invisible") —
+deliberately NOT a ban on any mention of exclusion.
 
 ## Formatting
 

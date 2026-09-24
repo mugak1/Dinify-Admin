@@ -285,8 +285,8 @@ describe('RestaurantCreatePage', () => {
   // ── THE FORM ─────────────────────────────────────────────────────────────────────
 
   it('pre-selects NEITHER the classification NOR the owner mode', fakeAsync(async () => {
-    // Two decisions with no default. `is_test` decides whether the tenant appears in
-    // every revenue figure and the mode decides whether an identity is minted; the
+    // Two decisions with no default. `is_test` decides whether the tenant's orders are
+    // flagged test and the mode decides whether an identity is minted; the
     // server wants each stated by an operator, and a defaulted radio would be this
     // screen deciding.
     await open();
@@ -297,6 +297,27 @@ describe('RestaurantCreatePage', () => {
     expect(el().querySelector('[data-create-owner-new-fields]')).toBeNull();
     expect(el().querySelector('[data-create-owner-existing-fields]')).toBeNull();
     expect(submitButton().disabled).toBeTrue();
+    flush();
+  }));
+
+  it('says a test restaurant works exactly like a real one, and never that it is excluded', fakeAsync(async () => {
+    // TEST-RESTAURANT-PARITY-00. A test restaurant exists so an operator can check that
+    // everything a live restaurant does actually works, and the backend now lets it:
+    // its orders are flagged test and still count, can be reviewed and are matched to
+    // customers. This copy used to promise the opposite ("Excluded from every revenue
+    // figure; every order it takes is commercially invisible"), which is the claim that
+    // must not come back.
+    await open();
+
+    const testChoice = el()
+      .querySelector('[data-create-classification-test]')!
+      .closest('label')!
+      .textContent!.replace(/\s+/g, ' ');
+    expect(testChoice).toContain('works exactly like a real restaurant');
+    expect(testChoice).toContain('marked as test orders');
+    for (const retired of ['Excluded', 'invisible', 'revenue figure']) {
+      expect(el().textContent!).withContext(retired).not.toContain(retired);
+    }
     flush();
   }));
 

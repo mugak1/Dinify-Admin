@@ -107,8 +107,10 @@ const KNOWN_FIELDS: Record<OwnerMode, readonly string[]> = {
  *
  * ── TWO DECISIONS HAVE NO DEFAULT ────────────────────────────────────────────────
  *
- * `is_test` decides whether this tenant appears in every revenue figure, and the owner
- * MODE decides whether an identity is minted or an existing person is attached. Both
+ * `is_test` decides whether this tenant's orders are FLAGGED as test orders (a test
+ * restaurant can still do everything a live one can — the flag limits nothing there),
+ * and the owner MODE decides whether an identity is minted or an existing person is
+ * attached. Both
  * are radios with nothing pre-selected: the server wants each stated by an operator,
  * and a defaulted "real" or a defaulted "new" would be this screen deciding.
  *
@@ -269,7 +271,7 @@ const KNOWN_FIELDS: Record<OwnerMode, readonly string[]> = {
                 <span class="flex flex-col gap-0.5">
                   <span [class]="label">Real restaurant</span>
                   <span [class]="note"
-                    >A commercial customer. Counted in every portfolio and revenue figure.</span
+                    >A commercial customer.</span
                   >
                 </span>
               </label>
@@ -287,8 +289,9 @@ const KNOWN_FIELDS: Record<OwnerMode, readonly string[]> = {
                 <span class="flex flex-col gap-0.5">
                   <span [class]="label">Test restaurant</span>
                   <span [class]="note"
-                    >A demo, fixture or rehearsal tenant. Excluded from every revenue figure;
-                    every order it takes is commercially invisible.</span
+                    >For demos and testing. It works exactly like a real restaurant —
+                    ordering, the kitchen, reviews and reports — and its orders are
+                    marked as test orders.</span
                   >
                 </span>
               </label>

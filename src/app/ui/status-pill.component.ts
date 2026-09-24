@@ -64,9 +64,11 @@ const STYLES: Record<StatusPillVariant, string> = {
  * name. The admin directory and detail reads surface it directly.
  *
  * DO NOT CONFUSE IT WITH `Order.is_test` (migration `orders_app/0035`), which is a
- * different fact about a different object: one ORDER that is operationally real and
- * commercially invisible, either because its tenant is a test tenant or because it was
- * placed before go-live as a rehearsal. A real restaurant can have test orders, and a
+ * different fact about a different object: one ORDER flagged test, either because its
+ * tenant is a test tenant or because it was placed before go-live as a rehearsal. The
+ * flag limits nothing at a test restaurant — it can do everything a live one can — and
+ * at a real restaurant it marks a practice order kept out of its figures. A real
+ * restaurant can have test orders, and a
  * test restaurant's orders are all test orders — so neither flag may be derived from
  * the other. The Overview tab marks a test LATEST ORDER with this same pill for the
  * same reason it marks a test tenant: "a rehearsal happened" and "a sale happened" are

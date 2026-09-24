@@ -817,9 +817,9 @@ export function readStatus(error: unknown): number | null {
                     orderStatus(order.order_status)
                   }}</span>
                   @if (order.is_test) {
-                    <!-- A TEST order is operationally real and commercially invisible.
-                         Marked, because "a rehearsal happened" and "a sale happened"
-                         are different facts. -->
+                    <!-- A TEST order is flagged, and nothing more at a test
+                         restaurant. Marked, because "a rehearsal happened" and "a
+                         sale happened" are different facts. -->
                     <app-status-pill variant="test" />
                   }
                 </div>

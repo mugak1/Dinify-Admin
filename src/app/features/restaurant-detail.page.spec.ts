@@ -2576,8 +2576,8 @@ describe('RestaurantOverviewTab', () => {
     const pills = Array.from(el().querySelectorAll('app-status-pill span')).map(
       (pill) => pill.textContent?.trim(),
     );
-    // A rehearsal order is operationally real and commercially invisible; "a rehearsal
-    // happened" and "a sale happened" are different statements.
+    // A test order is flagged, and the flag is shown: "a rehearsal happened" and "a
+    // sale happened" are different statements.
     expect(pills).toContain('Test');
     flush();
   }));

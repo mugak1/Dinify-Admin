@@ -23,7 +23,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 
 import { evaluate, headline } from './core.mjs';
 import { environmentFacts, inventory, readReport, scannerArgs, scannerEnvironment, sha256, toolingScope } from './npm.mjs';
@@ -40,6 +40,26 @@ const SCANNER_KEYS = ['package', 'version', 'root', 'registry', 'timeoutSeconds'
 const readJson = (path) => JSON.parse(readFileSync(path, 'utf8'));
 const writeJson = (path, value) => writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
 const canonical = (value) => JSON.stringify(value, Object.keys(value ?? {}).sort());
+const isMapping = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+/**
+ * One retained evidence document, or the reason it is not one. JSON that parses is not yet
+ * evidence: `null`, `0`, `""`, `false` and a list all parse, and a caller that read "falsy"
+ * as "nothing to check" skipped every binding and graph check — so an evidence directory
+ * holding `null` re-decided to within policy, exit 0 (Codex review on
+ * mugak1/Dinify-Backend#339). Only a JSON object carrying the expected schema is returned;
+ * everything else comes back as a problem, so an absent document always has a named reason.
+ */
+function readEvidence(path, schema) {
+  let doc;
+  try { doc = readJson(path); } catch (error) { return { doc: null, problem: `${basename(path)}: ${error.message}` }; }
+  if (!isMapping(doc)) return { doc: null, problem: `${basename(path)} is not a JSON object` };
+  if (doc.schema !== schema) return { doc: null, problem: `${basename(path)}: schema is not recognised` };
+  return { doc, problem: null };
+}
+
+/** A snapshot records its own problems as a list; anything else is a malformed snapshot. */
+const snapshotProblemsReadable = (snap) => Array.isArray(snap.problems) && snap.problems.every(isMapping);
 
 /**
  * The committed policy, validated. Returns {policy, problems}.
@@ -180,9 +200,11 @@ export function audit(root, { evidenceDir, now, runner = spawnRunner, env, insta
   const snapPath = join(evidenceDir, 'snapshot.json');
   if (!existsSync(snapPath)) incomplete.push({ code: 'no_snapshot', detail: 'no inventory snapshot was taken after installation — run `snapshot` first' });
   else {
-    try { snap = readJson(snapPath); } catch (error) { incomplete.push({ code: 'snapshot_unreadable', detail: error.message }); }
-    if (snap && snap.schema !== SNAPSHOT_SCHEMA) incomplete.push({ code: 'snapshot_unreadable', detail: 'snapshot schema is not recognised' });
-    if (snap && Array.isArray(snap.problems) && snap.problems.length) {
+    const read = readEvidence(snapPath, SNAPSHOT_SCHEMA);
+    if (read.problem) incomplete.push({ code: 'snapshot_unreadable', detail: read.problem });
+    else if (!snapshotProblemsReadable(read.doc)) incomplete.push({ code: 'snapshot_unreadable', detail: 'snapshot.json: problems is not a list of problems' });
+    else {
+      snap = read.doc;
       for (const pr of snap.problems) incomplete.push({ code: `snapshot_${pr.code}`, detail: pr.detail });
     }
   }
@@ -276,12 +298,16 @@ export function reevaluate(root, { evidenceDir, now, env } = {}) {
   const findings = [];
   const { policy, problems } = loadPolicy(root);
   incomplete.push(...problems);
-  let collection = null; let snap = null;
-  try { collection = readJson(join(evidenceDir, 'collection.json')); snap = readJson(join(evidenceDir, 'snapshot.json')); } catch (error) {
-    incomplete.push({ code: 'evidence_unreadable', detail: error.message });
-  }
+  const readDoc = (name, schema) => {
+    const read = readEvidence(join(evidenceDir, name), schema);
+    if (read.problem) incomplete.push({ code: 'evidence_unreadable', detail: read.problem });
+    return read.doc;
+  };
+  const collection = readDoc('collection.json', COLLECTION_SCHEMA);
+  const snap = readDoc('snapshot.json', SNAPSHOT_SCHEMA);
+  // Every way this branch is skipped has already recorded its reason: a null document
+  // (readDoc), or a null policy (loadPolicy returns one only beside its problems).
   if (collection && snap && policy) {
-    if (collection.schema !== COLLECTION_SCHEMA) incomplete.push({ code: 'evidence_unreadable', detail: 'collection schema is not recognised' });
     const current = capture(root, { policy, env, revision: gitRevision(root) });
     incomplete.push(...current.problems);
     for (const d of bindingDifferences(collection.binding, current.binding)) incomplete.push({ code: 'evidence_foreign', detail: `the evidence is not for this checkout: ${d}` });

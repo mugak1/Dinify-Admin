@@ -256,6 +256,49 @@ describe('an invalid policy is incomplete on every path, never a crash', () => {
   });
 });
 
+describe('retained evidence that is not a document is incomplete, never clean', () => {
+  // Codex review on mugak1/Dinify-Backend#339: evidence that PARSES is not yet evidence.
+  // `reevaluate` guarded on truthy documents, so a collection.json or snapshot.json holding
+  // `null`, `0`, `""` or `false` skipped every binding and graph check and re-decided to
+  // within policy, exit 0 — a clean verdict about evidence that does not exist.
+  const SHAPES = {
+    'null': null, 'zero': 0, 'an empty string': '', 'false': false,
+    'an empty object': {}, 'an empty list': [], 'a list': [1, 2],
+    'an object with another schema': { schema: 'dinify.dependency-audit.something-else/v1' },
+  };
+  const prepare = (p) => {
+    snapshot(p.root, { evidenceDir: p.evidence, now: NOW });
+    assert.equal(scan(p, { application: CLEAN, scanner: CLEAN_SCANNER }).result.outcome, 'within_policy');
+  };
+
+  it('REGRESSION: re-deciding a collection or snapshot that is not a document is incomplete', () => {
+    for (const [label, value] of Object.entries(SHAPES)) for (const file of ['collection.json', 'snapshot.json']) run({}, (p) => {
+      prepare(p);
+      writeFileSync(join(p.evidence, file), JSON.stringify(value));
+      const r = reevaluate(p.root, { evidenceDir: p.evidence, now: NOW });
+      assert.equal(r.outcome, 'incomplete', `${file} holding ${label}: ${JSON.stringify(r.reasons)}`);
+      assert.equal(r.exitCode, 2, `${file} holding ${label}`);
+      assert.ok(r.reasons.some((x) => x.code === 'evidence_unreadable' && x.detail.startsWith(file)), `${file} holding ${label}: the reason names the file`);
+    });
+  });
+
+  it('REGRESSION: the audit refuses a snapshot that is not a document, and scans nothing', () => {
+    const shapes = { ...SHAPES, 'problems that are not a list': 'problems-string', 'a problem that is not an object': 'problems-null' };
+    for (const [label, value] of Object.entries(shapes)) run({}, (p) => {
+      snapshot(p.root, { evidenceDir: p.evidence, now: NOW });
+      const path = join(p.evidence, 'snapshot.json');
+      const good = JSON.parse(readFileSync(path, 'utf8'));
+      const doc = value === 'problems-string' ? { ...good, problems: 'none' } : value === 'problems-null' ? { ...good, problems: [null] } : value;
+      writeFileSync(path, JSON.stringify(doc));
+      const { result, runner } = scan(p, { application: CLEAN, scanner: CLEAN_SCANNER });
+      assert.equal(result.outcome, 'incomplete', label);
+      assert.equal(result.exitCode, 2, label);
+      assert.ok(result.reasons.some((x) => x.code === 'snapshot_unreadable'), `${label}: ${JSON.stringify(result.reasons)}`);
+      assert.equal(runner.calls.length, 0, `${label}: nothing is scanned`);
+    });
+  });
+});
+
 describe('the committed policy of THIS repository', () => {
   const ROOT = resolve(new URL('../..', import.meta.url).pathname);
   const policy = JSON.parse(readFileSync(join(ROOT, 'dependency-audit/policy.json'), 'utf8'));

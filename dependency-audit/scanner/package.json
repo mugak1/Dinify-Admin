@@ -1,0 +1,9 @@
+{
+  "name": "dinify-dependency-audit-scanner",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The pinned dependency-audit scanner (npm). Installed separately from the application graph with scripts disabled; audited as its own graph. See dependency-audit/README.md.",
+  "dependencies": {
+    "npm": "11.19.1"
+  }
+}

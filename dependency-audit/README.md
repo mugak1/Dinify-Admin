@@ -77,6 +77,12 @@ ranges, an extra path that matches no current finding, a record that matches not
 exception on a triage finding, duplicate ids and unknown fields (an `approved: true` flag,
 say) are all refused. A record is valid through the day before `expires`.
 
+**Which advisories are the same is the scanner's statement, never the record's.** A record
+names a finding through the finding's own identifier or an alias the scanner reported for
+it, and every alias the record lists must be one the scanner reports for that finding. An
+alias it does not corroborate refuses the record — otherwise a record for one advisory
+could list a second as its "alias" and except both on one approval.
+
 `kind: "exception"` covers a blocking finding; `kind: "triage"` records the decision on a
 lower-severity tooling finding. Neither is self-approving: the schema can check that
 provenance is *stated*, not that the linked review exists — that is the reviewer's job.

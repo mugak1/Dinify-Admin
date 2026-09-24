@@ -136,12 +136,22 @@ export function classify(finding) {
   return 'unresolved';
 }
 
-const advisoryMatches = (record, finding) => {
-  const fAliases = Array.isArray(finding.aliases) ? finding.aliases : [];
-  const rAliases = Array.isArray(record.aliases) ? record.aliases : [];
-  return record.advisory === finding.advisory
-    || fAliases.includes(record.advisory)
-    || rAliases.includes(finding.advisory);
+/**
+ * Which advisory a finding IS: its own identifier plus the aliases the SCANNER reported
+ * for it. A record's `aliases` are never part of this set. They are a claim the record
+ * makes, and trusting them let a record widen what it covered: a record for advisory A
+ * that listed B as an alias also covered a separate finding B at the same path, so one
+ * approval excepted a second, unapproved advisory and the audit exited 0.
+ */
+const identityOf = (finding) => new Set([finding.advisory, ...(Array.isArray(finding.aliases) ? finding.aliases : [])]);
+
+/** A record names a finding only through the finding's own, scanner-reported identity. */
+const advisoryMatches = (record, finding) => identityOf(finding).has(record.advisory);
+
+/** The aliases a record claims that the scanner does not report for this finding. */
+const uncorroboratedAliases = (record, finding) => {
+  const identity = identityOf(finding);
+  return (Array.isArray(record.aliases) ? record.aliases : []).filter((a) => !identity.has(a));
 };
 
 const FINDING_KEYS = ['advisory', 'package', 'version', 'path', 'scope', 'severity'];
@@ -210,6 +220,11 @@ export function evaluate({ incomplete = [], findings = [], records = [], now }) 
     }
     for (const f of related) {
       if (!r.paths.includes(f.path)) continue;
+      // A record describes ONE advisory as the scanner identifies it. An alias the scanner
+      // does not report is an equivalence nobody has corroborated, so the record is
+      // refused rather than read as a description of some other advisory.
+      const unverified = uncorroboratedAliases(r, f);
+      if (unverified.length) { entry.problems.push(`aliases ${unverified.join(', ')} are not reported by the scanner for ${f.advisory} at ${f.path}`); continue; }
       if (f.version !== r.version) { entry.problems.push(`version ${r.version} does not match ${f.version} at ${f.path}`); continue; }
       if (f.scope !== r.scope) { entry.problems.push(`scope ${r.scope} does not match ${f.scope} at ${f.path}`); continue; }
       if (f.class === 'unresolved') { entry.problems.push(`${f.path} is unresolved and cannot be excepted`); continue; }

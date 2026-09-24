@@ -25,7 +25,7 @@ const BYTES = readFileSync(CONFORMANCE_URL);
 const VECTORS = JSON.parse(BYTES.toString('utf8'));
 
 /** Pinned identically in the three repositories. Change it only with the vectors, everywhere. */
-export const CONFORMANCE_SHA256 = '341102170ee013d39560a7a919a33bb20218526bc1c8bfedb79aa7a411d67070';
+export const CONFORMANCE_SHA256 = '7a9d09e3acbede18578d64ce86d5f93c361601648dcc979a68f8066b58e865bf';
 
 describe('the cross-ecosystem conformance vectors', () => {
   it('CONTRACT: the vectors are the pinned, shared bytes', () => {

@@ -195,7 +195,7 @@ const SEEDS: readonly Seed[] = [
     owner: { name: 'Miriam Nakato', email: 'miriam@ankolegrill.ug', phone_number: '256772140388' },
     operations: { table_count: 12, usable_table_count: 9, dining_area_count: 2 },
     latestOrderHoursAgo: 5,
-    latestOrderTest: true, // A pre-go-live REHEARSAL order: real, commercially invisible.
+    latestOrderTest: true, // A pre-go-live REHEARSAL at a real restaurant: a practice order, left out of its figures.
     // THE SHAPE LIVE BABA HOUSE RETURNS — adopted, consistent, no control evidence,
     // and no invitation because none ever applied. Reviewed most often, so it is first.
     onboarding: { source: 'legacy_adopted', recordedHoursAgo: 26 },

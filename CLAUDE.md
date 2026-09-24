@@ -1226,7 +1226,7 @@ lose what was typed) and `buildOwner()` emits exactly one mode's keys — the ot
 unrepresentable on the wire. Three facts are stated by the operator and defaulted by
 nobody: the **classification** (`is_test`, a JSON boolean — the server's
 `StrictBooleanField` refuses `"true"`, `1` and `null`, because a coercion table must not
-decide whether a tenant appears in every revenue figure), the **owner mode**, and the
+decide whether a tenant's orders are flagged test), the **owner mode**, and the
 **reason**. Both radios start with nothing selected. A blank email is sent as an explicit
 `null`; the phone is sent as typed, because canonicalising a Ugandan number is the
 server's job and there is exactly one place that does it.
@@ -1738,11 +1738,29 @@ directory and detail reads surface it, and the directory row and detail header b
 it with the solid TEST pill.
 
 **It is NOT `Order.is_test`** (migration `orders_app/0035`), which is a different fact
-about a different object: ONE order that is operationally real and commercially
-invisible, either because its tenant is a test tenant or because it was placed
-pre-go-live as a rehearsal. A real restaurant can have test orders. **Neither flag may
-be derived from the other.** Overview marks a test LATEST ORDER with the same pill, for
-the same reason: "a rehearsal happened" and "a sale happened" are different statements.
+about a different object: ONE order FLAGGED test, either because its tenant is a test
+tenant or because it was placed pre-go-live as a rehearsal. A real restaurant can have
+test orders. **Neither flag may be derived from the other.** Overview marks a test
+LATEST ORDER with the same pill, for the same reason: "a rehearsal happened" and "a
+sale happened" are different statements.
+
+**A TEST RESTAURANT CAN DO EVERYTHING A LIVE RESTAURANT CAN** (backend
+TEST-RESTAURANT-PARITY-00). The flags are labels. At a test restaurant nothing is
+switched off: its flagged orders count in its own reports and dashboards, can be
+reviewed and are matched to customers exactly like a live restaurant's. Only a
+PRACTICE order — a test order at a restaurant that is NOT a test restaurant, such as a
+rehearsal before a real restaurant went live — is left out of that restaurant's
+figures. **The classification is still not a no-op**: spec §11 and §16 leave test
+restaurants out of every portfolio and financial figure in THIS portal — Dinify's own
+numbers (the Home portfolio summary, portfolio metrics, receivables; none built yet),
+never the restaurant's. The creation screen's Test option says BOTH halves ("works
+exactly like a real restaurant — ordering, the kitchen, reviews and its own reports"
+and "left out of Dinify’s own portfolio and financial figures"), because it is the only
+explanation an operator reads before choosing, and a commercial customer classified as
+test by mistake would otherwise vanish from Dinify's figures without warning (Codex
+review on PR #27). A spec pins both halves, and its negatives are the retired claims
+word for word ("Excluded from every revenue figure", "commercially invisible") —
+deliberately NOT a ban on any mention of exclusion.
 
 ## Formatting
 

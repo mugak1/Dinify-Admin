@@ -285,8 +285,8 @@ describe('RestaurantCreatePage', () => {
   // ── THE FORM ─────────────────────────────────────────────────────────────────────
 
   it('pre-selects NEITHER the classification NOR the owner mode', fakeAsync(async () => {
-    // Two decisions with no default. `is_test` decides whether the tenant appears in
-    // every revenue figure and the mode decides whether an identity is minted; the
+    // Two decisions with no default. `is_test` decides whether the tenant's orders are
+    // flagged test and the mode decides whether an identity is minted; the
     // server wants each stated by an operator, and a defaulted radio would be this
     // screen deciding.
     await open();
@@ -297,6 +297,38 @@ describe('RestaurantCreatePage', () => {
     expect(el().querySelector('[data-create-owner-new-fields]')).toBeNull();
     expect(el().querySelector('[data-create-owner-existing-fields]')).toBeNull();
     expect(submitButton().disabled).toBeTrue();
+    flush();
+  }));
+
+  it('says a test restaurant works like a real one, and is left out only of Dinify’s own figures', fakeAsync(async () => {
+    // TEST-RESTAURANT-PARITY-00. A test restaurant exists so an operator can check that
+    // everything a live restaurant does actually works, and the backend now lets it:
+    // its orders are flagged test and still count in its own reports, can be reviewed
+    // and are matched to customers. This copy used to promise the opposite ("Excluded
+    // from every revenue figure; every order it takes is commercially invisible"), which
+    // is the claim that must not come back.
+    //
+    // The classification is not a no-op, though, and the copy has to say what it DOES
+    // do: spec §11 and §16 leave test restaurants out of every portfolio and financial
+    // figure in THIS portal — Dinify's own numbers, not the restaurant's. This text is
+    // the only explanation an operator reads before choosing, so a commercial customer
+    // classified as test by mistake would otherwise vanish from them without warning
+    // (Codex review on PR #27). The negatives below are therefore the retired claims
+    // word for word, deliberately not a ban on any mention of exclusion.
+    await open();
+
+    const testChoice = el()
+      .querySelector('[data-create-classification-test]')!
+      .closest('label')!
+      .textContent!.replace(/\s+/g, ' ');
+    expect(testChoice).toContain('works exactly like a real restaurant');
+    expect(testChoice).toContain('its own reports');
+    expect(testChoice).toContain('marked as test orders');
+    expect(testChoice).toContain('left out of Dinify’s own portfolio and financial figures');
+    const screen = el().textContent!.replace(/\s+/g, ' ');
+    for (const retired of ['Excluded from every revenue figure', 'commercially invisible']) {
+      expect(screen).withContext(retired).not.toContain(retired);
+    }
     flush();
   }));
 

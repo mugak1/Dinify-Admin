@@ -405,8 +405,9 @@ interface RestaurantCommon extends PaymentModeSummary {
   readonly status: LifecycleState;
   /**
    * PLATFORM-OWNED. `Restaurant.is_test` (migration `restaurants_app/0057`) marks a
-   * tenant that is not a real commercial customer. Distinct from `Order.is_test`,
-   * which marks one order as commercially invisible — see `LatestOrder`.
+   * tenant that is not a real commercial customer. It limits nothing: a test
+   * restaurant can do everything a live one can. Distinct from `Order.is_test`, which
+   * FLAGS one order — see `LatestOrder`.
    */
   readonly is_test: boolean;
   readonly readiness: ReadinessSummary;
@@ -468,9 +469,11 @@ export interface LatestOrder {
   readonly created_at: string | null;
   readonly order_status: OrderStatus;
   /**
-   * `Order.is_test` — operationally real, commercially invisible. True either because
-   * the tenant itself is a test tenant or because the order was a pre-go-live
-   * rehearsal. Different fact from `Restaurant.is_test`, and never inferred from it.
+   * `Order.is_test` — a FLAG, true either because the tenant itself is a test tenant
+   * or because the order was a pre-go-live rehearsal. At a test restaurant it limits
+   * nothing; only a test order at a REAL restaurant (a practice order) is left out of
+   * that restaurant's figures. Different fact from `Restaurant.is_test`, and never
+   * inferred from it.
    */
   readonly is_test: boolean;
 }
@@ -721,8 +724,9 @@ export const DEFAULT_PAGE_SIZE = 25;
  * ── `is_test` IS A JSON BOOLEAN, STRICTLY ─────────────────────────────────────────
  *
  * The server's `StrictBooleanField` refuses `1`, `"true"`, `"yes"` and `null`: a
- * tenant's test classification decides whether it appears in every revenue figure,
- * and that decision has to be made by an operator saying so. It is typed `boolean`
+ * tenant's test classification decides whether its orders are flagged test — which
+ * limits nothing while it is a test restaurant, and decides what counts once it is
+ * real — and that decision has to be made by an operator saying so. It is typed `boolean`
  * here and stated explicitly by the form — never inferred from the name, the
  * location, the owner, the environment or a mock convention.
  */

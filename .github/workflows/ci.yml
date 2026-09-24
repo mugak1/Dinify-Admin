@@ -30,6 +30,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # DEPENDENCY AUDIT, part 1 of 2 (D08 B2.1 — dependency-audit/README.md). Taken
+      # IMMEDIATELY after installation, before any repository code runs: it records the
+      # exact lock graph and installed tree this job validates, and refuses if the tree
+      # is not the lock graph. Offline. The scan at the end of this job is bound to it.
+      - name: Dependency audit — snapshot the installed inventory
+        run: npm run audit:snapshot
+
       - name: Type-check
         run: npm run type-check
 
@@ -53,6 +60,12 @@ jobs:
       - name: Claim-code gate
         run: npm run check:claim-code
 
+      # The dependency-audit evaluator's own regression matrix — offline and
+      # deterministic, fixtures only. Proves the policy can pass AND refuse; it does not
+      # scan anything and is not a substitute for the scan at the end of this job.
+      - name: Dependency-audit evaluator tests
+        run: npm run test:audit
+
       - name: Test
         run: npm run test:ci
 
@@ -65,3 +78,26 @@ jobs:
       # authentication bypass with a friendly name.
       - name: Mock-isolation gate
         run: npm run check:mock-isolation
+
+      # DEPENDENCY AUDIT, part 2 of 2 — part of THIS required check, not a separate one.
+      # Scans the snapshotted inventory (and the pinned scanner's own graph) against the
+      # public advisory database and enforces the policy: a high/critical finding
+      # anywhere, or any finding on a runtime (non-dev) package, fails `validate`; so does a scan
+      # that could not complete — a timeout, an error body, an unparseable or empty
+      # report, or an inventory that moved since the snapshot is never read as clean.
+      # Placed LAST so the application gates above still report when only the audit
+      # fails. No `if:`, no `continue-on-error`, no pipe: its exit status is the step's.
+      - name: Dependency audit — scan the validated inventory and enforce the policy
+        run: npm run audit:deps
+
+      # The complete raw scanner output, the inventory and the decision, kept whether the
+      # job passed or not. `always()` here only retains evidence; it cannot turn a failed
+      # step green.
+      - name: Retain the dependency-audit evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dependency-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dependency-audit/evidence/
+          if-no-files-found: warn
+          retention-days: 30

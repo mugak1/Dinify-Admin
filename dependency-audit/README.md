@@ -57,9 +57,10 @@ exit status the body contradicts, or an inventory that moved since the snapshot 
 read as clean. npm uses exit 1 both for "vulnerabilities found" and for "the audit
 failed", so the status is only accepted when the body agrees with it.
 
-**The invocation is hardened because narrowing is invisible.** Measured on main: with an
-inherited `NODE_ENV=production`, `npm audit --json` reported **zero** vulnerabilities for a
-graph with five, while `metadata.dependencies.total` still counted all 794 packages. So
+**The invocation is hardened because narrowing is invisible.** Measured on main
+(`3521ebd`): with an inherited `NODE_ENV=production`, `npm audit --json` reported **zero**
+vulnerable packages where it otherwise reports five (ten findings by advisory and path),
+while `metadata.dependencies.total` still counted all 794 packages. So
 the scanner runs with every dependency type `--include`d, `--package-lock=true`, the
 public registry named explicitly, and `NODE_ENV`, `NODE_OPTIONS` and every `npm_*`
 variable removed from its environment.

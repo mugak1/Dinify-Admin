@@ -1,10 +1,15 @@
 name: Dependency Audit
 
-# Weekly npm audit sweep so the audit-zero state cannot silently erode.
-# Scheduled + manual only — NOT triggered on PRs, so it never produces a PR check and
-# cannot become a required/blocking gate. Fails (firing GitHub's scheduled-workflow
-# notification) when a high/critical advisory is found; lower severities still print
-# to the run log for visibility. Mirrors Dinify-Frontend's audit.yml.
+# A SCHEDULED RE-SCAN of main, using the SAME evaluator and policy as the required
+# check. Since D08 B2.1 the audit is enforced inside `validate` (ci.yml) on every pull
+# request and every push to main; this workflow exists because advisories are published
+# between merges, so a clean scan last week says nothing about today.
+#
+# It is not a required check and it deploys nothing: deploy.yml triggers on the
+# workflow named "CI" and re-verifies that the triggering run is .github/workflows/ci.yml,
+# so a green run of THIS workflow cannot stand in for complete application validation.
+# A failure (blocking findings, or a scan that could not complete) fires GitHub's
+# scheduled-workflow notification.
 on:
   schedule:
     - cron: '30 6 * * 1'   # Mondays 06:30 UTC (09:30 EAT)
@@ -27,5 +32,17 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Audit dependencies
-        run: npm audit --audit-level=high
+      - name: Dependency audit — snapshot the installed inventory
+        run: npm run audit:snapshot
+
+      - name: Dependency audit — scan and enforce the policy
+        run: npm run audit:deps
+
+      - name: Retain the dependency-audit evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dependency-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dependency-audit/evidence/
+          if-no-files-found: warn
+          retention-days: 30

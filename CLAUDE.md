@@ -177,8 +177,13 @@ not exist, and this repo renders that truth rather than filling the column:
 - **There is no `overrides` block, and none is needed.** The sibling's four entries
   (`lodash-es`, gaxios's `uuid`, `@grpc/grpc-js`, `esbuild`) exist to hold
   `firebase-tools` / `ng2-charts` / `gaxios` transitives at audit-zero. None of those
-  packages are dependencies here, and `npm audit` reports 0 vulnerabilities without
-  them.
+  packages are dependencies here. **CORRECTION (D08 B2.1): this bullet used to add that
+  `npm audit` reports 0 vulnerabilities without them. It did not.** A fresh scan of
+  `3521ebd` found five HIGH findings (four `fast-uri` 3.1.5 advisories via `ajv` 8, which
+  `@angular-devkit/core` pulls in; `js-yaml` 4.3.1 via `@eslint/eslintrc`) and five moderate
+  (`hono`, `qs`), all in dev tooling. They
+  were closed by an in-range, lock-only `npm update` — still no override needed — and the
+  claim is now made by the required audit on every run rather than by this file.
 
 ### No component library, no icon package
 Inline SVG only. `lucide-angular` is absent by design — the sibling removed it in
@@ -1951,14 +1956,21 @@ Before raising a PR:
    no production statement or template tag writes a raw owner claim code to storage, a
    log, a URL, router state, the workspace store or a canonical model, and none assembles
    a claim link — see "Restaurant Creation and the Owner Claim Code")
-5. `npm run test:ci` — headless Chrome
-6. `npm run build:prod` — zero errors
-7. `npm run check:mock-isolation` — **after** the build; it scans `dist/`
+5. `npm run test:audit` — the dependency-audit evaluator's regression matrix, OFFLINE
+   (fixtures only; it scans nothing)
+6. `npm run test:ci` — headless Chrome
+7. `npm run build:prod` — zero errors
+8. `npm run check:mock-isolation` — **after** the build; it scans `dist/`
+9. `npm run audit:deps` — the dependency audit, NETWORK. Bound to the inventory
+   `npm run audit:snapshot` recorded right after `npm ci`; a scan that cannot complete
+   FAILS, it is never skipped. See "Dependency Audit" below
 
 `.github/workflows/ci.yml` (job `validate`, on `pull_request` to `main` **and on push
-to `main`**) runs all seven on Node 20 with plain `npm ci`. `.github/workflows/audit.yml`
-runs a weekly `npm audit --audit-level=high` — scheduled and manual only, never a PR
-check.
+to `main`**) runs all of them on Node 20 with plain `npm ci`, the snapshot directly
+after the install and the scan last. `.github/workflows/audit.yml` is a weekly
+re-scan of main with the SAME evaluator — scheduled and manual only, never a PR check,
+and consumed by nothing (deploy.yml triggers on the workflow named "CI" and re-verifies
+the run is `ci.yml` by path).
 
 **The push-to-`main` trigger is load-bearing for deployment, not redundant with the PR
 one.** A PR's CI runs against a merge preview of the branch with main as it was then;
@@ -1966,7 +1978,36 @@ the commit that actually lands on main was never itself tested. `deploy.yml` cer
 its target against a successful `ci.yml` run whose `head_branch` is `main`, so it is
 gating on the commit it is actually shipping. Do not remove that trigger.
 
-`deploy.yml` is NOT part of CI and is never a PR check — it is `workflow_dispatch` only.
+`deploy.yml` is NOT part of CI and is never a PR check — it runs on `workflow_run` after
+a successful CI push to main, or on `workflow_dispatch`.
+
+### Dependency Audit — D08 B2.1
+
+`dependency-audit/` (README there) makes the audit a real input to `validate`:
+
+- **What is audited is what was validated.** `audit:snapshot` records the lock graph and
+  proves the installed tree IS that graph (every locked-but-absent package explained by
+  platform, engines or a pruned optional subtree); `audit:deps` refuses to scan anything
+  else and re-checks the inventory before and after each scan. It scans the application
+  graph and the pinned scanner's own graph (npm 11.19.1, installed from its own lockfile
+  with scripts disabled).
+- **Four outcomes, one policy, shared with Frontend and Backend:** `within_policy` 0,
+  `exceptions_only` 0, `blocking` 1, `incomplete` 2. High/critical blocks in every scope,
+  any runtime advisory blocks, lower-severity tooling is TRIAGE REQUIRED (visible, never
+  "zero findings"), and anything unevaluable is incomplete. `conformance.json` is
+  byte-identical in all three repos and its digest is pinned in each suite.
+- **The scanner is invoked hardened because narrowing is invisible** — measured on main:
+  an inherited `NODE_ENV=production` made `npm audit` report zero vulnerable packages where
+  it otherwise reports five, while still counting every package.
+- **Nothing is pre-approved.** `policy.json → records` is empty; an exception or triage
+  record must name the exact advisory/package/version/paths/scope, carry evidence, an
+  owner, a linked mugak1 review and an expiry ≤ 90 days, and is refused otherwise.
+- **The raw evidence is retained** as the artifact `dependency-audit-<run>-<attempt>`,
+  pass or fail.
+- **What it does not do:** bind a fresh audit to the artifact a deploy promotes (the deploy
+  re-installs from the same lockfile but does not re-audit), audit GitHub Actions or
+  the runner image, or change branch protection. Those, and the mock-isolation scanner's
+  self-test/coverage work, are later B2 deliveries.
 
 ## Deployment — 0C.1 AND 0C.2 BOTH ACCEPTED
 

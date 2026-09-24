@@ -227,4 +227,51 @@ describe('the range subset', () => {
     assert.equal(satisfies('1.0.0', 'latest'), null);
     assert.equal(satisfies('not-a-version', '>=1.0.0'), null);
   });
+
+  // Codex review on #698: npm evaluates advisory ranges with `includePrerelease`, under
+  // which node-semver floors every lower bound it DERIVES from a partial version at the
+  // lowest prerelease (`>=1.0` is `>=1.0.0-0`). Reading `>=1.0` as `>=1.0.0` dropped a
+  // prerelease node npm itself calls vulnerable. Every literal below was checked against
+  // the scanner's own node-semver with npm's options.
+  it('REGRESSION: a lower bound derived from a partial version admits its prereleases, as npm does', () => {
+    assert.equal(satisfies('1.0.0-beta.1', '>=1.0'), true);
+    assert.equal(satisfies('1.2.0-rc.1', '^1.2'), true);
+    assert.equal(satisfies('1.2.0-rc.1', '~1.2'), true);
+    assert.equal(satisfies('1.0.0-0', '1.x'), true);
+    assert.equal(satisfies('1.0.0-0', '1'), true);
+    assert.equal(satisfies('1.3.0-alpha', '>1.2'), true);
+    assert.equal(satisfies('1.2.3-beta', '1.2.3 - 2'), true, 'a hyphen range floors its start even when it is a full version');
+  });
+
+  it('CONTROL: a lower bound STATED as a full version keeps exactly what it says', () => {
+    assert.equal(satisfies('1.0.0-beta.1', '>=1.0.0'), false);
+    assert.equal(satisfies('1.0.0-beta.1', '>=1.0.0 <2'), false);
+    assert.equal(satisfies('1.2.3-beta', '^1.2.3'), false);
+    assert.equal(satisfies('1.2.3-beta', '~1.2.3'), false);
+    assert.equal(satisfies('0.9.9', '>=1.0'), false);
+    assert.equal(satisfies('2.0.0-0', '1.x'), false, 'the derived upper bound is exclusive of its own floor');
+  });
+
+  it('CONTRACT: a partial node-semver refuses to read is null, not a guess', () => {
+    assert.equal(satisfies('1.2.2', '1.x.2'), null);
+    assert.equal(satisfies('1.2.0', '>=1.2-beta'), null);
+  });
+
+  it('REGRESSION: a runtime prerelease keeps its attribution beside a matching tooling copy', () => withProject({
+    extraLock: {
+      'node_modules/shipped': { version: '2.0.0', resolved: 'https://registry.npmjs.org/shipped/-/shipped-2.0.0.tgz', integrity: 'sha512-AAAA', dependencies: { dup: '^1.0.0-beta.1' } },
+      'node_modules/dup': { version: '1.0.0-beta.1', integrity: 'sha512-FFFF' },
+      'node_modules/tool/node_modules/dup': { version: '1.2.0', dev: true, integrity: 'sha512-GGGG' },
+    },
+  }, ({ root }) => {
+    // The attribution rule keeps only the nodes the range names whenever ANY node matches,
+    // so a mis-read prerelease is not over-attributed back in: it is silently dropped, and
+    // a moderate advisory on shipped code read as build-only triage.
+    const inv = inventory(root, { graph: 'application', env: LINUX });
+    assert.deepEqual(inv.problems, []);
+    const nodes = ['node_modules/dup', 'node_modules/tool/node_modules/dup'];
+    const r = decide({ status: 1, stdout: npmReport({ dup: { name: 'dup', severity: 'moderate', via: [via('dup', 'moderate', '>=1.0')], nodes } }, inv.counts.locked) }, inv);
+    assert.deepEqual(r.findings.map((f) => [f.path, f.scope]).sort(), [['application:node_modules/dup', 'runtime'], ['application:node_modules/tool/node_modules/dup', 'tooling']]);
+    assert.equal(r.outcome, 'blocking', 'a runtime advisory blocks at any severity');
+  }));
 });

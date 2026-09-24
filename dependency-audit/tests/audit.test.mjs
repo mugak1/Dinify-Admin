@@ -190,6 +190,72 @@ describe('re-deciding retained evidence', () => {
   }));
 });
 
+describe('an invalid policy is incomplete on every path, never a crash', () => {
+  // Codex review on #698: loadPolicy recorded `policy_invalid` and still returned the
+  // object, every caller guarded on a truthy policy, and `capture` then read
+  // `policy.target.nodeMajor` — so a parseable policy with a missing or null target
+  // (or an array for a policy) crashed `snapshot` with a TypeError instead of
+  // reporting itself, and re-deciding retained evidence crashed on those and on a
+  // missing scanner too. An uncaught throw is not one of the four outcomes.
+  const SHAPES = {
+    'no target': (p) => { delete p.target; },
+    'a null target': (p) => { p.target = null; },
+    'a target that is not an object': (p) => { p.target = '24'; },
+    'no scanner': (p) => { delete p.scanner; },
+    'a null scanner': (p) => { p.scanner = null; },
+    'records that are not a list': (p) => { p.records = { a: 1 }; },
+    'an array for a policy': () => [],
+  };
+  const breakPolicy = (root, mutate) => {
+    const file = join(root, 'dependency-audit', 'policy.json');
+    const policy = JSON.parse(readFileSync(file, 'utf8'));
+    writeFileSync(file, JSON.stringify(mutate(policy) ?? policy));
+  };
+  const onlyPolicyInvalid = (problems, label) => {
+    assert.ok(problems.length > 0, label);
+    // Exactly the named problem — not a spurious target_mismatch read off a malformed target.
+    assert.deepEqual([...new Set(problems.map((x) => x.code))], ['policy_invalid'], `${label}: ${JSON.stringify(problems)}`);
+  };
+  const refuseToRun = () => { throw new Error('an invalid policy must not reach the scanner'); };
+
+  it('REGRESSION: the snapshot reports it, is still written, and the audit after it is incomplete', () => {
+    for (const [label, mutate] of Object.entries(SHAPES)) run({}, (p) => {
+      breakPolicy(p.root, mutate);
+      const snap = snapshot(p.root, { evidenceDir: p.evidence, now: NOW });
+      assert.equal(snap.ok, false, label);
+      onlyPolicyInvalid(snap.problems, label);
+      const written = JSON.parse(readFileSync(join(p.evidence, 'snapshot.json'), 'utf8'));
+      assert.deepEqual(written.problems, snap.problems, `${label}: the evidence says why`);
+      const result = audit(p.root, { evidenceDir: p.evidence, now: NOW, runner: refuseToRun, installScanner: refuseToRun });
+      assert.equal(result.outcome, 'incomplete', label);
+      assert.equal(result.exitCode, 2, label);
+    });
+  });
+
+  it('REGRESSION: a policy broken after a valid snapshot scans nothing and is incomplete', () => {
+    for (const [label, mutate] of Object.entries(SHAPES)) run({}, (p) => {
+      assert.equal(snapshot(p.root, { evidenceDir: p.evidence, now: NOW }).ok, true, label);
+      breakPolicy(p.root, mutate);
+      const result = audit(p.root, { evidenceDir: p.evidence, now: NOW, runner: refuseToRun, installScanner: refuseToRun });
+      assert.equal(result.outcome, 'incomplete', label);
+      assert.equal(result.exitCode, 2, label);
+      onlyPolicyInvalid(result.reasons, label);
+    });
+  });
+
+  it('REGRESSION: re-deciding retained evidence under an invalid policy is incomplete', () => {
+    for (const [label, mutate] of Object.entries(SHAPES)) run({}, (p) => {
+      snapshot(p.root, { evidenceDir: p.evidence, now: NOW });
+      assert.equal(scan(p, { application: CLEAN, scanner: CLEAN_SCANNER }).result.outcome, 'within_policy', label);
+      breakPolicy(p.root, mutate);
+      const result = reevaluate(p.root, { evidenceDir: p.evidence, now: NOW });
+      assert.equal(result.outcome, 'incomplete', label);
+      assert.equal(result.exitCode, 2, label);
+      onlyPolicyInvalid(result.reasons, label);
+    });
+  });
+});
+
 describe('the committed policy of THIS repository', () => {
   const ROOT = resolve(new URL('../..', import.meta.url).pathname);
   const policy = JSON.parse(readFileSync(join(ROOT, 'dependency-audit/policy.json'), 'utf8'));

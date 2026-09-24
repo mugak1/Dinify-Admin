@@ -41,7 +41,16 @@ const readJson = (path) => JSON.parse(readFileSync(path, 'utf8'));
 const writeJson = (path, value) => writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
 const canonical = (value) => JSON.stringify(value, Object.keys(value ?? {}).sort());
 
-/** The committed policy, validated. Returns {policy, problems}. */
+/**
+ * The committed policy, validated. Returns {policy, problems}.
+ *
+ * `policy` is null whenever ANY problem was recorded, not only when the file will not
+ * parse. Every caller guards on a truthy policy and then dereferences `target`, `scanner`
+ * and `records`, so handing back an object that failed validation turns a named
+ * `policy_invalid` into an uncaught TypeError — an audit that crashes instead of
+ * reporting itself incomplete. An invalid policy is no policy: the problems carry the
+ * explanation, and the outcome is `incomplete` (exit 2) on every path.
+ */
 export function loadPolicy(root) {
   const path = join(root, 'dependency-audit', 'policy.json');
   const problems = [];
@@ -67,7 +76,7 @@ export function loadPolicy(root) {
     if (!Number.isInteger(s.timeoutSeconds) || s.timeoutSeconds < 30 || s.timeoutSeconds > 900) p('scanner.timeoutSeconds must be 30..900');
   }
   if (!Array.isArray(policy.records)) p('records must be a list (it may be empty)');
-  return { policy, problems };
+  return { policy: problems.length ? null : policy, problems };
 }
 
 /** The real process runner. Output is captured whole; nothing is piped through a formatter. */

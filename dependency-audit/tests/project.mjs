@@ -8,9 +8,11 @@
  * scanner is exercised separately, against the real graph, by `npm run audit:deps`.
  */
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+
+import { audit, snapshot, verifyScannerPin } from '../lib/audit.mjs';
 
 export const SCANNER_VERSION = '11.19.1';
 
@@ -64,13 +66,30 @@ export function makeProject({ nodeMajor = Number(process.versions.node.split('.'
   return { root, evidence: join(root, 'dependency-audit', 'evidence'), cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
-/** An `npm audit --json` body for `total` locked packages. */
+const SEVERITIES = ['info', 'low', 'moderate', 'high', 'critical'];
+
+/**
+ * An `npm audit --json` body for `total` locked packages, written the way npm writes one:
+ * each entry names itself, carries the most severe of its own advisories unless the
+ * fixture states a severity, and the counters count entries by severity. These bodies
+ * used to count zero by severity whatever they listed — a shape npm never writes, and
+ * one the reader now refuses — so a fixture has to be internally consistent to test
+ * anything but that refusal.
+ */
 export function npmReport(vulnerabilities = {}, total = 4) {
+  const body = {};
+  const counted = { info: 0, low: 0, moderate: 0, high: 0, critical: 0 };
+  for (const [name, entry] of Object.entries(vulnerabilities)) {
+    const own = (entry.via ?? []).filter((v) => v && typeof v === 'object').map((v) => v.severity);
+    const severity = 'severity' in entry ? entry.severity : SEVERITIES.filter((s) => own.includes(s)).at(-1);
+    body[name] = { name, ...entry, ...(severity === undefined ? {} : { severity }) };
+    if (severity in counted) counted[severity] += 1;
+  }
   return JSON.stringify({
     auditReportVersion: 2,
-    vulnerabilities,
+    vulnerabilities: body,
     metadata: {
-      vulnerabilities: { info: 0, low: 0, moderate: 0, high: 0, critical: 0, total: Object.keys(vulnerabilities).length },
+      vulnerabilities: { ...counted, total: Object.keys(body).length },
       dependencies: { prod: 1, dev: 3, optional: 1, peer: 0, peerOptional: 0, total },
     },
   });
@@ -96,3 +115,38 @@ export function cannedRunner(byGraph) {
 export const CLEAN = { status: 0, stdout: npmReport({}, 4) };
 export const CLEAN_SCANNER = { status: 0, stdout: npmReport({}, 2) };
 export const NOW = '2026-09-24T12:00:00.000Z';
+
+/**
+ * SYNTHETIC answers for the unaccounted-vulnerability boundary, shared by the orchestration
+ * suite and each repository's workflow suite. Internally consistent (counters, severity,
+ * exit status, real fixture paths), so the only flaw is the one under test.
+ */
+export const HIGH_RUNTIME_MISSING_CAUSE = { status: 1, stdout: npmReport({ shipped: { severity: 'high', via: ['missing-cause'], nodes: ['node_modules/shipped'] } }) };
+export const UNGROUNDED_CYCLE = { status: 1, stdout: npmReport({
+  tool: { severity: 'high', via: ['helper'], nodes: ['node_modules/tool'] },
+  helper: { severity: 'high', via: ['tool'], nodes: ['node_modules/tool/node_modules/helper'] },
+}) };
+export const SUPPORTED_CHAIN = { status: 1, stdout: npmReport({
+  tool: { severity: 'moderate', via: ['helper'], nodes: ['node_modules/tool'] },
+  helper: { severity: 'moderate', via: [via('helper', 'moderate', '>=3.0.0 <3.2.0')], nodes: ['node_modules/tool/node_modules/helper'] },
+}) };
+
+/** Installation of the pinned scanner, minus the network: the pin is still verified. */
+export const fakeInstall = ({ scannerRoot, policy }) => ({ problems: verifyScannerPin(scannerRoot, policy), summary: { status: 0 } });
+
+/**
+ * A fixture project that has been through snapshot → audit() with `answer` injected at the
+ * runner seam, and has THIS directory's real CLI installed beside its policy — so the
+ * CLI's ROOT and evidence directory are the fixture's own. `evaluateCommand` is the shell
+ * that runs that CLI's `evaluate` over the retained evidence.
+ */
+export function auditedProject(answer) {
+  const p = makeProject({});
+  snapshot(p.root, { evidenceDir: p.evidence, now: NOW });
+  const result = audit(p.root, { evidenceDir: p.evidence, now: NOW, runner: cannedRunner({ application: answer, scanner: CLEAN_SCANNER }), installScanner: fakeInstall });
+  const here = new URL('..', import.meta.url).pathname;
+  const cli = join(p.root, 'dependency-audit', 'cli.mjs');
+  cpSync(join(here, 'cli.mjs'), cli);
+  cpSync(join(here, 'lib'), join(p.root, 'dependency-audit', 'lib'), { recursive: true });
+  return { ...p, result, cli, evaluateCommand: `exec "${process.execPath}" "${cli}" evaluate` };
+}

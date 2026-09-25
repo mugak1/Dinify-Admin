@@ -10,10 +10,11 @@
  */
 
 import { strict as assert } from 'node:assert';
-import { readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { auditedProject, HIGH_RUNTIME_MISSING_CAUSE, SUPPORTED_CHAIN } from './project.mjs';
 import { commandOf, loadWorkflow, runStep, simulateJob, statusSwallowers } from './workflow-harness.mjs';
 
 const ROOT = resolve(new URL('../..', import.meta.url).pathname);
@@ -119,6 +120,83 @@ describe('an audit failure reaches the required check — executed, not asserted
     assert.equal(runStep(`${SCAN} | tee audit.log\n`, { npmExit: 2 }).status, 0);
     assert.deepEqual(statusSwallowers(`${SCAN} | tee audit.log`), ['a pipe or `||`']);
     assert.notEqual(runStep(`${SCAN} | tee audit.log\n`, { npmExit: 2, shell: ['bash', '-eo', 'pipefail'] }).status, 0);
+  });
+});
+
+describe('an unaccounted vulnerability fails `validate` — decided by the real evaluator, carried by the real step', () => {
+  // The chain is EXECUTED, not assumed, three links long:
+  //   1. the real audit() decides a SYNTHETIC answer injected at its runner seam, and
+  //      leaves its evidence on disk;
+  //   2. the `npm run audit:deps` step exactly as `validate` declares it runs under the
+  //      runner's default shell, with `npm` answered by the REAL `evaluate` command over
+  //      that evidence — so the step's status is the evaluator's own exit status;
+  //   3. GitHub's step sequencing over the actual `validate` steps turns that status into
+  //      the job's conclusion.
+  const scanStep = VALIDATE[indexOfRun(VALIDATE, SCAN)];
+  const retainStep = VALIDATE.find((s) => s.name === 'Retain the dependency-audit evidence');
+  const within = (answer, fn) => { const p = auditedProject(answer); try { return fn(p); } finally { p.cleanup(); } };
+  const validateWith = (p) => {
+    const step = runStep(scanStep.run, { npmBody: p.evaluateCommand });
+    const invoked = [];
+    const job = simulateJob(VALIDATE, (s) => {
+      invoked.push(s);
+      if (s === scanStep) return step.status === 0 ? 'success' : 'failure';
+      return 'success';
+    });
+    return { step, job, invoked };
+  };
+
+  it('REGRESSION MATRIX: a HIGH runtime entry whose cause the report does not list turns `validate` red with status 2', () => within(HIGH_RUNTIME_MISSING_CAUSE, (p) => {
+    assert.equal(p.result.outcome, 'incomplete');
+    const { step, job } = validateWith(p);
+    assert.equal(step.status, 2, step.stdout + step.stderr);
+    assert.match(step.stdout, /scanner_dangling_cause/);
+    assert.equal(job.conclusion, 'failure');
+  }));
+
+  it('CONTROL: the same path with a supported dependency chain is a green `validate`', () => within(SUPPORTED_CHAIN, (p) => {
+    const { step, job } = validateWith(p);
+    assert.equal(step.status, 0, step.stdout + step.stderr);
+    assert.equal(job.conclusion, 'success');
+  }));
+
+  it('REGRESSION MATRIX: the evidence is retained on that failure, and `if: always()` does not rescue the job', () => within(HIGH_RUNTIME_MISSING_CAUSE, (p) => {
+    const { job } = validateWith(p);
+    assert.equal(retainStep.if, 'always()');
+    assert.deepEqual(job.ran.find(([name]) => name === retainStep.name), [retainStep.name, 'success'], 'the evidence step ran after the failure');
+    assert.equal(job.conclusion, 'failure', 'collecting the evidence did not turn the job green');
+    // What that step collects is on disk and says why: the raw answer, byte for byte, and
+    // a result that names the unaccounted cause.
+    assert.equal(retainStep.with.path, 'dependency-audit/evidence/');
+    assert.equal(readFileSync(join(p.evidence, 'application.scanner-stdout.txt'), 'utf8'), HIGH_RUNTIME_MISSING_CAUSE.stdout);
+    const result = JSON.parse(readFileSync(join(p.evidence, 'result.json'), 'utf8'));
+    assert.equal(result.outcome, 'incomplete');
+    assert.ok(result.reasons.some((r) => r.code === 'scanner_dangling_cause'));
+    assert.ok(existsSync(join(p.evidence, 'collection.json')) && existsSync(join(p.evidence, 'snapshot.json')));
+    // And a retention step that itself failed would not make a failed job pass either.
+    assert.equal(simulateJob(VALIDATE, (s) => (s === retainStep || commandOf(s) === SCAN ? 'failure' : 'success')).conclusion, 'failure');
+  }));
+
+  it('CONTRACT: nothing that ran holds a credential — `validate` references no secret and requests no OIDC token', () => within(HIGH_RUNTIME_MISSING_CAUSE, (p) => {
+    const { invoked } = validateWith(p);
+    assert.ok(invoked.length > 0);
+    for (const s of invoked) assert.doesNotMatch(JSON.stringify(s), /secrets\.|id-token/, s.name);
+    assert.doesNotMatch(readFileSync(WF('ci.yml'), 'utf8'), /secrets\.|id-token/);
+  }));
+
+  it('CONTRACT (static — Dinify-Admin has no workflow engine): a red `validate` reaches no deployment job', () => {
+    // deploy.yml's only automatic trigger is this workflow's completion, its first job
+    // proceeds on that trigger only for a SUCCESSFUL push run on main, and every other job
+    // needs it — so the credentialed job cannot start after a failed audit.
+    const jobs = DEPLOY.jobs;
+    const first = Object.entries(jobs).filter(([, j]) => j.needs === undefined);
+    assert.equal(first.length, 1);
+    const [firstName, firstJob] = first[0];
+    assert.match(String(firstJob.if), /github\.event\.workflow_run\.conclusion == 'success'/);
+    for (const [name, job] of Object.entries(jobs)) {
+      if (name === firstName) continue;
+      assert.ok([].concat(job.needs).includes(firstName), `${name} does not wait for ${firstName}`);
+    }
   });
 });
 

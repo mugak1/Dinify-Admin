@@ -10,7 +10,9 @@
  *                   so a new condition forces this harness to be revisited.
  *   runStep       — executes a step's actual `run:` text the way a GitHub runner does
  *                   when no `shell:` is given (`bash -e {0}`: errexit, NO pipefail), with
- *                   `npm` replaced by a stub that exits with a chosen status.
+ *                   `npm` replaced by a stub. The stub either exits with a chosen status or
+ *                   runs a real command, so the status the step sees can come from the real
+ *                   evaluator process rather than from a number the test picked.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -50,19 +52,24 @@ export function simulateJob(steps, outcomeOf) {
   return { conclusion: status, ran };
 }
 
-/** Run a step's `run:` text under a runner's default shell with a stub `npm`. */
-export function runStep(script, { npmExit, shell = ['bash', '-e'] } = {}) {
+/**
+ * Run a step's `run:` text under a runner's default shell with a stub `npm`.
+ * @param {object} options
+ * @param {number} [options.npmExit]  the status the stub exits with
+ * @param {string} [options.npmBody]  instead, the shell the stub runs (e.g. the real CLI)
+ */
+export function runStep(script, { npmExit, npmBody, shell = ['bash', '-e'] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'step-'));
   try {
     const stub = join(dir, 'npm');
-    writeFileSync(stub, `#!/bin/sh\necho "stub npm $*" >&2\nexit ${Number(npmExit)}\n`);
+    writeFileSync(stub, `#!/bin/sh\necho "stub npm $*" >&2\n${npmBody ?? `exit ${Number(npmExit)}`}\n`);
     chmodSync(stub, 0o755);
     const file = join(dir, 'step.sh');
     writeFileSync(file, script);
     const r = spawnSync(shell[0], [...shell.slice(1), file], {
       env: { PATH: `${dir}:/usr/bin:/bin`, HOME: dir }, cwd: dir, encoding: 'utf8', timeout: 30000,
     });
-    return { status: r.status, stderr: r.stderr };
+    return { status: r.status, stdout: r.stdout, stderr: r.stderr };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

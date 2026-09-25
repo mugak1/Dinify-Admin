@@ -5,12 +5,12 @@
  */
 
 import { strict as assert } from 'node:assert';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { evaluate } from '../lib/core.mjs';
-import { explainAbsences, inventory, readReport, resolveEdge, scannerArgs, scannerEnvironment } from '../lib/npm.mjs';
+import { AUDIT_LEVEL, explainAbsences, inventory, readReport, resolveEdge, scannerArgs, scannerEnvironment, sha256 } from '../lib/npm.mjs';
 import { satisfies } from '../lib/range.mjs';
 import { makeProject, npmReport, NOW, via } from './project.mjs';
 
@@ -111,7 +111,16 @@ describe('the scanner invocation cannot be narrowed by what it inherits', () => 
     assert.ok(args.includes('--json'));
     assert.ok(args.includes('--package-lock=true'), 'npm audit reads the lock graph; package-lock=false would switch it to an ideal tree');
     assert.ok(args.includes('--registry=https://registry.npmjs.org/'));
-    assert.ok(!args.some((a) => a.startsWith('--omit') || a.startsWith('--audit-level') || a === '--production'));
+    assert.ok(!args.some((a) => a.startsWith('--omit') || a === '--production'));
+  });
+
+  it('REGRESSION: the audit level the exit-status check assumes is pinned on the command line, once', () => {
+    // An npmrc the environment scrub cannot reach (`audit-level=none` in ~/.npmrc, measured
+    // with the pinned npm) made a five-moderate report exit 0, and the reader refused the
+    // contradiction as incomplete. The level is npm's default, so the body is unchanged.
+    assert.equal(AUDIT_LEVEL, 'low');
+    const levels = scannerArgs('https://registry.npmjs.org/').filter((a) => a.startsWith('--audit-level'));
+    assert.deepEqual(levels, [`--audit-level=${AUDIT_LEVEL}`]);
   });
 
   it('REGRESSION: an inherited NODE_ENV=production or npm_config_omit never reaches the scanner', () => {
@@ -273,5 +282,259 @@ describe('the range subset', () => {
     const r = decide({ status: 1, stdout: npmReport({ dup: { name: 'dup', severity: 'moderate', via: [via('dup', 'moderate', '>=1.0')], nodes } }, inv.counts.locked) }, inv);
     assert.deepEqual(r.findings.map((f) => [f.path, f.scope]).sort(), [['application:node_modules/dup', 'runtime'], ['application:node_modules/tool/node_modules/dup', 'tooling']]);
     assert.equal(r.outcome, 'blocking', 'a runtime advisory blocks at any severity');
+  }));
+});
+
+describe('every declared vulnerability is accounted for by evidence the report carries', () => {
+  // The scanner's answers below are SYNTHETIC unless a title says CAPTURED. They are
+  // internally consistent (counters, severities, exit status and inventory paths all
+  // agree) so each case isolates ONE flaw, and the refusal it expects comes from the
+  // decoder rather than from an unrelated count. They are malformed on purpose: healthy
+  // npm does not emit these shapes, and nothing here claims a Dinify scan did.
+  const captured = (file) => {
+    const doc = JSON.parse(readFileSync(new URL(`./fixtures/${file}`, import.meta.url), 'utf8'));
+    assert.equal(sha256(doc.stdout), doc.stdoutSha256, `${file}: the fixture is not the bytes that were captured`);
+    const inv = { packages: doc.packages.map(([path, version, scope]) => ({ path: `application:${path}`, version, scope })) };
+    return { run: { status: doc.status, stdout: doc.stdout }, inv, report: JSON.parse(doc.stdout) };
+  };
+
+  it('CONTROL (CAPTURED, Dinify-Admin 5074511): a real clean report of a 794-package inventory is within policy with zero findings', () => {
+    const c = captured('captured-admin-5074511.json');
+    assert.equal(c.inv.packages.length, 794);
+    const r = decide(c.run, c.inv);
+    assert.equal(r.outcome, 'within_policy', JSON.stringify(r.reasons));
+    assert.equal(r.counts.findings, 0);
+  });
+
+  it('CONTROL (CAPTURED, Dinify-Frontend 1e339ed): npm\'s own dependency chains are accepted and decided on the advisories they are traced to', () => {
+    // Real npm 11.19.1 output: firebase-tools is listed through three packages by NAME,
+    // and @google-cloud/pubsub through @opentelemetry/core — a two-level chain.
+    const c = captured('captured-frontend-1e339ed.json');
+    assert.deepEqual(c.report.vulnerabilities['firebase-tools'].via, ['@google-cloud/pubsub', 'csv-parse', 'stream-json']);
+    assert.deepEqual(c.report.vulnerabilities['@google-cloud/pubsub'].via, ['@opentelemetry/core']);
+    const read = readReport({ graph: 'application', run: c.run, inv: c.inv });
+    assert.deepEqual(read.problems, []);
+    const r = decide(c.run, c.inv);
+    assert.equal(r.outcome, 'within_policy', JSON.stringify(r.reasons));
+    // Five vulnerable packages, three advisories: one finding per advisory and path, and
+    // none for the packages listed only through a dependency.
+    assert.equal(Object.keys(c.report.vulnerabilities).length, 5);
+    assert.deepEqual(r.findings.map((f) => [f.package, f.advisory, f.scope, f.class]).sort(), [
+      ['@opentelemetry/core', 'GHSA-8988-4f7v-96qf', 'tooling', 'triage'],
+      ['csv-parse', 'GHSA-8cw4-87c7-c6xx', 'tooling', 'triage'],
+      ['stream-json', 'GHSA-528h-pc64-c93x', 'tooling', 'triage'],
+    ]);
+    assert.equal(r.counts.triageRequired, 3, 'lower-severity tooling findings stay visible — never zero findings');
+  });
+
+  describe('against a fixture project whose shipped package has runtime dependencies', () => withProject({
+    extraLock: {
+      'node_modules/shipped': { version: '2.0.0', resolved: 'https://registry.npmjs.org/shipped/-/shipped-2.0.0.tgz', integrity: 'sha512-AAAA', dependencies: { inner: '^1.0.0', dup: '^1.0.0' } },
+      'node_modules/inner': { version: '1.0.0', integrity: 'sha512-HHHH' },
+      'node_modules/dup': { version: '1.0.0', integrity: 'sha512-FFFF' },
+      'node_modules/tool/node_modules/dup': { version: '1.2.0', dev: true, integrity: 'sha512-GGGG' },
+    },
+  }, ({ root }) => {
+    const inv = inventory(root, { graph: 'application', env: LINUX });
+    const total = inv.counts.locked;
+    const answer = (vulns) => {
+      const body = npmReport(vulns, total);
+      const counts = JSON.parse(body).metadata.vulnerabilities;
+      return { status: ['low', 'moderate', 'high', 'critical'].some((s) => counts[s] > 0) ? 1 : 0, stdout: body };
+    };
+    const read = (vulns) => readReport({ graph: 'application', run: answer(vulns), inv });
+    const codes = (r) => r.problems.map((p) => p.code);
+    const on = { shipped: ['node_modules/shipped'], inner: ['node_modules/inner'], tool: ['node_modules/tool'], helper: ['node_modules/tool/node_modules/helper'], dup: ['node_modules/dup', 'node_modules/tool/node_modules/dup'] };
+
+    it('CONTROL: the fixture inventory is itself clean evidence', () => {
+      assert.deepEqual(inv.problems, []);
+      assert.equal(inv.packages.find((p) => p.name === 'inner').scope, 'runtime');
+    });
+
+    it('CONTROL: a genuinely empty package-name map, with consistent counters, is within policy', () => {
+      const r = decide(answer({}), inv);
+      assert.equal(r.outcome, 'within_policy');
+      assert.equal(r.counts.findings, 0);
+    });
+
+    it('CONTRACT: a complete direct advisory on a runtime package blocks', () => {
+      const r = decide(answer({ inner: { severity: 'low', via: [via('inner', 'low', '<2.0.0')], nodes: on.inner } }), inv);
+      assert.equal(r.outcome, 'blocking');
+      assert.deepEqual(r.findings.map((f) => [f.path, f.scope]), [['application:node_modules/inner', 'runtime']]);
+    });
+
+    it('CONTRACT: a supported TOOLING chain is decided on the advisory it is traced to — strings are not rejected', () => {
+      const r = decide(answer({
+        tool: { severity: 'moderate', via: ['helper'], nodes: on.tool, effects: [] },
+        helper: { severity: 'moderate', via: [via('helper', 'moderate', '>=3.0.0 <3.2.0')], nodes: on.helper, effects: ['tool'] },
+      }), inv);
+      assert.equal(r.outcome, 'within_policy', JSON.stringify(r.reasons));
+      assert.deepEqual(r.findings.map((f) => [f.package, f.path, f.class]), [['helper', 'application:node_modules/tool/node_modules/helper', 'triage']]);
+    });
+
+    it('CONTRACT: a supported RUNTIME chain keeps its runtime exposure and blocks', () => {
+      const r = decide(answer({
+        shipped: { severity: 'moderate', via: ['inner'], nodes: on.shipped, effects: [] },
+        inner: { severity: 'moderate', via: [via('inner', 'moderate', '<2.0.0')], nodes: on.inner, effects: ['shipped'] },
+      }), inv);
+      assert.equal(r.outcome, 'blocking');
+      assert.deepEqual(r.findings.map((f) => [f.package, f.scope]), [['inner', 'runtime']]);
+    });
+
+    it('CONTRACT: several advisories and paths behind several dependents — attributed per advisory and path, not per package', () => {
+      const r = decide(answer({
+        dup: { severity: 'high', via: [via('dup', 'moderate', '<2.0.0', 'GHSA-aaaa-bbbb-0001', 2001), via('dup', 'high', '>=1.2.0 <1.3.0', 'GHSA-aaaa-bbbb-0002', 2002)], nodes: on.dup, effects: ['shipped', 'tool'] },
+        shipped: { severity: 'moderate', via: ['dup'], nodes: on.shipped, effects: [] },
+        tool: { severity: 'high', via: ['dup'], nodes: on.tool, effects: [] },
+      }), inv);
+      assert.equal(r.outcome, 'blocking');
+      // Three vulnerable packages, three findings — but NOT one per package: the moderate
+      // advisory covers both installed copies, the high one only the copy in its range, and
+      // the two dependents add nothing of their own.
+      assert.deepEqual(r.findings.map((f) => [f.advisory, f.path, f.scope]).sort(), [
+        ['GHSA-aaaa-bbbb-0001', 'application:node_modules/dup', 'runtime'],
+        ['GHSA-aaaa-bbbb-0001', 'application:node_modules/tool/node_modules/dup', 'tooling'],
+        ['GHSA-aaaa-bbbb-0002', 'application:node_modules/tool/node_modules/dup', 'tooling'],
+      ]);
+    });
+
+    it('CONTRACT: a legitimate cycle that reaches an advisory is accepted, not refused for being a cycle', () => {
+      const r = decide(answer({
+        tool: { severity: 'moderate', via: [via('tool', 'moderate', '<2.0.0'), 'helper'], nodes: on.tool, effects: ['helper'] },
+        helper: { severity: 'moderate', via: ['tool'], nodes: on.helper, effects: ['tool'] },
+      }), inv);
+      assert.equal(r.outcome, 'within_policy', JSON.stringify(r.reasons));
+      assert.deepEqual(r.findings.map((f) => f.package), ['tool']);
+    });
+
+    it('REGRESSION: a HIGH runtime entry whose only cause the report does not list is incomplete, not zero findings', () => {
+      const answerIs = read({ shipped: { severity: 'high', via: ['missing-cause'], nodes: on.shipped } });
+      assert.deepEqual(answerIs.findings, []);
+      assert.ok(codes(answerIs).includes('scanner_dangling_cause'), JSON.stringify(answerIs.problems));
+      const r = evaluate({ incomplete: answerIs.problems, findings: answerIs.findings, records: [], now: NOW });
+      assert.equal(r.outcome, 'incomplete');
+      assert.equal(r.exitCode, 2);
+    });
+
+    it('REGRESSION: a string-only causal cycle with no advisory is incomplete, and a very long one neither hangs nor overflows', () => {
+      const small = read({ tool: { severity: 'high', via: ['helper'], nodes: on.tool }, helper: { severity: 'high', via: ['tool'], nodes: on.helper } });
+      assert.deepEqual(codes(small), ['scanner_ungrounded', 'scanner_ungrounded']);
+      assert.match(small.problems[0].detail, /loop back/);
+      // 20 000 entries in one ring, each vulnerable only via the next — far past any
+      // recursion limit, and a walk that followed a cycle would never finish.
+      const ring = {};
+      for (let i = 0; i < 20000; i += 1) ring[`p${i}`] = { severity: 'high', via: [`p${(i + 1) % 20000}`], nodes: on.tool };
+      const started = Date.now();
+      const big = read(ring);
+      assert.equal(big.problems.filter((p) => p.code === 'scanner_ungrounded').length, 20000);
+      assert.ok(Date.now() - started < 10000, 'the ring was decided in bounded time — a per-entry walk takes minutes');
+    });
+
+    it('REGRESSION: one valid finding beside one unaccounted entry is incomplete — the valid part does not hide the missing part', () => {
+      const answerIs = read({
+        helper: { severity: 'moderate', via: [via('helper', 'moderate', '>=3.0.0 <3.2.0')], nodes: on.helper },
+        shipped: { severity: 'high', via: ['missing-cause'], nodes: on.shipped },
+      });
+      assert.equal(answerIs.findings.length, 1, 'the valid finding is still reported');
+      const r = evaluate({ incomplete: answerIs.problems, findings: answerIs.findings, records: [], now: NOW });
+      assert.equal(r.outcome, 'incomplete');
+    });
+
+    it('REGRESSION: a vulnerabilities value that is not the package-name map is incomplete, whatever the counters say', () => {
+      for (const [label, value] of [['an empty list', []], ['a list', [{ name: 'shipped' }]], ['null', null], ['zero', 0], ['a string', 'shipped'], ['true', true]]) {
+        const listed = Array.isArray(value) ? value.length : 0;
+        const stdout = JSON.stringify({ auditReportVersion: 2, vulnerabilities: value, metadata: { vulnerabilities: { info: 0, low: 0, moderate: listed, high: 0, critical: 0, total: listed }, dependencies: { total } } });
+        const answerIs = readReport({ graph: 'application', run: { status: listed ? 1 : 0, stdout }, inv });
+        assert.deepEqual(codes(answerIs), ['scanner_shape'], `${label}: ${JSON.stringify(answerIs.problems)}`);
+        assert.equal(evaluate({ incomplete: answerIs.problems, findings: answerIs.findings, records: [], now: NOW }).exitCode, 2, label);
+      }
+    });
+
+    it('REGRESSION: malformed metadata and counters are a controlled incomplete result, never a TypeError', () => {
+      const base = () => ({ auditReportVersion: 2, vulnerabilities: {}, metadata: { vulnerabilities: { info: 0, low: 0, moderate: 0, high: 0, critical: 0, total: 0 }, dependencies: { total } } });
+      const shapes = {
+        'metadata null': (d) => { d.metadata = null; },
+        'metadata a list': (d) => { d.metadata = []; },
+        'dependencies null': (d) => { d.metadata.dependencies = null; },
+        'vulnerability counters null': (d) => { d.metadata.vulnerabilities = null; },
+        'vulnerability counters a list': (d) => { d.metadata.vulnerabilities = []; },
+        'a counter missing': (d) => { delete d.metadata.vulnerabilities.high; },
+        'a fractional counter': (d) => { d.metadata.vulnerabilities.low = 0.5; },
+        'a counter as a string': (d) => { d.metadata.vulnerabilities.total = '0'; },
+        'a negative counter': (d) => { d.metadata.vulnerabilities.info = -1; d.metadata.vulnerabilities.low = 1; },
+      };
+      for (const [label, mutate] of Object.entries(shapes)) {
+        const doc = base();
+        mutate(doc);
+        let answerIs;
+        assert.doesNotThrow(() => { answerIs = readReport({ graph: 'application', run: { status: 0, stdout: JSON.stringify(doc) }, inv }); }, label);
+        assert.equal(answerIs.problems.length, 1, `${label}: ${JSON.stringify(answerIs.problems)}`);
+        assert.equal(evaluate({ incomplete: answerIs.problems, findings: answerIs.findings, records: [], now: NOW }).outcome, 'incomplete', label);
+      }
+    });
+
+    it('REGRESSION: malformed entries and via members are named, never filtered out of a report that then passes', () => {
+      const good = via('helper', 'moderate', '>=3.0.0 <3.2.0');
+      const shapes = {
+        'an entry that is null': { helper: null },
+        'an entry that is a list': { helper: [] },
+        'an entry with no via': { helper: { severity: 'moderate', nodes: on.helper } },
+        'an entry with an empty via': { helper: { severity: 'moderate', via: [], nodes: on.helper } },
+        'a node that is not a path': { helper: { severity: 'moderate', via: [good], nodes: [...on.helper, 7] } },
+        'a numeric via member beside a valid advisory': { helper: { severity: 'moderate', via: [good, 42] } },
+        'a null via member beside a valid advisory': { helper: { severity: 'moderate', via: [good, null] } },
+        'a list as a via member beside a valid advisory': { helper: { severity: 'moderate', via: [good, []] } },
+        'a boolean via member beside a valid advisory': { helper: { severity: 'moderate', via: [good, true] } },
+        'an empty cause beside a valid advisory': { helper: { severity: 'moderate', via: [good, ''] } },
+        'an unknown entry severity': { helper: { severity: 'severe', via: [good] } },
+        'an advisory whose source is not an id': { helper: { severity: 'moderate', via: [{ ...good, source: { id: 1 } }] } },
+        'an advisory filed under another package': { helper: { severity: 'moderate', via: [{ ...good, name: 'shipped', dependency: 'shipped' }] } },
+        'an entry that names another package': { helper: { name: 'shipped', severity: 'moderate', via: [good] } },
+      };
+      for (const [label, vulns] of Object.entries(shapes)) {
+        for (const e of Object.values(vulns)) if (e && !Array.isArray(e) && !e.nodes && e.via) e.nodes = on.helper;
+        const counted = { info: 0, low: 0, moderate: 0, high: 0, critical: 0 };
+        for (const e of Object.values(vulns)) if (e && e.severity in counted) counted[e.severity] += 1;
+        if (!Object.values(counted).some(Boolean)) counted.moderate = 1;
+        const stdout = JSON.stringify({ auditReportVersion: 2, vulnerabilities: vulns, metadata: { vulnerabilities: { ...counted, total: 1 }, dependencies: { total } } });
+        let answerIs;
+        assert.doesNotThrow(() => { answerIs = readReport({ graph: 'application', run: { status: 1, stdout }, inv }); }, label);
+        assert.ok(answerIs.problems.length > 0, `${label}: nothing was said`);
+        const r = evaluate({ incomplete: answerIs.problems, findings: answerIs.findings, records: [], now: NOW });
+        assert.equal(r.outcome, 'incomplete', `${label}: ${JSON.stringify(r.reasons)}`);
+      }
+    });
+
+    it('REGRESSION: counters that do not describe the entries are incomplete', () => {
+      const stdout = JSON.stringify({ auditReportVersion: 2, vulnerabilities: JSON.parse(npmReport({ tool: { severity: 'low', via: [via('tool', 'low', '<2.0.0')], nodes: on.tool } }, total)).vulnerabilities,
+        metadata: { vulnerabilities: { info: 0, low: 0, moderate: 0, high: 1, critical: 0, total: 1 }, dependencies: { total } } });
+      const answerIs = readReport({ graph: 'application', run: { status: 1, stdout }, inv });
+      assert.ok(codes(answerIs).includes('scanner_inconsistent'), JSON.stringify(answerIs.problems));
+    });
+
+    it('REGRESSION: an entry more severe than every advisory it is traced to is incomplete — the HIGH is not accounted for', () => {
+      const answerIs = read({
+        tool: { severity: 'high', via: ['helper'], nodes: on.tool },
+        helper: { severity: 'moderate', via: [via('helper', 'moderate', '>=3.0.0 <3.2.0')], nodes: on.helper },
+      });
+      assert.deepEqual(codes(answerIs), ['scanner_unaccounted']);
+    });
+
+    it('REGRESSION: a runtime entry traced only to tooling paths is incomplete — its runtime exposure is not silently lost', () => {
+      const answerIs = read({
+        shipped: { severity: 'moderate', via: ['helper'], nodes: on.shipped },
+        helper: { severity: 'moderate', via: [via('helper', 'moderate', '>=3.0.0 <3.2.0')], nodes: on.helper },
+      });
+      assert.deepEqual(codes(answerIs), ['scanner_unattributed']);
+      assert.equal(answerIs.findings[0].scope, 'tooling', 'the only finding the report supports is a tooling one');
+    });
+
+    it('CONTRACT: the exit status follows npm\'s own rule — an info-only report exits 0 and is read, and 1 there is inconsistent', () => {
+      const body = npmReport({ tool: { severity: 'info', via: [via('tool', 'info', '<2.0.0')], nodes: on.tool } }, total);
+      const r = decide({ status: 0, stdout: body }, inv);
+      assert.equal(r.outcome, 'within_policy', JSON.stringify(r.reasons));
+      assert.equal(r.counts.triageRequired, 1, 'an info finding is visible, not zero findings');
+      assert.ok(codes(readReport({ graph: 'application', run: { status: 1, stdout: body }, inv })).includes('scanner_inconsistent'));
+    });
   }));
 });

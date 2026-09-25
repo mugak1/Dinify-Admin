@@ -7,14 +7,16 @@
  */
 
 import { strict as assert } from 'node:assert';
+import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { audit, reevaluate, renderSummary, snapshot, verifyScannerPin } from '../lib/audit.mjs';
-import { CLEAN, CLEAN_SCANNER, cannedRunner, makeProject, npmReport, NOW, via } from './project.mjs';
+import { audit, reevaluate, renderSummary, snapshot } from '../lib/audit.mjs';
+import {
+  auditedProject, CLEAN, CLEAN_SCANNER, cannedRunner, fakeInstall, HIGH_RUNTIME_MISSING_CAUSE, makeProject, npmReport, NOW, SUPPORTED_CHAIN, UNGROUNDED_CYCLE, via,
+} from './project.mjs';
 
-const fakeInstall = ({ scannerRoot, policy }) => ({ problems: verifyScannerPin(scannerRoot, policy), summary: { status: 0 } });
 
 function run(options, fn) {
   const p = makeProject(options);
@@ -39,6 +41,7 @@ describe('snapshot → audit', () => {
       assert.equal(call.command, process.execPath);
       assert.match(call.args[0], /dependency-audit[\\/]scanner[\\/]node_modules[\\/]npm[\\/]bin[\\/]npm-cli\.js$/);
       assert.ok(call.args.includes('--include=dev'));
+      assert.ok(call.args.includes('--audit-level=low'), 'the level the status check assumes is the level the scanner runs at');
       assert.equal(call.env.NODE_ENV, undefined);
     }
     const collection = JSON.parse(readFileSync(join(p.evidence, 'collection.json'), 'utf8'));
@@ -297,6 +300,44 @@ describe('retained evidence that is not a document is incomplete, never clean', 
       assert.equal(runner.calls.length, 0, `${label}: nothing is scanned`);
     });
   });
+});
+
+describe('an unaccounted vulnerability reaches the final outcome — through audit() and the evaluate command', () => {
+  // The scanner answers are SYNTHETIC (project.mjs), injected at the runner seam audit()
+  // already has. The evaluate command is the real CLI, run as its own process.
+  const evaluateCommand = (p) => spawnSync(process.execPath, [p.cli, 'evaluate'], { encoding: 'utf8' });
+  const within = (answer, fn) => { const p = auditedProject(answer); try { return fn(p); } finally { p.cleanup(); } };
+
+  it('REGRESSION: a HIGH runtime entry with a cause the report does not list is incomplete end to end, and its raw output is kept', () => within(HIGH_RUNTIME_MISSING_CAUSE, (p) => {
+    const { result } = p;
+    assert.equal(result.outcome, 'incomplete', JSON.stringify(result.reasons));
+    assert.equal(result.exitCode, 2);
+    assert.equal(result.counts.findings, 0, 'nothing was invented to stand for the missing cause');
+    assert.ok(result.reasons.some((r) => r.code === 'scanner_dangling_cause' && /missing-cause/.test(r.detail)));
+    assert.match(result.headline, /NOT A CLEAN RESULT/);
+    assert.equal(readFileSync(join(p.evidence, 'application.scanner-stdout.txt'), 'utf8'), HIGH_RUNTIME_MISSING_CAUSE.stdout, 'the raw answer is retained byte for byte');
+    assert.equal(JSON.parse(readFileSync(join(p.evidence, 'result.json'), 'utf8')).outcome, 'incomplete');
+    assert.equal(reevaluate(p.root, { evidenceDir: p.evidence, now: NOW }).outcome, 'incomplete');
+    const cli = evaluateCommand(p);
+    assert.equal(cli.status, 2, cli.stdout + cli.stderr);
+    assert.match(cli.stdout, /AUDIT UNAVAILABLE OR INCOMPLETE — NOT A CLEAN RESULT/);
+    assert.match(cli.stdout, /scanner_dangling_cause: application: shipped is listed as vulnerable via missing-cause/);
+  }));
+
+  it('REGRESSION: a string-only causal cycle with no advisory is incomplete end to end', () => within(UNGROUNDED_CYCLE, (p) => {
+    assert.equal(p.result.outcome, 'incomplete');
+    assert.deepEqual([...new Set(p.result.reasons.map((r) => r.code))], ['scanner_ungrounded']);
+    const cli = evaluateCommand(p);
+    assert.equal(cli.status, 2, cli.stdout + cli.stderr);
+  }));
+
+  it('CONTROL: a supported dependency chain passes end to end — the fix is not "refuse every string"', () => within(SUPPORTED_CHAIN, (p) => {
+    assert.equal(p.result.outcome, 'within_policy', JSON.stringify(p.result.reasons));
+    assert.equal(p.result.counts.triageRequired, 1);
+    const cli = evaluateCommand(p);
+    assert.equal(cli.status, 0, cli.stdout + cli.stderr);
+    assert.match(cli.stdout, /REQUIRE TRIAGE \(not zero findings\)/);
+  }));
 });
 
 describe('the committed policy of THIS repository', () => {

@@ -57,6 +57,31 @@ exit status the body contradicts, or an inventory that moved since the snapshot 
 read as clean. npm uses exit 1 both for "vulnerabilities found" and for "the audit
 failed", so the status is only accepted when the body agrees with it.
 
+**Every vulnerability the report declares is accounted for, or the audit is incomplete.**
+Being unable to interpret a reported vulnerability is not evidence that there is none.
+The contract is the pinned scanner's own (npm 11.19.1, Arborist 9.9.1): `vulnerabilities`
+is an object keyed by package name, and each entry's `via` holds either an advisory
+object (whose `name` and `dependency` are that package) or a STRING naming another entry
+the package is vulnerable through. Arborist links every such name before it writes the
+report, so a string cause is ordinary and never itself a finding — the finding is the
+advisory it leads to, attributed to the advisory's own package, counted once per
+(advisory, path). What the reader refuses as **incomplete** (exit 2, raw output and
+diagnosis retained):
+
+| shape | reason code |
+|---|---|
+| `vulnerabilities`, `metadata`, a counter block or an entry that is not the container npm writes (a list, `null`, a scalar); a `via`/`nodes` that is not a non-empty list; a `via` member that is neither a name nor an advisory object | `scanner_shape` |
+| counters that do not add up to the entries, a severity distribution the entries do not have, an entry or advisory naming a different package, an entry less severe than its own advisory, an exit status the severity counters contradict | `scanner_inconsistent` |
+| a string cause naming an entry the report does not list | `scanner_dangling_cause` |
+| an entry no advisory is reachable from — including a cycle of string causes with nothing concrete in it | `scanner_ungrounded` |
+| an entry declared more severe than any advisory it reaches | `scanner_unaccounted` |
+| an entry on a runtime path whose reachable advisories are attributed to tooling only | `scanner_unattributed` |
+
+A cycle is NOT refused for being a cycle — only when nothing in it reaches an advisory —
+and the traversal is a bounded worklist, so a long or cyclic chain can neither hang nor
+overflow the stack. An empty `vulnerabilities` object with zero counters is a legitimate
+clean report. Optional fields npm omits stay optional; nothing here is a general schema.
+
 **The invocation is hardened because narrowing is invisible.** Measured on main
 (`3521ebd`): with an inherited `NODE_ENV=production`, `npm audit --json` reported **zero**
 vulnerable packages where it otherwise reports five (ten findings by advisory and path),

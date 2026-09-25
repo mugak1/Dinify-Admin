@@ -262,17 +262,70 @@ export function scannerArgs(registry) {
 
 const GHSA = /\/advisories\/(GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4})/i;
 
+/** npm's severity vocabulary, least severe first (Arborist's vuln.js, npm-audit-report's exit-code.js). */
+const SEVERITY_ORDER = Object.freeze(['info', 'low', 'moderate', 'high', 'critical']);
+const rankOf = (severity) => SEVERITY_ORDER.indexOf(severity);
+const isMapping = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+const isCount = (value) => Number.isInteger(value) && value >= 0;
+const shapeOf = (value) => {
+  if (value === undefined) return 'missing';
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'a list';
+  if (typeof value === 'string') return `the string ${JSON.stringify(value.slice(0, 60))}`;
+  return typeof value === 'object' ? 'an object' : `the ${typeof value} ${String(value)}`;
+};
+const listOf = (names) => (names.length > 8 ? `${names.slice(0, 8).join(', ')} and ${names.length - 8} more` : names.join(', '));
+
 /**
  * Read one `npm audit --json` answer for one graph. Returns {problems, findings}.
  *
  * The exit status is CROSS-CHECKED against the body rather than trusted alone: npm uses 1
  * both for "vulnerabilities found" and for "the audit failed", so a status is only
  * accepted when the body agrees with it.
+ *
+ * WHAT THE PINNED SCANNER WRITES — read from npm 11.19.1 and the @npmcli/arborist 9.9.1 and
+ * @npmcli/metavuln-calculator 9.0.3 it bundles, as dependency-audit/scanner installs them:
+ *   - `vulnerabilities` is an OBJECT keyed by package name. Each entry names itself, states
+ *     a severity, lists the installed `nodes` (lock paths) it covers, and says why in `via`.
+ *   - A `via` member is either an ADVISORY OBJECT — that package's own advisory, whose
+ *     `name` and `dependency` are the entry's own name — or a STRING: a metavulnerability.
+ *     The package is vulnerable only because the versions it depends on of the NAMED
+ *     package are. Arborist links every such name to the entry it names before it writes
+ *     anything, so a name the report does not list cannot have come from it.
+ *   - A metavulnerability inherits the severity of the advisory it was derived from, so an
+ *     entry is never more severe than the advisories it can be traced to.
+ *   - `metadata.vulnerabilities` counts ENTRIES by severity, and its `total` is the number
+ *     of entries. npm exits 1 exactly when a counter at or above `low` is non-zero — the
+ *     default audit level, which scannerArgs does not change.
+ *
+ * THE RULE: every vulnerability the report declares is accounted for by advisory evidence
+ * it carries, or the answer is incomplete. Being unable to interpret a reported
+ * vulnerability is not evidence that there is none. A report that parsed, with the right
+ * status and every advisory object read, could still say "high, via a package I do not
+ * list", or "high, via each other" — and return no finding at all, which the policy would
+ * then have called clean.
+ *
+ * A string cause produces no finding of its own, and that is deliberate. The advisory it
+ * is traced to is already a finding on the nodes of the package that carries it, and one
+ * advisory is not counted again for every package that depends on it. Findings are
+ * therefore not one per vulnerable package: a package can carry several advisories and be
+ * installed at several paths, and a package listed only through its dependencies carries
+ * none. What the string causes ARE checked for is that they are grounded:
+ *   - every name resolves to an entry in the same report;
+ *   - every entry reaches, through its causes, an advisory the report carries. Evidence
+ *     is propagated from each advisory to everything traced to it, without recursion, so
+ *     a legitimate cycle with an advisory in it is accepted, and a cycle without one is
+ *     refused rather than followed forever;
+ *   - no entry is more severe than the advisories it is traced to;
+ *   - an entry installed on a RUNTIME path is traced to at least one runtime finding. A
+ *     runtime package's exposure must not quietly become tooling exposure because the
+ *     only copies the report attributes are build-time ones.
  */
 export function readReport({ graph, run, inv }) {
   const problems = [];
   const findings = [];
-  const fail = (code, detail) => { problems.push({ code, detail: `${graph}: ${detail}` }); return { problems, findings }; };
+  const note = (code, detail) => problems.push({ code, detail: `${graph}: ${detail}` });
+  const fail = (code, detail) => { note(code, detail); return { problems, findings }; };
 
   if (run.error) return fail('scanner_error', `the scanner could not be run (${run.error})`);
   if (run.timedOut) return fail('scanner_timeout', 'the scanner did not finish within the policy timeout');
@@ -293,57 +346,225 @@ export function readReport({ graph, run, inv }) {
   if (report.auditReportVersion !== 2) return fail('scanner_format', `auditReportVersion ${report.auditReportVersion} is not the supported version 2`);
   const vulns = report.vulnerabilities;
   const meta = report.metadata;
-  if (!vulns || typeof vulns !== 'object' || !meta || typeof meta.dependencies !== 'object' || typeof meta.vulnerabilities !== 'object') {
-    return fail('scanner_shape', 'the report lacks vulnerabilities or metadata');
+  // Every container below is dereferenced, so each is checked for the shape npm writes
+  // first. A list is not the package-name map even when it is empty: `[]` passes a
+  // `typeof === 'object'` test, lists nothing, and read as "no vulnerabilities".
+  if (!isMapping(vulns)) return fail('scanner_shape', `vulnerabilities is ${shapeOf(vulns)}, not the package-name map npm writes — a list that cannot be read is not an empty one`);
+  if (!isMapping(meta) || !isMapping(meta.dependencies) || !isMapping(meta.vulnerabilities)) {
+    return fail('scanner_shape', 'the report lacks the dependency and vulnerability counters npm writes in its metadata');
   }
   const total = meta.dependencies.total;
   if (!Number.isInteger(total) || total <= 0) return fail('coverage_empty', `the scanner counted ${total} dependencies — an empty inventory is refused, not passed`);
   if (total !== inv.packages.length) return fail('coverage_mismatch', `the scanner counted ${total} dependencies, the lock graph has ${inv.packages.length}`);
+  const counted = meta.vulnerabilities;
+  for (const key of [...SEVERITY_ORDER, 'total']) {
+    if (!isCount(counted[key])) return fail('scanner_shape', `metadata.vulnerabilities.${key} is ${shapeOf(counted[key])}, not a count`);
+  }
   const names = Object.keys(vulns);
-  if (meta.vulnerabilities.total !== names.length) return fail('scanner_inconsistent', `metadata counts ${meta.vulnerabilities.total} vulnerable packages, the body lists ${names.length}`);
-  if (run.status === 0 && names.length > 0) return fail('scanner_inconsistent', 'the scanner exited 0 but listed vulnerabilities');
+  if (counted.total !== names.length) return fail('scanner_inconsistent', `metadata counts ${counted.total} vulnerable packages, the body lists ${names.length}`);
+  const bySeverity = SEVERITY_ORDER.reduce((sum, severity) => sum + counted[severity], 0);
+  if (bySeverity !== counted.total) return fail('scanner_inconsistent', `metadata counts ${counted.total} vulnerable packages, but ${bySeverity} by severity`);
   if (run.status === 1 && names.length === 0) return fail('scanner_status', 'the scanner exited 1 with no vulnerabilities and no error — an unexplained failure');
+  // npm-audit-report's own rule at the default level. It is exact, so it is not replaced
+  // by "any listed vulnerability means 1": an info-only report really does exit 0, and a
+  // status that disagrees with these counters says the counters are not npm's.
+  const expected = SEVERITY_ORDER.slice(1).some((severity) => counted[severity] > 0) ? 1 : 0;
+  if (run.status !== expected) {
+    const counts = SEVERITY_ORDER.filter((s) => counted[s] > 0).map((s) => `${counted[s]} ${s}`).join(', ') || 'nothing';
+    return fail('scanner_inconsistent', `the scanner exited ${run.status}, but npm exits ${expected} for a report that counts ${counts}`);
+  }
 
   const byPath = new Map(inv.packages.map((p) => [p.path.slice(graph.length + 1), p]));
+  const listed = new Map();
+  const declared = Object.fromEntries(SEVERITY_ORDER.map((severity) => [severity, 0]));
+  let severitiesReadable = true;
   for (const name of names) {
     const entry = vulns[name];
-    if (!entry || !Array.isArray(entry.via) || !Array.isArray(entry.nodes) || entry.nodes.length === 0) {
-      problems.push({ code: 'scanner_shape', detail: `${graph}: vulnerability entry ${name} is malformed` });
+    if (!isMapping(entry) || name === '') {
+      severitiesReadable = false;
+      note('scanner_shape', `vulnerability entry ${JSON.stringify(name)} is ${name === '' ? 'unnamed' : shapeOf(entry)}, not an entry npm writes`);
       continue;
     }
-    const advisories = entry.via.filter((v) => v && typeof v === 'object');
-    const effects = entry.via.filter((v) => typeof v === 'string');
-    if (advisories.length === 0 && effects.length === 0) {
-      problems.push({ code: 'scanner_shape', detail: `${graph}: ${name} is listed with no advisory and no cause` });
+    if (entry.name !== undefined && entry.name !== name) note('scanner_inconsistent', `vulnerability entry ${name} names itself ${shapeOf(entry.name)}`);
+    if (rankOf(entry.severity) === -1) {
+      severitiesReadable = false;
+      note('scanner_shape', `${name} has severity ${shapeOf(entry.severity)}, which is not one npm reports`);
+    } else {
+      declared[entry.severity] += 1;
+    }
+    if (!Array.isArray(entry.via) || entry.via.length === 0 || !Array.isArray(entry.nodes) || entry.nodes.length === 0) {
+      note('scanner_shape', `vulnerability entry ${name} is malformed`);
       continue;
     }
+    // What this entry carries itself, and what it is vulnerable through.
+    const item = { severity: entry.severity, causes: [], own: { evidence: false, rank: -1, runtime: false }, onRuntimePath: false };
+    listed.set(name, item);
     for (const node of entry.nodes) {
-      if (!byPath.has(node)) problems.push({ code: 'coverage_unknown_node', detail: `${graph}: advisory node ${node} is not in the audited inventory` });
+      if (typeof node !== 'string') { note('scanner_shape', `${name} lists ${shapeOf(node)} among its nodes, not an installed path`); continue; }
+      if (!byPath.has(node)) note('coverage_unknown_node', `advisory node ${node} is not in the audited inventory`);
+      else if (byPath.get(node).scope === 'runtime') item.onRuntimePath = true;
+    }
+    const advisories = [];
+    for (const member of entry.via) {
+      if (typeof member === 'string' && member !== '') item.causes.push(member);
+      else if (isMapping(member)) advisories.push(member);
+      // Filtering an unreadable member out would leave the rest looking complete.
+      else note('scanner_shape', `${name} is vulnerable via ${shapeOf(member)}, which is neither an advisory nor the name of another vulnerable package`);
     }
     for (const via of advisories) {
       const ghsa = GHSA.exec(String(via.url ?? ''));
+      if (via.source !== undefined && !Number.isInteger(via.source) && !(typeof via.source === 'string' && via.source !== '')) {
+        note('scanner_shape', `an advisory on ${name} has source ${shapeOf(via.source)}, not an advisory id`);
+        continue;
+      }
       // GitHub prints advisory ids as `GHSA-xxxx-xxxx-xxxx`: upper-case prefix, lower-case body.
       const advisory = ghsa ? `GHSA-${ghsa[1].slice(5).toLowerCase()}` : (via.source !== undefined ? `npm:${via.source}` : null);
-      if (!advisory) { problems.push({ code: 'scanner_shape', detail: `${graph}: an advisory on ${name} has no identifier` }); continue; }
+      if (!advisory) { note('scanner_shape', `an advisory on ${name} has no identifier`); continue; }
+      // npm lists a package's own advisories under that package. An advisory naming
+      // another package here could not be attributed: the nodes are this entry's.
+      const foreign = ['name', 'dependency'].find((field) => via[field] !== undefined && via[field] !== name);
+      if (foreign) { note('scanner_inconsistent', `an advisory whose ${foreign} is ${shapeOf(via[foreign])} is listed under ${name} — its findings could not be attributed to the right package`); continue; }
       const aliases = ghsa && via.source !== undefined ? [`npm:${via.source}`] : [];
       const nodes = entry.nodes.filter((n) => byPath.has(n));
       const matched = nodes.filter((n) => satisfies(byPath.get(n).version, via.range) === true);
       const attributed = matched.length ? matched : nodes;
+      const severity = typeof via.severity === 'string' ? via.severity.toLowerCase() : 'unknown';
       for (const node of attributed) {
         const pkg = byPath.get(node);
         findings.push({
           advisory,
           aliases,
-          package: via.name ?? name,
+          package: name,
           version: pkg.version,
           path: pkg.path,
           scope: pkg.scope,
-          severity: typeof via.severity === 'string' ? via.severity.toLowerCase() : 'unknown',
+          severity,
           title: typeof via.title === 'string' ? via.title : '',
           url: typeof via.url === 'string' ? via.url : '',
         });
+        if (pkg.scope === 'runtime') item.own.runtime = true;
+      }
+      if (attributed.length) {
+        item.own.evidence = true;
+        item.own.rank = Math.max(item.own.rank, rankOf(severity));
       }
     }
   }
+  if (severitiesReadable) {
+    for (const severity of SEVERITY_ORDER) {
+      if (declared[severity] !== counted[severity]) note('scanner_inconsistent', `metadata counts ${counted[severity]} ${severity} vulnerable package(s), the body lists ${declared[severity]}`);
+    }
+  }
+
+  // Every cause is a package the report lists.
+  for (const [name, item] of listed) {
+    for (const cause of item.causes) {
+      if (!Object.hasOwn(vulns, cause)) {
+        note('scanner_dangling_cause', `${name} is listed as vulnerable via ${cause}, which the report does not list — a cause that cannot be traced is not evidence of no vulnerability`);
+      }
+    }
+  }
+
+  // What each entry is traced to: its own advisories and, through every cause, theirs.
+  // A worklist over the reverse edges rather than a recursive walk. Each value only grows
+  // (evidence and runtime from false to true, rank upward) and has a ceiling, so an entry
+  // is revisited at most a handful of times and the loop ends on any graph, cycles
+  // included, with no stack to exhaust.
+  const traced = new Map([...listed].map(([name, item]) => [name, { ...item.own }]));
+  const dependents = new Map();
+  for (const [name, item] of listed) {
+    for (const cause of item.causes) {
+      if (!listed.has(cause)) continue;
+      if (!dependents.has(cause)) dependents.set(cause, []);
+      dependents.get(cause).push(name);
+    }
+  }
+  const queue = [...listed.keys()];
+  while (queue.length) {
+    const cause = queue.pop();
+    const from = traced.get(cause);
+    for (const name of dependents.get(cause) ?? []) {
+      const was = traced.get(name);
+      const now = { evidence: was.evidence || from.evidence, rank: Math.max(was.rank, from.rank), runtime: was.runtime || from.runtime };
+      if (now.evidence !== was.evidence || now.rank !== was.rank || now.runtime !== was.runtime) {
+        traced.set(name, now);
+        queue.push(name);
+      }
+    }
+  }
+
+  let loops = null;
+  for (const [name, item] of listed) {
+    const reach = traced.get(name);
+    if (!reach.evidence) {
+      loops ??= cyclicComponents(listed);
+      const why = item.causes.length === 0 ? 'it carries no advisory the report can attribute and names no cause'
+        : loops.has(name) ? `its causes loop back to it (${loops.get(name)}) without reaching an advisory`
+          : `none of its causes (${listOf([...item.causes].sort())}) leads to an advisory the report carries`;
+      note('scanner_ungrounded', `${name} is listed as ${item.severity} but ${why} — a declared vulnerability the report does not account for is not the absence of one`);
+      continue;
+    }
+    const declaredRank = rankOf(item.severity);
+    if (declaredRank !== -1 && declaredRank > reach.rank) {
+      note('scanner_unaccounted', `${name} is listed as ${item.severity}, but the most severe advisory it is traced to is ${SEVERITY_ORDER[reach.rank] ?? 'of no severity npm reports'}`);
+    }
+    if (declaredRank !== -1 && declaredRank < item.own.rank) {
+      note('scanner_inconsistent', `${name} is listed as ${item.severity} but carries a ${SEVERITY_ORDER[item.own.rank]} advisory of its own`);
+    }
+    if (item.onRuntimePath && !reach.runtime) {
+      note('scanner_unattributed', `${name} is installed on a runtime path, but every advisory it is traced to is attributed only to tooling paths — the runtime exposure cannot be established from this report`);
+    }
+  }
   return { problems, findings };
+}
+
+/**
+ * The entries that lie on a cycle of causes, each mapped to a description of its cycle.
+ * Tarjan's strongly-connected-components algorithm, written iteratively: one pass over the
+ * report however long a cycle is, and no recursion for a long one to exhaust.
+ */
+function cyclicComponents(listed) {
+  const index = new Map();
+  const low = new Map();
+  const onStack = new Set();
+  const stack = [];
+  const cyclic = new Map();
+  let next = 0;
+  const open = (name, work) => {
+    index.set(name, next); low.set(name, next); next += 1;
+    stack.push(name); onStack.add(name);
+    work.push([name, 0]);
+  };
+  for (const start of listed.keys()) {
+    if (index.has(start)) continue;
+    const work = [];
+    open(start, work);
+    while (work.length) {
+      const frame = work[work.length - 1];
+      const [name, at] = frame;
+      const causes = listed.get(name).causes;
+      if (at < causes.length) {
+        frame[1] += 1;
+        const cause = causes[at];
+        if (!listed.has(cause)) continue;
+        if (!index.has(cause)) open(cause, work);
+        else if (onStack.has(cause)) low.set(name, Math.min(low.get(name), index.get(cause)));
+        continue;
+      }
+      work.pop();
+      if (work.length) {
+        const parent = work[work.length - 1][0];
+        low.set(parent, Math.min(low.get(parent), low.get(name)));
+      }
+      if (low.get(name) !== index.get(name)) continue;
+      const members = [];
+      let member;
+      do { member = stack.pop(); onStack.delete(member); members.push(member); } while (member !== name);
+      if (members.length > 1 || causes.includes(name)) {
+        const description = members.length > 1 ? `a cycle of ${members.length}: ${listOf(members.sort())}` : 'it names itself';
+        for (const m of members) cyclic.set(m, description);
+      }
+    }
+  }
+  return cyclic;
 }

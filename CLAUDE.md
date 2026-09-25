@@ -1999,6 +1999,15 @@ a successful CI push to main, or on `workflow_dispatch`.
 - **The scanner is invoked hardened because narrowing is invisible** — measured on main:
   an inherited `NODE_ENV=production` made `npm audit` report zero vulnerable packages where
   it otherwise reports five, while still counting every package.
+- **Every vulnerability the report declares is accounted for, or the audit is incomplete.**
+  npm's `via` may name another vulnerable package as a STRING rather than carry an
+  advisory; that is ordinary (Arborist links every such name before writing), so the reader
+  follows the chain to the advisory it reaches and attributes the finding there. A name the
+  report does not list, a chain or cycle that reaches no advisory, a declared severity no
+  reachable advisory supports, runtime exposure left attributed to tooling only, and any
+  container npm never writes (a list or `null` where the name map belongs) are INCOMPLETE,
+  exit 2 — never zero findings. Reason codes and the pinned-scanner contract are in the
+  README; the shared tests pin a captured real report from each npm repo as the control.
 - **Nothing is pre-approved.** `policy.json → records` is empty; an exception or triage
   record must name the exact advisory/package/version/paths/scope, carry evidence, an
   owner, a linked mugak1 review and an expiry ≤ 90 days, and is refused otherwise.

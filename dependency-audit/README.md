@@ -89,6 +89,11 @@ while `metadata.dependencies.total` still counted all 794 packages. So
 the scanner runs with every dependency type `--include`d, `--package-lock=true`, the
 public registry named explicitly, and `NODE_ENV`, `NODE_OPTIONS` and every `npm_*`
 variable removed from its environment.
+The audit level is pinned too (`--audit-level=low`, npm's own default): it moves only the
+exit code, never the JSON body, but npm reads it from any npmrc the environment scrub
+cannot reach, and the exit-status check above assumes it. Measured with the pinned npm, an
+`audit-level=none` in `~/.npmrc` made a five-moderate report exit 0; a command-line value
+outranks every npmrc, so the invocation and the check cannot disagree.
 
 ## Exceptions and triage records
 

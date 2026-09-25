@@ -254,10 +254,21 @@ export function scannerEnvironment(base = process.env) {
   return { env, removed: removed.sort() };
 }
 
+/**
+ * The audit level the scanner is RUN at, and the one readReport's exit-status check assumes.
+ * It is npm's own default, and it moves only the exit code — the JSON body lists every
+ * vulnerability whatever the level. It is pinned on the command line because npm otherwise
+ * reads it from any npmrc (the project's, the user's, the global one), and the environment
+ * scrub cannot reach a file: an `audit-level=none` there made a report counting five
+ * moderate entries exit 0, which the status check then correctly refused as a contradiction.
+ * A command-line value outranks every npmrc, so the check and the invocation cannot disagree.
+ */
+export const AUDIT_LEVEL = 'low';
+
 /** The exact argv. Every dependency type is INCLUDED explicitly; `include` beats `omit`. */
 export function scannerArgs(registry) {
   return ['audit', '--json', '--include=prod', '--include=dev', '--include=optional', '--include=peer',
-    '--package-lock=true', `--registry=${registry}`, '--no-fund', '--no-update-notifier'];
+    '--package-lock=true', `--registry=${registry}`, `--audit-level=${AUDIT_LEVEL}`, '--no-fund', '--no-update-notifier'];
 }
 
 const GHSA = /\/advisories\/(GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4})/i;
@@ -295,8 +306,8 @@ const listOf = (names) => (names.length > 8 ? `${names.slice(0, 8).join(', ')} a
  *   - A metavulnerability inherits the severity of the advisory it was derived from, so an
  *     entry is never more severe than the advisories it can be traced to.
  *   - `metadata.vulnerabilities` counts ENTRIES by severity, and its `total` is the number
- *     of entries. npm exits 1 exactly when a counter at or above `low` is non-zero — the
- *     default audit level, which scannerArgs does not change.
+ *     of entries. npm exits 1 exactly when a counter at or above the audit level is
+ *     non-zero — AUDIT_LEVEL, which scannerArgs pins on the command line.
  *
  * THE RULE: every vulnerability the report declares is accounted for by advisory evidence
  * it carries, or the answer is incomplete. Being unable to interpret a reported
@@ -365,10 +376,10 @@ export function readReport({ graph, run, inv }) {
   const bySeverity = SEVERITY_ORDER.reduce((sum, severity) => sum + counted[severity], 0);
   if (bySeverity !== counted.total) return fail('scanner_inconsistent', `metadata counts ${counted.total} vulnerable packages, but ${bySeverity} by severity`);
   if (run.status === 1 && names.length === 0) return fail('scanner_status', 'the scanner exited 1 with no vulnerabilities and no error — an unexplained failure');
-  // npm-audit-report's own rule at the default level. It is exact, so it is not replaced
-  // by "any listed vulnerability means 1": an info-only report really does exit 0, and a
-  // status that disagrees with these counters says the counters are not npm's.
-  const expected = SEVERITY_ORDER.slice(1).some((severity) => counted[severity] > 0) ? 1 : 0;
+  // npm-audit-report's own rule at the level the scanner was run at. It is exact, so it is
+  // not replaced by "any listed vulnerability means 1": an info-only report really does
+  // exit 0, and a status that disagrees with these counters says the counters are not npm's.
+  const expected = SEVERITY_ORDER.slice(rankOf(AUDIT_LEVEL)).some((severity) => counted[severity] > 0) ? 1 : 0;
   if (run.status !== expected) {
     const counts = SEVERITY_ORDER.filter((s) => counted[s] > 0).map((s) => `${counted[s]} ${s}`).join(', ') || 'nothing';
     return fail('scanner_inconsistent', `the scanner exited ${run.status}, but npm exits ${expected} for a report that counts ${counts}`);

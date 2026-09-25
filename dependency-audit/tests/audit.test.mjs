@@ -41,6 +41,7 @@ describe('snapshot → audit', () => {
       assert.equal(call.command, process.execPath);
       assert.match(call.args[0], /dependency-audit[\\/]scanner[\\/]node_modules[\\/]npm[\\/]bin[\\/]npm-cli\.js$/);
       assert.ok(call.args.includes('--include=dev'));
+      assert.ok(call.args.includes('--audit-level=low'), 'the level the status check assumes is the level the scanner runs at');
       assert.equal(call.env.NODE_ENV, undefined);
     }
     const collection = JSON.parse(readFileSync(join(p.evidence, 'collection.json'), 'utf8'));

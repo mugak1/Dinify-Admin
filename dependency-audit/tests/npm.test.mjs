@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { evaluate } from '../lib/core.mjs';
-import { explainAbsences, inventory, readReport, resolveEdge, scannerArgs, scannerEnvironment, sha256 } from '../lib/npm.mjs';
+import { AUDIT_LEVEL, explainAbsences, inventory, readReport, resolveEdge, scannerArgs, scannerEnvironment, sha256 } from '../lib/npm.mjs';
 import { satisfies } from '../lib/range.mjs';
 import { makeProject, npmReport, NOW, via } from './project.mjs';
 
@@ -111,7 +111,16 @@ describe('the scanner invocation cannot be narrowed by what it inherits', () => 
     assert.ok(args.includes('--json'));
     assert.ok(args.includes('--package-lock=true'), 'npm audit reads the lock graph; package-lock=false would switch it to an ideal tree');
     assert.ok(args.includes('--registry=https://registry.npmjs.org/'));
-    assert.ok(!args.some((a) => a.startsWith('--omit') || a.startsWith('--audit-level') || a === '--production'));
+    assert.ok(!args.some((a) => a.startsWith('--omit') || a === '--production'));
+  });
+
+  it('REGRESSION: the audit level the exit-status check assumes is pinned on the command line, once', () => {
+    // An npmrc the environment scrub cannot reach (`audit-level=none` in ~/.npmrc, measured
+    // with the pinned npm) made a five-moderate report exit 0, and the reader refused the
+    // contradiction as incomplete. The level is npm's default, so the body is unchanged.
+    assert.equal(AUDIT_LEVEL, 'low');
+    const levels = scannerArgs('https://registry.npmjs.org/').filter((a) => a.startsWith('--audit-level'));
+    assert.deepEqual(levels, [`--audit-level=${AUDIT_LEVEL}`]);
   });
 
   it('REGRESSION: an inherited NODE_ENV=production or npm_config_omit never reaches the scanner', () => {

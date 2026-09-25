@@ -1,0 +1,16 @@
+{
+  "schema": "dinify.dependency-audit.policy/v1",
+  "repository": "mugak1/Dinify-Admin",
+  "ecosystem": "npm",
+  "target": {
+    "nodeMajor": 20
+  },
+  "scanner": {
+    "package": "npm",
+    "version": "11.19.1",
+    "root": "dependency-audit/scanner",
+    "registry": "https://registry.npmjs.org/",
+    "timeoutSeconds": 300
+  },
+  "records": []
+}

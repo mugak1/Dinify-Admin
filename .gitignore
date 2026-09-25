@@ -53,3 +53,8 @@ Thumbs.db
 
 # Deployment is 0C (S3 + GitHub OIDC + SSM). There is deliberately no Firebase,
 # rsync or SSH config in this repo — see CLAUDE.md.
+
+# Dependency audit (dependency-audit/README.md): retained evidence and the separately
+# installed, pinned scanner. Neither is source; CI uploads the evidence as an artifact.
+/dependency-audit/evidence/
+/dependency-audit/scanner/node_modules/

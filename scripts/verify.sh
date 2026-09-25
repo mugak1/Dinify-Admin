@@ -13,10 +13,12 @@
 #                           reaches no storage, log, URL, store or fabricated link)
 #   5. dependency-audit evaluator tests (OFFLINE — fixtures only; proves the policy
 #                           can pass and refuse; scans nothing)
-#   6. test                (ng test, headless single run)
-#   7. build:prod          (ng build --configuration=production)
-#   8. mock-isolation gate (scans the build output from step 7)
-#   9. dependency audit    (NETWORK — scans the inventory snapshotted before step 1
+#   6. guard qualification tests (OFFLINE — proves the mock-isolation gate fires, incl.
+#                           real optimized builds of deliberately broken workspace copies)
+#   7. test                (ng test, headless single run)
+#   8. build:prod          (ng build --configuration=production)
+#   9. mock-isolation gate (--self-test, then scans the build output from step 8)
+#  10. dependency audit    (NETWORK — scans the inventory snapshotted before step 1
 #                           against the public advisory database and enforces the
 #                           policy; a scan that cannot complete FAILS, it is never
 #                           skipped. See dependency-audit/README.md)
@@ -58,6 +60,7 @@ run_step "lint"                npm run lint
 run_step "design-token gate"   npm run check:tokens
 run_step "claim-code gate"     npm run check:claim-code
 run_step "dependency-audit evaluator tests (offline)" npm run test:audit
+run_step "guard qualification tests (offline)" npm run test:guards
 run_step "test"                npm run test:ci
 run_step "build:prod"          npm run build:prod
 # Deliberately last: it reads dist/, which the step above produces.

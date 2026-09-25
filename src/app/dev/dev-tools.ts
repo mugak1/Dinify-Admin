@@ -16,8 +16,9 @@ import { MockRestaurantApi } from './mock-restaurant-api';
  * not merely unreachable in production, they are not in the module graph at all,
  * because nothing in the production build imports the files that import them.
  *
- * `scripts/check-mock-isolation.mjs` then scans the built bundles for the two build
- * markers and fails if either appears — so the guarantee is CHECKED, not asserted.
+ * `scripts/check-mock-isolation.mjs` then walks the production module graph with this
+ * replacement applied and scans the built output — so the guarantee is CHECKED, not
+ * asserted.
  */
 
 /**

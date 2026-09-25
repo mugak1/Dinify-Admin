@@ -66,16 +66,29 @@ jobs:
       - name: Dependency-audit evaluator tests
         run: npm run test:audit
 
+      # The standing guards' own qualification (B2.3), before the long suite so a broken
+      # detector fails fast. Proves the mock-isolation gate can find what it claims to:
+      # its CLI and package script executed against a disposable workspace, the source
+      # boundary against every development-only module, output coverage against missing,
+      # empty, partial, unreadable and linked outputs, and — in
+      # scripts/tests/mock-isolation.build.test.mjs — REAL optimized production builds
+      # of deliberately broken copies of this app. Offline; builds nothing into dist/.
+      - name: Guard qualification tests
+        run: npm run test:guards
+
       - name: Test
         run: npm run test:ci
 
       - name: Build (production)
         run: npm run build:prod
 
-      # Must run AFTER build:prod — it scans the built output. Fails if the mock
-      # authentication transport or the primitives gallery reached a production
-      # bundle. A mock authenticator shipped to the control plane is an
-      # authentication bypass with a friendly name.
+      # Must run AFTER build:prod — it scans the built output. The package script runs
+      # the gate's --self-test FIRST and the real scan only if it passes. Fails (1) if
+      # development-only code — the mock transports, their fixtures or the primitives
+      # gallery — is in the production module graph or the build output, and (2) is
+      # INCOMPLETE, never clean, if the output is missing, empty, partial or unreadable.
+      # A mock authenticator shipped to the control plane is an authentication bypass
+      # with a friendly name.
       - name: Mock-isolation gate
         run: npm run check:mock-isolation
 

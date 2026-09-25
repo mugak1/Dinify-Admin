@@ -1932,16 +1932,69 @@ with `dev-tools.prod.ts`, whose exports are empty and which imports nothing from
 `src/app/dev`. So they are not merely unreachable — they are not in the production
 module graph at all, rather than depending on the bundler eliminating dead code.
 
-`scripts/check-mock-isolation.mjs` CHECKS that against the built output by scanning
-for **three** build markers — the mock auth transport, the mock restaurant transport and
-the gallery — each emitted in a way a minifier cannot drop (`console.warn`, or a rendered
-`data-` attribute). It fails loudly when `dist/` is missing, so a green result can never
-mean "there was nothing to look at". Adding a development-only module means adding its
-marker HERE and to the `--self-test` cases; the self-test is what proves the matcher
-still fires.
+`scripts/check-mock-isolation.mjs` CHECKS that (ADMIN-MOCK-00), with THREE checks, because
+a marker alone is not a proof. **Qualified in D08 B2.3**, which found and closed four
+false-clean states — details below.
 
-Verified both ways at step 1: all three markers are present in a `development` build and
-absent from `dist/` after `build:prod`, so the gate has something real to catch.
+1. **SOURCE BOUNDARY.** The production module graph is walked from the entries
+   `angular.json` declares, with the production `fileReplacements` applied, using the
+   TypeScript compiler's own parser and module resolver and `tsconfig.app.json`. Any module
+   reached under `src/app/dev/` is a violation, and so is any `*.spec.*` source, with ONE
+   exception: the module compiled IN PLACE OF a replaced development-only source, on that
+   source's own path (today `dev-tools.ts` → `dev-tools.prod.ts`). **The exemption belongs
+   to the replaced EDGE, never to the target file** (Codex P1 on PR #30, valid): it used to
+   be a global allowlist of every replacement target, so a dormant `fileReplacements` entry
+   merely NAMING `mock-restaurants.fixtures.ts` exempted a direct import of it, and a real
+   optimized build shipped 11,716 bytes of fixtures with the gate at 0. Now the same target
+   reached by its own path is a violation, and so is a replacement that swaps a PRODUCTION
+   source for a development-only one. **This is what catches a production file importing
+   `mock-restaurants.fixtures.ts` or `mock-http-error.ts` directly** — neither carries a
+   marker, and a real optimized build of that mistake shipped **11.7 kB** of the synthetic
+   portfolio (per the esbuild metafile) while the marker-only gate reported OK. Edges:
+   static `import`/`export … from`, `import = require()`, `require()`, dynamic `import()`;
+   `import type` is erased and is not an edge; a value-syntax import used only for types IS
+   counted (stricter than the compiler, deliberately). An unresolvable specifier, a
+   non-literal dynamic import and a `Worker` entry are INCOMPLETE, not guessed. Styles are
+   CSS entries, not modules, and are not walked. A build shape the gate does not model
+   (`server`, `ssr`, `prerender`, a second project, another builder) is INCOMPLETE.
+2. **BUILD-OUTPUT COVERAGE.** The directory is the one the production `outputPath` names,
+   not a guessed `dist/`. It must hold an `index.html` that loads at least one JavaScript
+   entry, every file that page references, and every chunk those scripts import,
+   statically or lazily. Symbolic links are refused (Angular emits none) and anything that
+   cannot be listed or read is reported, never skipped. The old gate called a `dist/`
+   holding only `index.html` — or only a stylesheet — clean, and crashed with a stack trace
+   on a link loop.
+3. **MARKERS.** The mock transports and the gallery export a literal used in a way a
+   minifier cannot drop; the self-test also checks each literal is still what its source
+   file exports, so a renamed marker fails loudly instead of silently turning its half off.
+
+**Exit status: 0 complete and clean · 1 violation · 2 INCOMPLETE (never clean) · 3
+self-test failed.** `npm run check:mock-isolation` is `--self-test && scan` — the same
+pattern as `check:tokens` and `check:claim-code` — and it is the command `ci.yml`,
+`verify.sh` and `deploy.yml`'s prepare job all run, so none of them changed. The self-test
+drives every check over an in-memory workspace and an in-memory output filesystem
+(reader failures are simulated, because permission bits mean nothing to a root process).
+
+**`npm run test:guards` qualifies the gate and is its own `validate` step, before the
+suite.** `scripts/tests/mock-isolation.test.mjs` runs the real package script in a
+disposable workspace copy (node_modules symlinked): a broken matcher, discovery, walker or
+chunk reader makes the required check exit 3 with no scan-clean line; the CI step's own
+shell carries 0/1/2/3; every development-only file in `src/app/dev/` (enumerated from
+disk, so a new one is covered automatically) is refused when a production module imports
+it; and `validate` stays red when the gate or its qualification fails.
+`scripts/tests/mock-isolation.build.test.mjs` does five REAL optimized production builds
+(~10 s each) of broken copies, with `--stats-json` so the optimizer's own record proves the
+forbidden code is LIVE in the output: the unmodified app (and the walker ⊇ every module the
+build compiled), the marker-free direct import, the same import beside a dormant
+replacement naming the fixtures as its target, an eager mock provider plus a lazily routed
+gallery (caught in the initial bundle AND a lazy chunk `index.html` never names), and the
+production replacement removed. The metafile exists only in those disposable workspaces;
+the shipped build is not given one. **Adding a development-only module needs no edit to
+the gate** (the boundary covers the whole directory); give it a marker too if it should be
+visible in the output half.
+
+What this does NOT prove: authentication correctness, or anything about code outside the
+production module graph. It complements the application's tests; it replaces none.
 
 ## Verification
 
@@ -1960,7 +2013,11 @@ Before raising a PR:
    (fixtures only; it scans nothing)
 6. `npm run test:ci` — headless Chrome
 7. `npm run build:prod` — zero errors
-8. `npm run check:mock-isolation` — **after** the build; it scans `dist/`
+8. `npm run check:mock-isolation` — **after** the build: `--self-test`, then the source
+   boundary and the output `angular.json` names. Exit 1 violation, 2 incomplete, 3 detector
+   broken — none of them is clean
+8a. `npm run test:guards` — the gate's own qualification, OFFLINE, including five real
+   optimized builds of broken workspace copies (runs anywhere after `npm ci`; ~1.5 min)
 9. `npm run audit:deps` — the dependency audit, NETWORK. Bound to the inventory
    `npm run audit:snapshot` recorded right after `npm ci`; a scan that cannot complete
    FAILS, it is never skipped. See "Dependency Audit" below
@@ -2015,8 +2072,9 @@ a successful CI push to main, or on `workflow_dispatch`.
   pass or fail.
 - **What it does not do:** bind a fresh audit to the artifact a deploy promotes (the deploy
   re-installs from the same lockfile but does not re-audit), audit GitHub Actions or
-  the runner image, or change branch protection. Those, and the mock-isolation scanner's
-  self-test/coverage work, are later B2 deliveries.
+  the runner image, or change branch protection. Those are later B2 deliveries (the
+  mock-isolation scanner's self-test/coverage work landed in B2.3 — see "Neither the mock
+  nor the gallery reaches production").
 
 ## Deployment — 0C.1 AND 0C.2 BOTH ACCEPTED
 

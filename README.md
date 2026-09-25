@@ -51,9 +51,10 @@ npm run type-check
 npm run lint
 npm run check:tokens         # design-token gate (self-test, then the real scan)
 npm run check:claim-code     # claim-code gate: a raw owner claim code reaches no sink
+npm run test:guards          # the mock-isolation gate's own qualification (real builds)
 npm run test:ci
 npm run build:prod
-npm run check:mock-isolation # after build:prod — scans dist/
+npm run check:mock-isolation # after build:prod — self-test, source boundary, dist/
 ```
 
 ## Documentation

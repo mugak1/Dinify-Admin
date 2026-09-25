@@ -304,14 +304,16 @@ describe('the source boundary over the real tree', () => {
   });
 
   // Enumerated from disk, so a development-only module added later is covered with no
-  // edit here. The seam itself is excluded: importing `dev-tools` IS the legitimate
-  // production path, because the build replaces it — the test after this matrix removes
-  // the replacement and proves the seam is refused then.
-  const seam = new Set([...contract.replacements].flatMap(([from, to]) => [from, to]).map((p) => p.slice(ROOT.length + 1)));
+  // edit here. Only the replaced SOURCE is excluded: importing `dev-tools` IS the
+  // legitimate production path, because the build replaces it — the test after this
+  // matrix removes the replacement and proves the seam is refused then. The replacement
+  // TARGET is deliberately IN the matrix: the exemption belongs to the replaced edge,
+  // so `dev-tools.prod.ts` imported by its own path is refused like any other dev file.
+  const seam = new Set([...contract.replacements.keys()].filter((from) => from.startsWith(DEV)).map((p) => p.slice(ROOT.length + 1)));
   const devModules = readdirSync(DEV).filter((name) => /\.ts$/.test(name) && !seam.has(`src/app/dev/${name}`));
-  it('CONTRACT: every current development-only module is in the matrix below, and only the seam is exempt', () => {
-    assert.ok(seam.has('src/app/dev/dev-tools.ts') && seam.has(SEAM_TARGET));
-    for (const name of ['mock-admin-auth.ts', 'mock-restaurant-api.ts', 'mock-restaurants.fixtures.ts', 'mock-http-error.ts', 'gallery.page.ts']) {
+  it('CONTRACT: every current development-only module is in the matrix below, and only the replaced seam source is exempt', () => {
+    assert.deepEqual([...seam], ['src/app/dev/dev-tools.ts']);
+    for (const name of ['dev-tools.prod.ts', 'mock-admin-auth.ts', 'mock-restaurant-api.ts', 'mock-restaurants.fixtures.ts', 'mock-http-error.ts', 'gallery.page.ts']) {
       assert.ok(devModules.includes(name), name);
     }
   });
@@ -324,6 +326,34 @@ describe('the source boundary over the real tree', () => {
       assert.deepEqual(hit.chain.slice(-2), ['src/app/app.config.ts', `src/app/dev/${name}`]);
     });
   }
+
+  // Codex review of PR #30 (P1): replacement targets used to be a GLOBAL allowlist, so
+  // any `fileReplacements` entry naming a dev file as its `with` target — even a dormant
+  // one whose source nothing imports — exempted that file on every path, including a
+  // direct production import. A real optimized build shipped the synthetic portfolio
+  // with the gate at 0; the build-test sibling of this case proves that end to end.
+  const FIXTURES = join(DEV, 'mock-restaurants.fixtures.ts');
+  const MAIN = join(ROOT, 'src/main.ts');
+  const importFixtures = () => new Map([[MAIN, `${readFileSync(MAIN, 'utf8')}\nimport * as leak from './app/dev/mock-restaurants.fixtures';\nexport const LEAK = Object.keys(leak).length;\n`]]);
+  it('REGRESSION: a dormant replacement naming a dev file as its target does not exempt a direct import of that file', () => {
+    const dormant = new Map(contract.replacements).set(join(ROOT, 'src/app/never-imported.ts'), FIXTURES);
+    const result = analyse(importFixtures(), dormant);
+    const hit = result.violations.find((v) => v.file === 'src/app/dev/mock-restaurants.fixtures.ts');
+    assert.ok(hit, JSON.stringify(result.violations));
+    assert.deepEqual(hit.chain, ['src/main.ts', 'src/app/dev/mock-restaurants.fixtures.ts']);
+  });
+  it('REGRESSION: a replacement that swaps a PRODUCTION source for a dev module is refused on that edge', () => {
+    const routes = join(ROOT, 'src/app/app.routes.ts');
+    const swapped = new Map(contract.replacements).set(routes, FIXTURES);
+    const hit = analyse(new Map(), swapped).violations.find((v) => v.file === 'src/app/dev/mock-restaurants.fixtures.ts');
+    assert.ok(hit);
+    assert.equal(hit.chain.at(-1), 'src/app/app.routes.ts', 'the violation names the replaced production path that reaches it');
+  });
+  it('CONTROL: the real seam target reached through its own replaced source stays allowed', () => {
+    const result = analyse();
+    assert.ok(result.modules.some((m) => m.path === 'src/app/dev/dev-tools.ts' && m.compiled === SEAM_TARGET));
+    assert.ok(!result.violations.some((v) => v.file === SEAM_TARGET));
+  });
 
   it('REGRESSION: a test source that becomes part of the production graph is refused', () => {
     const main = join(ROOT, 'src/main.ts');

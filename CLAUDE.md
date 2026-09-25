@@ -1939,8 +1939,15 @@ false-clean states — details below.
 1. **SOURCE BOUNDARY.** The production module graph is walked from the entries
    `angular.json` declares, with the production `fileReplacements` applied, using the
    TypeScript compiler's own parser and module resolver and `tsconfig.app.json`. Any module
-   reached under `src/app/dev/` other than a declared replacement target is a violation, and
-   so is any `*.spec.*` source. **This is what catches a production file importing
+   reached under `src/app/dev/` is a violation, and so is any `*.spec.*` source, with ONE
+   exception: the module compiled IN PLACE OF a replaced development-only source, on that
+   source's own path (today `dev-tools.ts` → `dev-tools.prod.ts`). **The exemption belongs
+   to the replaced EDGE, never to the target file** (Codex P1 on PR #30, valid): it used to
+   be a global allowlist of every replacement target, so a dormant `fileReplacements` entry
+   merely NAMING `mock-restaurants.fixtures.ts` exempted a direct import of it, and a real
+   optimized build shipped 11,716 bytes of fixtures with the gate at 0. Now the same target
+   reached by its own path is a violation, and so is a replacement that swaps a PRODUCTION
+   source for a development-only one. **This is what catches a production file importing
    `mock-restaurants.fixtures.ts` or `mock-http-error.ts` directly** — neither carries a
    marker, and a real optimized build of that mistake shipped **11.7 kB** of the synthetic
    portfolio (per the esbuild metafile) while the marker-only gate reported OK. Edges:
@@ -1975,10 +1982,11 @@ chunk reader makes the required check exit 3 with no scan-clean line; the CI ste
 shell carries 0/1/2/3; every development-only file in `src/app/dev/` (enumerated from
 disk, so a new one is covered automatically) is refused when a production module imports
 it; and `validate` stays red when the gate or its qualification fails.
-`scripts/tests/mock-isolation.build.test.mjs` does four REAL optimized production builds
+`scripts/tests/mock-isolation.build.test.mjs` does five REAL optimized production builds
 (~10 s each) of broken copies, with `--stats-json` so the optimizer's own record proves the
 forbidden code is LIVE in the output: the unmodified app (and the walker ⊇ every module the
-build compiled), the marker-free direct import, an eager mock provider plus a lazily routed
+build compiled), the marker-free direct import, the same import beside a dormant
+replacement naming the fixtures as its target, an eager mock provider plus a lazily routed
 gallery (caught in the initial bundle AND a lazy chunk `index.html` never names), and the
 production replacement removed. The metafile exists only in those disposable workspaces;
 the shipped build is not given one. **Adding a development-only module needs no edit to
@@ -2008,7 +2016,7 @@ Before raising a PR:
 8. `npm run check:mock-isolation` — **after** the build: `--self-test`, then the source
    boundary and the output `angular.json` names. Exit 1 violation, 2 incomplete, 3 detector
    broken — none of them is clean
-8a. `npm run test:guards` — the gate's own qualification, OFFLINE, including four real
+8a. `npm run test:guards` — the gate's own qualification, OFFLINE, including five real
    optimized builds of broken workspace copies (runs anywhere after `npm ci`; ~1.5 min)
 9. `npm run audit:deps` — the dependency audit, NETWORK. Bound to the inventory
    `npm run audit:snapshot` recorded right after `npm ci`; a scan that cannot complete

@@ -21,8 +21,16 @@
  * 1. SOURCE BOUNDARY. The production module graph is walked from the build entries
  *    `angular.json` declares, with the production `fileReplacements` applied, using
  *    the TypeScript compiler's own parser and module resolver and the tsconfig the
- *    build uses. Every module it reaches under `src/app/dev/` — other than a declared
- *    replacement target — is a violation, and so is any `*.spec.*` source. This is
+ *    build uses. Every module it reaches under `src/app/dev/` is a violation, and so is
+ *    any `*.spec.*` source, with ONE exception: the module the build compiles IN PLACE
+ *    OF a replaced development-only source, on the path that reaches that source (today
+ *    `dev-tools.ts` -> `dev-tools.prod.ts`). The exemption belongs to the replaced EDGE,
+ *    never to the target file: the same target reached by its own path is a violation,
+ *    and a replacement that swaps a PRODUCTION file for a development-only one is a
+ *    violation too, because that is development code entering the build by another
+ *    route. (Codex review of PR #30: a global allowlist of every replacement target let
+ *    a dormant replacement naming `mock-restaurants.fixtures.ts` exempt a direct import
+ *    of it, and a real optimized build shipped the fixtures with the gate at 0.) This is
  *    the check that catches a production file importing `mock-restaurants.fixtures.ts`
  *    or `mock-http-error.ts` DIRECTLY: neither carries a marker, and a real optimized
  *    build ships their code with nothing in the bundle for a string search to find.
@@ -72,8 +80,9 @@ const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 export const EXIT = Object.freeze({ CLEAN: 0, VIOLATION: 1, INCOMPLETE: 2, SELF_TEST: 3 });
 
-/** The development-only tree. Everything under it is forbidden in production except a
- *  declared `fileReplacements` target (today: `dev-tools.prod.ts`). */
+/** The development-only tree. Everything under it is forbidden in production except the
+ *  module compiled in place of a replaced development-only source, on that source's own
+ *  path (today: `dev-tools.ts` -> `dev-tools.prod.ts`). See `forbiddenKind`. */
 export const DEV_DIR = 'src/app/dev';
 
 /** Test sources must never become part of the production module graph. */
@@ -285,10 +294,21 @@ export function fileSystemHost(root, overlay = new Map()) {
   };
 }
 
-/** Where a reached module sits: 'dev', 'test', or null for an ordinary source. */
-function forbiddenKind(root, file, allowedTargets) {
-  const path = rel(root, file);
-  if (path.startsWith(`${DEV_DIR}/`) && !allowedTargets.has(file)) return 'dev';
+/**
+ * Where a reached module sits: 'dev', 'test', or null for an ordinary source.
+ *
+ * `file` is the path the walk reached; `compiled` is what the build compiles for it
+ * (the replacement's target when `file` is replaced, else `file` itself). A compiled
+ * module under the development tree is permitted ONLY when it stands in for a replaced
+ * source that is itself development-only — i.e. on the replaced edge. Being named as a
+ * replacement target somewhere is not a permission: the same file reached by its own
+ * path is a violation, and so is a production source replaced by a development one.
+ */
+function forbiddenKind(root, file, compiled) {
+  const path = rel(root, compiled);
+  const devTarget = path.startsWith(`${DEV_DIR}/`);
+  const standsInForDevSource = compiled !== file && rel(root, file).startsWith(`${DEV_DIR}/`);
+  if (devTarget && !standsInForDevSource) return 'dev';
   if (TEST_SOURCE.test(path)) return 'test';
   return null;
 }
@@ -304,7 +324,6 @@ export function analyseSourceBoundary({ root, entries, replacements, compilerOpt
   const parent = new Map();
   const applied = new Map();
   const queue = [];
-  const allowedTargets = new Set(replacements.values());
 
   for (const entry of entries) {
     if (!parent.has(entry)) {
@@ -363,7 +382,7 @@ export function analyseSourceBoundary({ root, entries, replacements, compilerOpt
   };
   for (const file of parent.keys()) {
     const compiled = replacements.get(file) ?? file;
-    const kind = forbiddenKind(root, compiled, allowedTargets);
+    const kind = forbiddenKind(root, file, compiled);
     if (kind) violations.push({ file: rel(root, compiled), kind, chain: chainOf(file) });
   }
   return {
@@ -657,6 +676,12 @@ export function selfTest({ root = REPO_ROOT, log = console.log, error = console.
   expect('boundary: a removed replacement exposes the seam and the mock', dev(unreplaced, 'dev-tools.ts') && dev(unreplaced, 'mock-api.ts'));
   expect('boundary: a direct import of a marker-free fixture is refused',
     dev(boundaryCase({ 'src/app/feature.ts': "import { ROWS } from './dev/fixtures';\nexport const feature = ROWS.length;\n", 'src/main.ts': "import './app/feature';\n" }), 'fixtures.ts'));
+  const dormant = new Map(V_REPLACEMENTS).set(join(V_ROOT, 'src/app/never-imported.ts'), join(V_ROOT, 'src/app/dev/fixtures.ts'));
+  expect('boundary: naming a dev file as a replacement target does not exempt a direct import of it',
+    dev(boundaryCase({ 'src/main.ts': "import { ROWS } from './app/dev/fixtures';\nexport const n = ROWS.length;\n" }, { replacements: dormant }), 'fixtures.ts'));
+  const swapped = new Map(V_REPLACEMENTS).set(join(V_ROOT, 'src/app/feature.ts'), join(V_ROOT, 'src/app/dev/fixtures.ts'));
+  expect('boundary: a production source replaced by a dev module is refused',
+    dev(boundaryCase({ 'src/main.ts': "import './app/feature';\n" }, { replacements: swapped }), 'fixtures.ts'));
   expect('boundary: a lazy route to the gallery is refused',
     dev(boundaryCase({ 'src/main.ts': "export const routes = [{ loadComponent: () => import('./app/dev/gallery.page').then((m) => m.GalleryPage) }];\n" }), 'gallery.page.ts'));
   expect('boundary: a re-export is refused', dev(boundaryCase({ 'src/main.ts': "export * from './app/dev/mock-api';\n" }), 'mock-api.ts'));

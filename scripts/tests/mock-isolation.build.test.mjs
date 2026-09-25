@@ -118,6 +118,32 @@ import { MockHttpError } from './app/dev/mock-http-error';
   );
 
   scenario(
+    'REGRESSION: a dormant fileReplacements entry naming a dev file as its target does not exempt a direct production import of that file',
+    (ws) => {
+      // Codex review of PR #30 (P1). `environment.live.ts` exists and nothing in the
+      // production graph imports it, so this replacement never fires — it only NAMES the
+      // fixtures as a target. Replacement targets used to be a global allowlist, so that
+      // naming alone exempted the direct import below and the gate exited 0.
+      const angular = JSON.parse(ws.read('angular.json'));
+      angular.projects.dinify_admin.architect.build.configurations.production.fileReplacements.push({
+        replace: 'src/environments/environment.live.ts',
+        with: 'src/app/dev/mock-restaurants.fixtures.ts',
+      });
+      ws.write('angular.json', `${JSON.stringify(angular, null, 2)}\n`);
+      ws.write('src/main.ts', `${ws.read('src/main.ts')}
+import { MOCK_RESTAURANT_ROWS } from './app/dev/mock-restaurants.fixtures';
+(globalThis as unknown as Record<string, unknown>)['__dinifyProbe'] = MOCK_RESTAURANT_ROWS.length;
+`);
+    },
+    ({ ws, gate, meta }) => {
+      assert.ok(meta.bytes.get('src/app/dev/mock-restaurants.fixtures.ts') > 1000, 'the synthetic portfolio shipped');
+      assert.deepEqual(scanBuildOutput(ws.path('dist'), { root: ws.dir }).markers, [], 'and carries no marker');
+      assert.equal(gate.status, EXIT.VIOLATION, gate.output);
+      assert.match(gate.output, /source: src\/app\/dev\/mock-restaurants\.fixtures\.ts is development-only and is in the production module graph \(src\/main\.ts -> src\/app\/dev\/mock-restaurants\.fixtures\.ts\)/);
+    },
+  );
+
+  scenario(
     'REGRESSION: a mock provider wired eagerly and the gallery routed lazily are caught by BOTH halves, in the initial bundle and in a lazy chunk',
     (ws) => {
       ws.mutate('src/app/app.config.ts', '    ...DEV_PROVIDERS,\n', "    ...DEV_PROVIDERS,\n    { provide: ADMIN_AUTH, useClass: MockAdminAuthApi },\n");

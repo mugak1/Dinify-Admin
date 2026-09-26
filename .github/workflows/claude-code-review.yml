@@ -49,8 +49,9 @@ jobs:
           github_token: ${{ github.token }}
           # Vendored at a pinned upstream commit, not fetched from the moving
           # default branch. It lives under `.claude/`, which the action replaces
-          # with the base branch's copy before installing plugins, so a PR cannot
-          # change the review it is given. See .claude/review-marketplace/README.md.
+          # with the base branch's copy before installing plugins, so a PR's edits
+          # to the plugin take effect only once merged. That does not cover a PR
+          # editing this workflow itself; see .claude/review-marketplace/README.md.
           plugin_marketplaces: './.claude/review-marketplace'
           plugins: 'code-review@dinify-claude-plugins'
           prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'

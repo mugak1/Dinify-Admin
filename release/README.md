@@ -326,6 +326,11 @@ The invariant behind each is unchanged.
 - OIDC, S3 and SSM;
 - the real host, whose paths are relocated. Apache is a `curl` stub, the bucket is a
   directory, and `df` and `date` are stubbed where a case needs them.
+- **Ownership**, when the matrix is not root. GitHub's runner is the unprivileged
+  `runner` user, so the model maps the procedure's two ownership lines (the `chown` to
+  root, and the refusal of anything not owned by root) to the current uid. Each must
+  match exactly once, or the model throws. Installed releases are given 0755/0644
+  explicitly rather than inheriting the runner's umask. As root nothing is mapped.
 
 The scanner's answers are canned in the suites. The live scanner is exercised by the real
 end-to-end proof in the PR, and by every CI run. **No production substitution was

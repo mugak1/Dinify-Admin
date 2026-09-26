@@ -10,9 +10,16 @@
  *     (and a canned admin-health answer); the S3 bucket is a directory the `aws` stub
  *     copies from; `df` and `date` may be replaced by stubs to model a full disk or a
  *     clock that passes a deadline mid-run;
+ *   - OWNERSHIP: the procedure runs as root on the host, `chown`s a release to root and
+ *     refuses any entry not owned by root. When the matrix itself runs as root (a
+ *     container), nothing is rewritten. When it does NOT — GitHub's hosted runner runs as
+ *     the unprivileged `runner` user — the two ownership lines are rewritten to name the
+ *     current uid:gid instead of root, exactly as the paths are relocated. Each rewrite
+ *     must match exactly once or the model throws, so a change to either line cannot
+ *     silently leave the ownership check unmodelled. The check itself still runs, with
+ *     the real `chown` and `find`, against the mapped owner;
  *   - everything else — bash, python3, tar extraction, find, chown, chmod, mv, sha256sum,
- *     mktemp — is the real tool. The script runs as the current user; the matrix runs as
- *     root in CI's container and the ownership checks are real there.
+ *     mktemp — is the real tool.
  *
  * Any command the stubs do not recognise exits 99, so a script change that starts calling
  * something new fails loudly here rather than falling through to a real cloud tool.
@@ -106,9 +113,21 @@ cp "${bucket}/$key" "$4"
     },
     calls: () => readFileSync(log, 'utf8'),
     live: () => realpathSync(current),
+    /**
+     * An already-installed release, in the state the procedure leaves one: dirs 0755,
+     * files 0644 — set explicitly, never inherited from the runner's umask (GitHub's
+     * runner and a container differ there). A case that wants another mode sets it.
+     */
     install(name, files) {
       const dir = join(releases, name);
       for (const [p, bytes] of files) { mkdirSync(dirname(join(dir, p)), { recursive: true }); writeFileSync(join(dir, p), bytes); }
+      const fix = (d) => {
+        chmodSync(d, 0o755);
+        for (const e of readdirSync(d, { withFileTypes: true })) {
+          if (e.isDirectory()) fix(join(d, e.name)); else chmodSync(join(d, e.name), 0o644);
+        }
+      };
+      fix(dir);
       return dir;
     },
     point(name) { symlinkSync(join(releases, name), current); },
@@ -117,12 +136,29 @@ cp "${bucket}/$key" "$4"
   };
 }
 
+/** The two ownership lines, mapped to the current user when the model is not root (see the header). */
+export function mapOwnership(script, uid = process.getuid(), gid = process.getgid()) {
+  if (uid === 0) return script;
+  const rewrites = [
+    ['chown -R root:root "${STAGE}/tree"', `chown -R ${uid}:${gid} "\${STAGE}/tree"`],
+    ['find "$dir" ! -user root -print -quit', `find "$dir" ! -user ${uid} -print -quit`],
+  ];
+  let out = script;
+  for (const [from, to] of rewrites) {
+    const n = out.split(from).length - 1;
+    if (n !== 1) throw new Error(`host model: expected exactly one "${from}" in the procedure, found ${n}`);
+    out = out.split(from).join(to);
+  }
+  return out;
+}
+
 /** Run the remote procedure with its placeholders filled, under the model. */
 export function runRemote(script, host, values, env = {}) {
   let s = script
     .replace(/^CURRENT=\/var\/www\/dinify-admin$/m, `CURRENT=${host.current}`)
     .replace(/^RELEASE_ROOT=\/var\/www\/dinify-admin-releases$/m, `RELEASE_ROOT=${host.releases}`)
     .replace(/^AWS_BIN=\/usr\/local\/bin\/aws$/m, `AWS_BIN=${host.bin}/aws`);
+  s = mapOwnership(s);
   for (const [k, v] of Object.entries(values)) s = s.split(`__${k}__`).join(v);
   if (/__[A-Z0-9_]+__/.test(s)) throw new Error(`unfilled placeholder: ${s.match(/__[A-Z0-9_]+__/)[0]}`);
   const file = join(host.root, 'deploy.sh');

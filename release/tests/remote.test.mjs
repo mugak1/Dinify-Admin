@@ -22,7 +22,7 @@ import { describe, it } from 'node:test';
 import { writeArchive } from '../lib/tar.mjs';
 import { describeFiles, sha256Hex, walkTree } from '../lib/tree.mjs';
 import { REPO_ROOT } from './fixtures.mjs';
-import { hostModel, remoteScriptOf, runRemote } from './host-model.mjs';
+import { hostModel, mapOwnership, remoteScriptOf, runRemote } from './host-model.mjs';
 import { archiveOf, rawMember } from './tar-craft.mjs';
 
 const SCRIPT = remoteScriptOf(readFileSync(join(REPO_ROOT, '.github/workflows/deploy.yml'), 'utf8'));
@@ -77,6 +77,21 @@ describe('the baseline fixture is the pre-B2.4 procedure', () => {
     const r = spawnSync('git', ['show', 'eb54c92:.github/workflows/deploy.yml'], { cwd: REPO_ROOT, encoding: 'utf8' });
     if (r.status !== 0) { t.skip('eb54c92 is not in this checkout (a shallow clone); the fixture was extracted from it and is reviewed as a file'); return; }
     assert.equal(remoteScriptOf(r.stdout), BASELINE);
+  });
+});
+
+describe('the model maps ownership only where it must', () => {
+  it('CONTRACT: as a non-root user, exactly the chown and the owner check are mapped in both procedures, and nothing else', () => {
+    for (const script of [SCRIPT, BASELINE]) {
+      const mapped = mapOwnership(script, 1001, 1002);
+      assert.match(mapped, /chown -R 1001:1002 "\$\{STAGE\}\/tree"/);
+      assert.match(mapped, /find "\$dir" ! -user 1001 -print -quit/);
+      assert.equal(mapped.split('\n').filter((l, i) => l !== script.split('\n')[i]).length, 2);
+      assert.equal(mapOwnership(script, 0, 0), script, 'as root nothing is rewritten');
+    }
+  });
+  it('CONTRACT: a procedure whose ownership lines changed is refused by the model rather than run unmodelled', () => {
+    assert.throws(() => mapOwnership(SCRIPT.replace('chown -R root:root', 'chown -R root:www-data'), 1001, 1001), /expected exactly one/);
   });
 });
 

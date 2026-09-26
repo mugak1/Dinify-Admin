@@ -26,8 +26,10 @@ name: Deploy Admin
 # TRANSPORT IS SSM OVER GITHUB OIDC, NEVER SSH. The instance's security group does not
 # admit GitHub-hosted runners — backend PR #281 retired the `appleboy/ssh-action` path
 # after it died at connect timeout, and the UAT_SSH_* secrets were deleted 2026-08-18.
-# No workflow in this repository references `secrets.` at all: OIDC needs no stored
-# credential. Do not reintroduce SSH, rsync, or Firebase Hosting here.
+# No deploy, CI or audit workflow references `secrets.`: OIDC needs no stored
+# credential. The one stored secret, CLAUDE_CODE_OAUTH_TOKEN, is read only by the two
+# Claude workflows, which hold no `id-token` (see CLAUDE.md → "Deployment"). Do not
+# reintroduce SSH, rsync, or Firebase Hosting here.
 #
 # ══════════════════════════════════════════════════════════════════════════════════
 # WHAT MAY BE PROMOTED (D08 B2.4)

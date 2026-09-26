@@ -2211,10 +2211,20 @@ nothing more:
 rsync, `appleboy/ssh-action`, or any stored SSH secret. That transport was deliberately
 retired by backend PR #281: the instance's security group does not admit GitHub-hosted
 runners, which is why the old SSH path died at connect timeout. The backend's
-`UAT_SSH_*` secrets were deleted 2026-08-18. **No workflow in this repo references
-`secrets.` at all** — OIDC needs no stored credential, and the role ARN lives in the
+`UAT_SSH_*` secrets were deleted 2026-08-18. **No deploy, CI or audit workflow
+references `secrets.`** — OIDC needs no stored credential, and the role ARN lives in the
 `AWS_DEPLOY_ROLE_ARN` repository *variable* (an ARN is not a secret) which the workflow
-compares byte-for-byte against the ARN pinned in the file before authenticating.
+compares byte-for-byte against the ARN pinned in the file before authenticating. The one
+stored secret in the repository is `CLAUDE_CODE_OAUTH_TOKEN`, read only by the two
+Claude workflows (`claude.yml`, `@claude` mentions; `claude-code-review.yml`, an
+automatic review when a PR is opened or marked ready). It is an Anthropic credential and
+grants nothing in AWS or on the box. **Neither Claude workflow may hold
+`id-token: write`**: the action installs its own npm dependencies inside the job, and
+`claude.yml`'s comment and issue events run from `refs/heads/main`, the identity the
+deploy role trusts. The stock setup grants that permission to exchange an OIDC token
+for the Claude app's token; here the action is handed the job's `github.token` instead,
+so Claude posts as `github-actions[bot]` and a commit it pushes does not start CI on its
+own. Both actions are pinned to full commit SHAs like the rest of this repo's workflows.
 
 ### THE PRIVILEGE BOUNDARY — TWO JOBS, AND IT MUST STAY TWO JOBS
 

@@ -48,8 +48,10 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
           # Vendored at a pinned upstream commit, not fetched from the moving
-          # default branch; see .github/claude-plugins/README.md.
-          plugin_marketplaces: './.github/claude-plugins'
+          # default branch. It lives under `.claude/`, which the action replaces
+          # with the base branch's copy before installing plugins, so a PR cannot
+          # change the review it is given. See .claude/review-marketplace/README.md.
+          plugin_marketplaces: './.claude/review-marketplace'
           plugins: 'code-review@dinify-claude-plugins'
           prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
           claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment"'

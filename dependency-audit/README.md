@@ -151,14 +151,19 @@ failed scan fails the run.
 
 Stated so none of it is inferred:
 
-- **The deploy re-installs; it does not re-audit.** `deploy.yml` builds from the same
-  lockfile (so the same graph, integrity-checked) and requires a successful `ci.yml` run on
-  main for the exact SHA — which now includes this audit. It does not bind a FRESH audit to
-  the built artifact, and a manual deploy or rollback can run long after that CI run. That
-  binding, and the 24-hour promotion freshness window, are the next B2 delivery.
+- **The deploy no longer re-installs or rebuilds (D08 B2.4).** `deploy.yml` promotes the
+  exact candidate `validate` certified, and before promotion it runs a FRESH assessment of
+  that candidate's RETAINED lock graph (the `package.json` / `package-lock.json` the
+  certification bound) and of the pinned scanner's own graph, under the trusted policy at
+  the deploy workflow's own revision. That replay is `lib/retained.mjs` — copied
+  byte-for-byte from Dinify-Frontend — and it is SCAN-ONLY: a directory holding exactly
+  the two retained files, no `node_modules`, no candidate script. It does not re-observe
+  what was installed at certification (those bytes are gone); that is the certification
+  snapshot, checked to be exactly the retained graph. The window is 24 hours from the
+  start of collection and the host enforces it. See `release/README.md`.
 - **Not audited here:** the GitHub Actions used by the workflows, the runner image's own
   tooling (the AWS CLI the deploy job uses included), and anything installed on the host.
 - **Branch protection is not changed.** "The audit is wired into `validate`" and "GitHub
   settings prevent bypassing `validate`" are separate facts; this change establishes only
   the first.
-- The pre-existing mock-isolation scanner's self-test/coverage work is a separate B2 item.
+- The mock-isolation scanner's self-test and coverage qualification landed separately (B2.3).

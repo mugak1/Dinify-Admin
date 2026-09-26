@@ -297,19 +297,41 @@ no evidence-free override for a new promotion.
 - `ci.yml`'s `checkout` and `setup-node` are now SHA-pinned to the same reviewed commits
   `deploy.yml` already used.
 
-## What merging does
+## What merging did (2026-09-26)
 
-Admin `main` deploys automatically.
+Admin `main` deploys automatically. This section was written before the merge as a
+forecast. It is now a record of the first certified promotion, the merge of #31,
+`M` = `a7ef20c452062e95f24ecec2a506d27882db587b`. Every figure below comes from the
+runs' own records, read through the GitHub API. None of it is a later live probe.
 
-1. `ci.yml` runs on the push of the merge commit `M`, certifies it, and uploads
-   `admin-candidate-<run>-1`. This is the first candidate that exists.
-2. `deploy.yml` starts from `workflow_run`. `prepare` installs the pinned scanner from
-   the registry, assesses `M`'s retained graph live, and writes the admission. `deploy`
-   verifies it. The ordering guard sees the served commit (currently `eb54c92`, unless
-   something is deployed in between), and `M` descends from it, so the run proceeds.
-3. The host installs `M` at `/var/www/dinify-admin-releases/M-<tree>` (a **new** naming
-   scheme) and promotes it. Every existing directory is left untouched.
-4. **Failure modes on this first run**, all fail-closed:
+1. `ci.yml` ran on the push of `M` (run `36245066677`, attempt 1), certified it, and
+   uploaded `admin-candidate-36245066677-1`. That is artifact `10907053040`, digest
+   `sha256:f37fad00cd863436feb3f8a0d6385ed6743322a81c102517c6ae629d39877043`, and it
+   was the first candidate that existed. Its listing gives an expiry of
+   2026-12-25T13:24:37Z.
+2. `deploy.yml` started from `workflow_run` (run `36245215836`).
+   - `prepare` (job `108413049301`) downloaded the candidate by id with its digest
+     enforced. Its fresh assessment of `M`'s retained graph answered
+     **WITHIN POLICY, no advisories reported**, collected
+     13:27:38.097Z → 13:27:40.713Z, promotion deadline 2026-09-27T13:27:38Z
+     (epoch `1790515658`). The admission is artifact `10906024764`.
+   - `deploy` (job `108413111466`) re-derived and verified the admission.
+   - The ordering guard read the served commit `eb54c92`, and `M` descends from it:
+     `AUTO-PROCEED`.
+3. The host (SSM command `8a17f265-1071-4580-8133-f3dbd880887d`, `Success`):
+   - verified archive `1175a79d…` (`ARCHIVE-MEMBERS: 16`);
+   - reported `PAYLOAD-VERIFIED sha256:2a0ec6a68dafbd2fea106d5d151257b3d093acda1c22e858ece58f2454776fbb`
+     for the staged and the installed release;
+   - installed `M` at `/var/www/dinify-admin-releases/a7ef20c…-2a0ec6a6…`, the **new**
+     naming scheme;
+   - promoted it from the previous target `/var/www/dinify-admin-releases/eb54c92…`;
+   - emitted `DEPLOYED-PAYLOAD` and `DEPLOYED-HEAD` once each.
+
+   The runner's public check (13:28:22–25Z) read `release.txt` as `M` with
+   `no-store`, admin health `ok`, `/` 200, and 16/16 admitted files served byte for
+   byte.
+4. **Failure modes on this first run**, all fail-closed. **None of them occurred**, so
+   none has been exercised on the live host:
    - a new advisory against `M`'s graph: `M` is not deployed and `eb54c92` stays live;
    - a scanner or registry failure: incomplete, red, nothing deployed;
    - a public byte-for-byte check that fails after the host switched: red, **DEGRADED**.
@@ -317,10 +339,31 @@ Admin `main` deploys automatically.
      to `eb54c92`.
 5. `eb54c92` and earlier remain reachable by **legacy rollback only**, as above.
 
+**Still not exercised on the live host.** Only the forward certified path ran. These
+rest on the source, the suites and the local host model:
+- certified rollback;
+- same-commit directory reuse;
+- the `AUTO-SKIP-*` decisions, including refusing a stale automatic run;
+- the host refusing a lapsed deadline or a payload-tree mismatch;
+- DEGRADED and restore-previous;
+- a legacy rollback under this procedure.
+
 **Coordination.** `deploy.yml` is the file Dinify-Frontend's Admin peer receipt covers.
-The Frontend compatible set still approves Admin `1993a087`. The first deployment of `M`
-will turn Frontend's next readiness run red (`peers.admin_serving_unapproved`) until a
-receipt for `M` is approved. That refresh is a separate change in Dinify-Frontend.
+When `M` merged (13:24:35Z) and deployed (13:28Z), the Frontend compatible set still
+approved Admin `1993a087` (`2026-09-25-pilot-5`), as this section had said. Frontend
+#703 merged at 14:04:54Z and moved the set to `eb54c92` (`2026-09-26-pilot-6`), which
+did not include `M` either. As forecast, the first Frontend readiness run after the
+deployment went red: run `36247543634`, on #703's merge, refused
+`peers.admin_serving_unapproved` — "admin serves `a7ef20c…`, which is not in
+compatible set 2026-09-26-pilot-6". Frontend #704 then approved `M`, compatible set
+`2026-09-26-pilot-7`, receipt
+`sha256:c21ad7c5142e05dcd7020545a3f71ee3e92e612f7a4499d7002c25abb16381e2`. Its merge's
+readiness run (`36249940983`) completed as a green, non-publishing evaluation.
+
+**Every later Admin merge repeats this.** `ci.yml` has no path filter, so a merge
+deploys a new commit whatever it changes, this documentation included. Frontend
+readiness then refuses `peers.admin_serving_unapproved` until that commit's receipt is
+approved in Dinify-Frontend.
 
 ## How it is tested
 

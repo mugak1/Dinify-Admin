@@ -51,13 +51,15 @@ audit:deps → release:certify → upload admin-candidate-<run>-<attempt>
   from anywhere else cannot be certified. Empty directories carry no byte, and are
   tolerated and recorded. That matters because `test:ci` runs first, and the Karma
   builder leaves an empty `dist/test-out/` behind. It also refuses an inventory that moved
-  since the audit snapshot. It opens the chain in `release/.work/continuity.json`.
+  since the audit snapshot, and a SOURCE that is not the commit (below). It opens the
+  chain in `release/.work/continuity.json`.
 - **`freeze`** records the tree digest of exactly the output the mock-isolation gate
-  scanned, and re-checks the inventory. The output must not contain `release.txt`, which
-  is reserved.
+  scanned, and re-checks the inventory and the source. The output must not contain
+  `release.txt`, which is reserved.
 - **`certify`** requires all of the following:
   - the output is still the frozen tree;
   - the inventory is still the snapshot;
+  - the source is still the commit;
   - the audit evidence belongs to this checkout, is passing, and re-evaluates to the same
     decision from its own raw output;
   - the run context is the policy's (`mugak1/Dinify-Admin`, `ci.yml`, job `validate`),
@@ -74,8 +76,48 @@ audit:deps → release:certify → upload admin-candidate-<run>-<attempt>
 - **A pull-request run produces a candidate the same way, and it is never promotable.**
   Retention is 7 days for a pull request and 90 days for a push.
 
+### The source the build read is the commit
+
+The record names `HEAD` and `HEAD^{tree}`, but `ng build` reads the WORKING TREE. An
+`npm ci` lifecycle script or any earlier step in `validate` could leave a tracked file
+different from the commit, and the freeze and the consumer would see only the payload
+and the five retained inputs (Codex P1 on #31). So `verifySource` reads the worktree
+itself at `prebuild`, `freeze` and `certify`:
+
+- **Every entry of the commit** (`git ls-tree -r`, the commit's own objects) must be
+  present with the committed bytes and mode. That is a regular file whose blob id is the
+  committed one and whose executable bit agrees, or a link whose target is. It never
+  reads `git status` or the index: `--skip-worktree` hides a change from `git status`, and
+  a staged change makes the index agree with the worktree. Both are refused, and a test
+  pins each.
+- **Every other file, link or special entry** must lie under a generated root the job
+  writes: `node_modules`, the scanner's install, `dist`, the audit evidence and
+  `release/.work`. Each must be a real directory, because a link would bring in bytes
+  from outside the checkout. `.gitignore` is not consulted, because an ignored `.env` or
+  Angular cache is still something the build can read. CI sets `CI=true`, so Angular's
+  cache is off and none may exist.
+
+Empty directories are tolerated, as under `dist/`. A submodule cannot be verified, and it
+is refused. The refusals are `source_modified`, `source_untracked` and
+`source_unverifiable`.
+
+The record carries `source`: the verification name, the file count, the generated roots
+present, the three instants, and a digest. The digest is taken over the `[path, mode,
+object id]` rows **as observed in the worktree**, sorted by path.
+
+The consumer's `commitFacts` computes the same digest from the commit's recursive tree
+listing as the API returns it, and inspection refuses `wrong_source` unless the two are
+equal. A listing that states no modes yields no source fact, so the candidate is refused
+rather than assumed. The legacy rollback path does not read it.
+
+**The limit, stated.** The worktree is compared at three instants, so a change made and
+undone between two of them is not seen. Code running inside `validate` can do that, just
+as it can rewrite anything else the job writes. That is the same boundary the inventory
+states: a digest of installed paths and versions, not of every executable byte.
+
 The record binds:
 - the repository, commit and tree, and the git blob of every input;
+- the source the build read, verified against the commit at all three stages;
 - the workflow path, job, event, ref, run and attempt;
 - the configuration, the Node and npm versions, and the environment;
 - the inventory binding, the scanner identity, and the audit outcome and invocation time;
@@ -94,8 +136,9 @@ The record binds:
    `github.sha` (the workflow's own revision, never the target): sparse, depth 1, no
    persisted credential.
 3. **Ancestry, and CI green on `main`** (unchanged).
-4. **Read the facts from the API.** This covers the target commit and its tree (inputs by
-   blob, and whether the tree carries `release/policy.json`). It also covers the
+4. **Read the facts from the API.** This covers the target commit and its recursive tree:
+   inputs by blob, whether the tree carries `release/policy.json`, and the source digest
+   over every entry's path, mode and object id. It also covers the
    `release/` and `dependency-audit/` trees at the workflow revision and on `main` now.
 5. **Select the candidate.**
    - Automatic runs use the triggering run and nothing else.
@@ -286,7 +329,7 @@ receipt for `M` is approved. That refresh is a separate change in Dinify-Fronten
 | suite | holds |
 |---|---|
 | `tree-archive` | the tree digest (Node and the host's Python, against Dinify-Frontend's vector); archive round trip and reproducibility; 13 refused archive shapes |
-| `certification` | the producer interfered with at one boundary per case (stale output, inventory moved during the build or after the audit, output moved after freeze, blocking or incomplete audit, missing or forged raw output); the consumer refusing a PR candidate, the wrong run, attempt, commit, tree, repository, configuration or inputs, and a same-SHA substituted payload |
+| `certification` | the producer interfered with at one boundary per case (stale output, inventory moved during the build or after the audit, output moved after freeze, blocking or incomplete audit, missing or forged raw output); the source moved before the build, during it and after the freeze, a deleted file, a flipped executable bit, a file replaced by a link to identical bytes, a change hidden by `--skip-worktree`, a staged change, an untracked and an ignored file, and a generated root that is a link; the consumer refusing a PR candidate, the wrong run, attempt, commit, tree, source, repository, configuration or inputs, a record with no source, a listing with no modes, and a same-SHA substituted payload |
 | `assessment` | a clean control; a newly published high advisory against unchanged bytes; four scanner failures, and scanner install failure; the trusted policy overriding the certification-time exception; record lapse inside the window; the reproduction refusing a rewritten outcome, swapped raw output, another candidate, an extra file, a moved window, a future decision |
 | `admission` | run and artifact selection (13 refusal cases, including the other-attempt artifact, ambiguity and a truncated listing); the decision (legacy rollback, pre-contract deploy, moved policy, another evaluation's assessment, another artifact, a substituted payload); the privileged re-decision (disagreement, received-bytes mismatch, margin, legacy) |
 | `remote` | the host procedure **as `deploy.yml` embeds it**, under a host model: install, identical reuse, **same-SHA substitution refused**, 9 hostile archives, digest mismatch, a consistent-but-different archive, the deadline at start and mid-install, certified and legacy rollback, health and `index.html` failures restoring, permissions. It also runs **the pre-change procedure** (`tests/baseline/remote-eb54c92.sh`, extracted verbatim and pinned to the history when present) against the same states as distinguishing controls |
@@ -312,6 +355,23 @@ a named subset:
 - the upload not re-hashing;
 - the evaluation attempt not bound;
 - the admission listing digest not compared.
+
+Eight more were run for the source binding, and each failed only its own case or cases:
+
+| mutation | failed |
+|---|---|
+| mode not compared | 1 |
+| no walk for untracked files | 3 |
+| a generated root allowed to be a link | 1 |
+| the consumer ignoring the source digest | 2 |
+| freeze and certify verifying but ignoring the answer | 2 |
+| `commitFacts` not requiring modes | 1 |
+| `git status` instead of bytes | 1 (the skip-worktree case) |
+| the index (`ls-files -s`) instead of the commit | 1 (the staged case) |
+
+Every new regression case was first run against the unfixed code: 12 of the 13 failed,
+and the 13th is the control that must not change. The staged case was added after that
+run, to distinguish the index from the commit, and it is pinned by the last mutation.
 
 **Two pre-existing oracles were corrected, not deleted.**
 - `scripts/tests/mock-isolation.test.mjs` asserted that the deploy builds and gates the

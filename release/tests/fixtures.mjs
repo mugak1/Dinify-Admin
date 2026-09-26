@@ -53,6 +53,9 @@ export function ciEnv(root, overrides = {}) {
   };
 }
 
+/** The fixture's one application source file (committed; the "build" does not read it). */
+export const SOURCE_MAIN = 'console.log("certified source");\n';
+
 export const BUILT = {
   'index.html': '<!doctype html><html><head><script src="main-AAAA1111.js" type="module"></script></head><body></body></html>\n',
   'main-AAAA1111.js': 'console.log("certified main");\n',
@@ -80,6 +83,8 @@ export function freshProject({ nodeMajor = Number(process.versions.node.split('.
   write(join(p.root, 'release', 'policy.json'), policy);
   write(join(p.root, 'angular.json'), { projects: { dinify_admin: { architect: { build: { configurations: { production: {} } } } } } });
   write(join(p.root, '.gitignore'), '/node_modules/\n/dist/\n/dependency-audit/evidence/\n/dependency-audit/scanner/node_modules/\n/release/.work/\n');
+  // Application source the build reads, so the source-worktree cases have something to move.
+  write(join(p.root, 'src', 'main.ts'), SOURCE_MAIN);
   git(p.root, 'init', '-q', '-b', 'main');
   git(p.root, 'add', '-A');
   git(p.root, 'commit', '-q', '-m', 'fixture');
@@ -99,6 +104,7 @@ export function writeBuild(root, files = BUILT) {
 export function certifiedProject({ answers = {}, env = {}, between = {}, records = [], withVerifier = false } = {}) {
   const p = freshProject({ records, withVerifier });
   const stages = {};
+  between.beforePrebuild?.(p);
   stages.prebuild = prebuild(p.root, { now: NOW });
   between.afterPrebuild?.(p);
   writeBuild(p.root, between.build ?? BUILT);
@@ -125,8 +131,8 @@ export function apiFacts(project, { run = {}, artifact = {}, workflowId = 77 } =
   const tree = git(project.root, 'rev-parse', 'HEAD^{tree}');
   const list = (recursive) => git(project.root, 'ls-tree', ...(recursive ? ['-r', '-t'] : []), 'HEAD').split('\n').filter(Boolean).map((l) => {
     const [meta, path] = l.split('\t');
-    const [, type, sha] = meta.split(' ');
-    return { path, type, sha };
+    const [mode, type, sha] = meta.split(' ');
+    return { path, mode, type, sha };
   });
   const runJson = { id: Number(RUN_ID), workflow_id: workflowId, path: '.github/workflows/ci.yml', event: 'push', head_branch: 'main', head_sha: commit, status: 'completed', conclusion: 'success', run_attempt: Number(RUN_ATTEMPT), ...run };
   const art = {
@@ -190,7 +196,7 @@ export function evaluatedProject({ answers = {}, assessAnswers = {}, records = [
   const f = apiFacts(p, facts);
   const { policy } = loadReleasePolicy(p.root);
   const commit = commitFacts({ target: p.commit, commit: f.commit, tree: f.tree }).facts;
-  const inspection = inspectCandidate(candidateFiles(p.candidateDir), { policy, commit: p.commit, tree: commit.tree, inputBlobs: commit.inputBlobs, runId: RUN_ID, runAttempt: RUN_ATTEMPT });
+  const inspection = inspectCandidate(candidateFiles(p.candidateDir), { policy, commit: p.commit, tree: commit.tree, inputBlobs: commit.inputBlobs, sourceDigest: commit.sourceDigest, runId: RUN_ID, runAttempt: RUN_ATTEMPT });
   const out = tempDir('assessment-');
   const replay = tempDir('replay-');
   const art = f.artifacts.artifacts[0];

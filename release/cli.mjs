@@ -140,13 +140,16 @@ function main(argv) {
     case 'freeze': {
       const r = (command === 'prebuild' ? prebuild : freeze)(ROOT, { now: clock() });
       if (!r.ok) { report(r.problems, `release ${command}: REFUSED — no candidate can be certified from this build.`); return 1; }
-      console.log(command === 'freeze' ? `release freeze: the output the mock-isolation gate scanned is ${r.treeDigest} (${r.entryCount} files)` : `release prebuild: no prior output bytes${r.emptyDirectories.length ? ` (${r.emptyDirectories.length} empty director${r.emptyDirectories.length === 1 ? 'y' : 'ies'} tolerated: ${r.emptyDirectories.join(', ')})` : ''}; the installed inventory is still the audit snapshot`);
+      console.log(command === 'freeze'
+        ? `release freeze: the output the mock-isolation gate scanned is ${r.treeDigest} (${r.entryCount} files); the source is still the commit`
+        : `release prebuild: no prior output bytes${r.emptyDirectories.length ? ` (${r.emptyDirectories.length} empty director${r.emptyDirectories.length === 1 ? 'y' : 'ies'} tolerated: ${r.emptyDirectories.join(', ')})` : ''}; the installed inventory is still the audit snapshot; the source is ${r.source.commit} byte for byte (${r.source.files} files, ${r.source.digest})`);
       return 0;
     }
     case 'certify': {
       const r = certify(ROOT, { now: clock() });
       if (!r.ok) { report(r.problems, 'release certify: REFUSED — no candidate is produced.'); return 1; }
       console.log(`release certify: candidate for ${r.record.commit} (run ${r.record.workflow.runId} attempt ${r.record.workflow.runAttempt}, ${r.record.workflow.event})`);
+      console.log(`  source           ${r.record.source.digest} (${r.record.source.files} files, verified at prebuild, freeze and certify)`);
       console.log(`  payload tree     ${r.record.payload.treeDigest} (${r.record.payload.entryCount} files)`);
       console.log(`  payload archive  sha256:${r.record.payload.archive.sha256}`);
       console.log(`  certification    ${r.recordDigest}`);
@@ -201,7 +204,7 @@ function main(argv) {
       if (!problems.length && commit.facts?.hasContract) {
         const sel = selectCertification({ policy: state.policy, target: a.target, ...cert });
         if (sel.selection) {
-          const inspection = inspectCandidate(cand.files, { policy: state.policy, commit: a.target, tree: commit.facts.tree, inputBlobs: commit.facts.inputBlobs, runId: sel.selection.runId, runAttempt: sel.selection.runAttempt });
+          const inspection = inspectCandidate(cand.files, { policy: state.policy, commit: a.target, tree: commit.facts.tree, inputBlobs: commit.facts.inputBlobs, sourceDigest: commit.facts.sourceDigest, runId: sel.selection.runId, runAttempt: sel.selection.runAttempt });
           if (!inspection.problems.length) {
             const r = assess({
               trustedRoot: ROOT, inspection,

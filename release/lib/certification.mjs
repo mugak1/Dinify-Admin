@@ -10,14 +10,16 @@
  *
  *   prebuild  before `npm run build:prod`. The output path must hold no file, link or
  *             other entry yet (a stale dist/ from anywhere else cannot be certified; an
- *             EMPTY directory, which carries no byte, is tolerated — see priorOutput), and
- *             the installed inventory must still be the audit snapshot taken after `npm ci`.
+ *             EMPTY directory, which carries no byte, is tolerated — see priorOutput), the
+ *             installed inventory must still be the audit snapshot taken after `npm ci`, and
+ *             the SOURCE the build is about to read must be the commit (verifySource).
  *   freeze    after the mock-isolation gate. Records the tree digest of the output that
- *             gate scanned, and again proves the inventory has not moved.
+ *             gate scanned, and again proves the inventory and the source have not moved.
  *   certify   after the dependency audit. Proves the output is still exactly the frozen
- *             tree, the inventory still the snapshot, the audit evidence THIS checkout's and
- *             passing (and reproducible offline from its own raw output), then writes the
- *             candidate: payload.tar.gz, evidence/ and certification.json.
+ *             tree, the inventory still the snapshot, the source still the commit, the audit
+ *             evidence THIS checkout's and passing (and reproducible offline from its own
+ *             raw output), then writes the candidate: payload.tar.gz, evidence/ and
+ *             certification.json.
  *
  * The chain prebuild → freeze → certify is recorded in release/.work/continuity.json and
  * each link re-checks the commit and the inventory, so evidence from another checkout, an
@@ -25,7 +27,11 @@
  *
  * WHAT IS OBSERVED AND WHAT IS NOT: the inventory is a digest of installed package PATHS
  * AND VERSIONS as npm wrote them (dependency-audit/lib/npm.mjs), not of every executable
- * byte; the payload tree digest IS a digest of every served byte.
+ * byte; the payload tree digest IS a digest of every served byte; and the source is every
+ * tracked file's own bytes, mode and path, read from the worktree and compared with the
+ * commit — at three instants, so a change made and undone between two of them is not
+ * seen. Code running inside the job can do that, as it can rewrite anything else the job
+ * writes; that is the same boundary the inventory states, not a new one.
  *
  * CONSUMER (inspectCandidate): pure, over the candidate's files as a Map. It re-derives
  * everything the record claims — the archive, the tree, the evidence files, the audit
@@ -34,7 +40,8 @@
  * candidate cannot vouch for itself.
  */
 
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import { capture, gitRevision, loadPolicy, reevaluate, SNAPSHOT_SCHEMA, COLLECTION_SCHEMA, RESULT_SCHEMA, POLICY_SCHEMA } from '../../dependency-audit/lib/audit.mjs';
@@ -58,6 +65,10 @@ export const RECORD = 'certification.json';
 export const ARCHIVE = 'payload.tar.gz';
 export const RELEASE_TXT = 'release.txt';
 export const PASSING = Object.freeze(['within_policy', 'exceptions_only']);
+export const SOURCE_VERIFICATION = 'worktree-bytes-equal-commit-tree';
+export const SOURCE_STAGES = Object.freeze(['prebuild', 'freeze', 'certify']);
+/** Installed by `npm ci` and by the audit; covered by the inventory statement, never source. */
+const DEPENDENCY_ROOTS = Object.freeze(['node_modules', 'dependency-audit/scanner/node_modules']);
 
 /** The certified dependency INPUTS, by their repository path. Each is retained under evidence/inputs/. */
 export const INPUTS = Object.freeze([
@@ -152,6 +163,102 @@ export function priorOutput(dir) {
   return { entries, emptyDirectories };
 }
 
+/**
+ * The digest of a commit's non-directory entries as [path, mode, object id] rows sorted by
+ * path. The producer computes it from the WORKTREE (verifySource); the consumer computes it
+ * from the commit's tree listing as the API returns it (admission.commitFacts). They agree
+ * exactly when the worktree the build read was the commit.
+ */
+export function sourceDigestOf(entries) {
+  const rows = entries.map((e) => [e.path, e.mode, e.id]).sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  return digestOfValue(rows);
+}
+
+const listed = (items, max = 10) => `${items.slice(0, max).join(', ')}${items.length > max ? ` and ${items.length - max} more` : ''}`;
+
+/**
+ * THE SOURCE THE BUILD READS IS THE COMMIT (Codex P1 on PR #31). The record names HEAD and
+ * HEAD^{tree}; `ng build` reads the WORKING TREE. So this reads the worktree itself:
+ *
+ *   - every entry of the commit (`git ls-tree -r`, the commit's own objects — never the
+ *     index, whose skip-worktree and assume-unchanged flags can hide a change from `git
+ *     status`) must be present with the committed BYTES and MODE: a regular file whose blob
+ *     id is the committed one and whose executable bit agrees, or a link whose target is;
+ *   - every other file, link or special entry in the checkout must lie under a GENERATED
+ *     root the job writes: node_modules and the scanner's install (the inventory's
+ *     subject), the build output, the audit evidence and release/.work. Each of those must
+ *     be a real directory — a generated root that is a link would bring bytes from outside
+ *     the checkout. .gitignore is not consulted: an ignored file is still a file the build
+ *     can read (a .env, an Angular cache — which CI does not use, so none may exist).
+ *
+ * Empty directories carry no byte and are tolerated, as in priorOutput. A submodule cannot
+ * be verified and is refused. Returns {problems, facts}; facts.digest is sourceDigestOf the
+ * entries AS OBSERVED, so it equals the commit's only when nothing was refused.
+ */
+export function verifySource(root, { outputPath }) {
+  const problems = [];
+  const rev = gitRevision(root);
+  if (!rev) return { problems: [reason('source_unverifiable', 'git cannot name the checkout, so its source cannot be compared with anything')], facts: null };
+  let listing;
+  try {
+    listing = execFileSync('git', ['ls-tree', '-r', '-z', '--full-tree', rev.commit], { cwd: root, maxBuffer: 256 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (error) {
+    return { problems: [reason('source_unverifiable', `git cannot list ${rev.commit}: ${String(error.stderr ?? error.message).trim().split('\n')[0]}`)], facts: null };
+  }
+  const tracked = new Map();
+  for (const rec of listing.toString('utf8').split('\0')) {
+    if (!rec) continue;
+    const tab = rec.indexOf('\t');
+    const [mode, type, id] = rec.slice(0, tab).split(' ');
+    tracked.set(rec.slice(tab + 1), { mode, type, id });
+  }
+
+  const modified = [];
+  const observed = [];
+  for (const [path, e] of tracked) {
+    if (e.type !== 'blob') { problems.push(reason('source_unverifiable', `${path} is a ${e.type} (mode ${e.mode}); only files and links can be compared`)); continue; }
+    const full = join(root, path);
+    let st;
+    try { st = lstatSync(full); } catch { modified.push(`${path} (missing)`); continue; }
+    let mode;
+    let id;
+    try {
+      if (st.isSymbolicLink()) { mode = '120000'; id = gitBlobSha1(readlinkSync(full, { encoding: 'buffer' })); }
+      else if (st.isFile()) { mode = (st.mode & 0o100) ? '100755' : '100644'; id = gitBlobSha1(readFileSync(full)); }
+      else { modified.push(`${path} (not a file)`); continue; }
+    } catch (error) { problems.push(reason('source_unverifiable', `${path} cannot be read: ${error.code ?? error.message}`)); continue; }
+    observed.push({ path, mode, id });
+    if (mode !== e.mode) modified.push(`${path} (mode ${mode}, committed ${e.mode})`);
+    else if (id !== e.id) modified.push(path);
+  }
+  if (modified.length) problems.push(reason('source_modified', `the worktree is not ${rev.commit}: ${listed(modified)} — the build would read source the record does not name`));
+
+  const generated = [...new Set([...DEPENDENCY_ROOTS, outputPath, AUDIT_EVIDENCE_DIR, WORK_DIR])].sort();
+  const present = [];
+  const untracked = [];
+  const visit = (rel) => {
+    let names;
+    try { names = readdirSync(rel ? join(root, rel) : root).sort(); } catch (error) { problems.push(reason('source_unverifiable', `${rel || '.'} cannot be listed: ${error.code ?? error.message}`)); return; }
+    for (const name of names) {
+      const p = rel ? `${rel}/${name}` : name;
+      if (p === '.git') continue;
+      let st;
+      try { st = lstatSync(join(root, p)); } catch (error) { problems.push(reason('source_unverifiable', `${p} cannot be read: ${error.code ?? error.message}`)); continue; }
+      if (generated.includes(p)) {
+        if (st.isDirectory()) present.push(p);
+        else untracked.push(`${p} (a generated root that is not a directory)`);
+        continue;
+      }
+      if (st.isDirectory()) { visit(p); continue; }
+      if (!tracked.has(p)) untracked.push(p);
+    }
+  };
+  visit('');
+  if (untracked.length) problems.push(reason('source_untracked', `the checkout holds ${listed(untracked)}, which ${rev.commit} does not — the build could read it`));
+
+  return { problems, facts: { commit: rev.commit, tree: rev.tree, digest: sourceDigestOf(observed), files: tracked.size, generatedRoots: present.sort() } };
+}
+
 /** Step 1 of 3, before the build. */
 export function prebuild(root, { now }) {
   const problems = [];
@@ -168,10 +275,16 @@ export function prebuild(root, { now }) {
   const { snapshot, problems: sp } = snapshotOf(root);
   problems.push(...sp);
   if (snapshot) problems.push(...inventoryStill(root, snapshot));
+  const source = verifySource(root, { outputPath: policy.build.outputPath });
+  problems.push(...source.problems);
   if (problems.length) return { ok: false, problems };
   const rev = gitRevision(root);
-  writeContinuity(root, { schema: CONTINUITY_SCHEMA, commit: rev.commit, tree: rev.tree, bindingDigest: digestOfValue(snapshot.binding), prebuildAt: now, emptyDirectoriesBeforeBuild: prior.emptyDirectories, frozen: null });
-  return { ok: true, problems: [], emptyDirectories: prior.emptyDirectories };
+  if (source.facts.commit !== rev.commit) return { ok: false, problems: [reason('source_unverifiable', 'the checkout moved while its source was being read')] };
+  writeContinuity(root, {
+    schema: CONTINUITY_SCHEMA, commit: rev.commit, tree: rev.tree, bindingDigest: digestOfValue(snapshot.binding), prebuildAt: now,
+    emptyDirectoriesBeforeBuild: prior.emptyDirectories, source: { digest: source.facts.digest, files: source.facts.files, verifiedAt: { prebuild: now } }, frozen: null,
+  });
+  return { ok: true, problems: [], emptyDirectories: prior.emptyDirectories, source: source.facts };
 }
 
 function continuityChecks(root, stage) {
@@ -187,7 +300,15 @@ function continuityChecks(root, stage) {
   if (cont && (!rev || rev.commit !== cont.commit || rev.tree !== cont.tree)) problems.push(reason('continuity_broken', 'the checkout is not the commit prebuild recorded'));
   if (cont && snapshot && digestOfValue(snapshot.binding) !== cont.bindingDigest) problems.push(reason('continuity_broken', 'the audit snapshot is not the one prebuild recorded'));
   if (snapshot) problems.push(...inventoryStill(root, snapshot));
-  return { policy, cont, snapshot, rev, problems };
+  let source = null;
+  if (policy) {
+    const v = verifySource(root, { outputPath: policy.build.outputPath });
+    problems.push(...v.problems);
+    source = v.facts;
+    if (cont && !isObject(cont.source)) problems.push(reason('continuity_broken', 'prebuild recorded no source verification'));
+    else if (cont && source && !v.problems.length && source.digest !== cont.source.digest) problems.push(reason('continuity_broken', 'the source is not the one prebuild verified'));
+  }
+  return { policy, cont, snapshot, rev, source, problems };
 }
 
 function builtTree(root, policy) {
@@ -208,7 +329,10 @@ export function freeze(root, { now }) {
     if (cont && cont.frozen) problems.push(reason('continuity_broken', 'the output was already frozen once'));
     if (!problems.length) {
       const d = describeFiles(built.files);
-      writeContinuity(root, { ...cont, frozen: { at: now, treeDigest: d.treeDigest, entryCount: d.entryCount } });
+      writeContinuity(root, {
+        ...cont, source: { ...cont.source, verifiedAt: { ...cont.source.verifiedAt, freeze: now } },
+        frozen: { at: now, treeDigest: d.treeDigest, entryCount: d.entryCount },
+      });
       return { ok: true, problems: [], treeDigest: d.treeDigest, entryCount: d.entryCount };
     }
   }
@@ -240,10 +364,11 @@ export function workflowContext(env = process.env) {
 
 /** Step 3 of 3, after the dependency audit. Writes the candidate. */
 export function certify(root, { now, env = process.env }) {
-  const { policy, cont, snapshot, rev, problems } = continuityChecks(root, 'certify');
+  const { policy, cont, snapshot, rev, source, problems } = continuityChecks(root, 'certify');
   const { ctx, problems: cp } = workflowContext(env);
   problems.push(...cp);
-  if (!policy || !cont || !snapshot || !rev || problems.length) return { ok: false, problems };
+  if (!policy || !cont || !snapshot || !rev || !source || problems.length) return { ok: false, problems };
+  if (!isInstant(cont.source?.verifiedAt?.freeze)) return { ok: false, problems: [reason('continuity_broken', 'the source was not verified when the output was frozen')] };
 
   if (ctx.sha !== rev.commit) problems.push(reason('context_mismatch', `the run is for ${ctx.sha}, the checkout is ${rev.commit}`));
   if (ctx.repository !== policy.repository) problems.push(reason('context_mismatch', `the run is in ${ctx.repository}, the policy names ${policy.repository}`));
@@ -342,6 +467,13 @@ export function certify(root, { now, env = process.env }) {
       reevaluatedAt: reeval.decidedAt,
       reevaluatedOutcome: reeval.outcome,
     },
+    source: {
+      verification: SOURCE_VERIFICATION,
+      digest: source.digest,
+      files: source.files,
+      generatedRoots: source.generatedRoots,
+      verifiedAt: { prebuild: cont.source.verifiedAt.prebuild, freeze: cont.source.verifiedAt.freeze, certify: now },
+    },
     continuity: { prebuildAt: cont.prebuildAt, frozenAt: cont.frozen.at, frozenTreeDigest: cont.frozen.treeDigest, certifiedAt: now },
     payload: {
       treeDigest: described.treeDigest,
@@ -393,6 +525,11 @@ export function validateRecord(r) {
   if (!isObject(a) || typeof a.outcome !== 'string' || !Number.isInteger(a.exitCode) || !isInstant(a.invokedAt) || !HEX_RE.test(String(a.policySha256))) p('audit');
   const c = r.continuity;
   if (!isObject(c) || !isInstant(c.prebuildAt) || !isInstant(c.frozenAt) || !isInstant(c.certifiedAt) || !DIGEST_RE.test(String(c.frozenTreeDigest))) p('continuity');
+  const src = r.source;
+  if (!isObject(src) || src.verification !== SOURCE_VERIFICATION || !DIGEST_RE.test(String(src.digest)) || !Number.isInteger(src.files) || src.files < 1
+      || !Array.isArray(src.generatedRoots) || !src.generatedRoots.every((g) => typeof g === 'string')
+      || !isObject(src.verifiedAt) || Object.keys(src.verifiedAt).join() !== SOURCE_STAGES.join() || !SOURCE_STAGES.every((st) => isInstant(src.verifiedAt[st]))
+      || (isObject(c) && (src.verifiedAt.prebuild !== c.prebuildAt || src.verifiedAt.freeze !== c.frozenAt || src.verifiedAt.certify !== c.certifiedAt))) p('source');
   const pl = r.payload;
   if (!isObject(pl) || !DIGEST_RE.test(String(pl.treeDigest)) || !Number.isInteger(pl.entryCount) || !HEX_RE.test(String(pl.indexSha256))
       || !isObject(pl.release) || pl.release.path !== RELEASE_TXT || !Array.isArray(pl.entries)
@@ -425,6 +562,7 @@ export function lockOnlyInventory(graph, manifestBytes, lockBytes) {
  * @param {string} expect.commit       the target commit
  * @param {string} expect.tree         that commit's tree, as git or the API holds it
  * @param {object} expect.inputBlobs   {path: git blob id} of the INPUTS at that commit
+ * @param {string} expect.sourceDigest sourceDigestOf that commit's tree listing (commitFacts)
  * @param {string} expect.runId        the certifying run the API reports
  * @param {string} expect.runAttempt   its attempt
  * @returns facts; `problems` empty means the candidate is what it claims to be
@@ -482,6 +620,8 @@ export function inspectCandidate(files, expect) {
   want('wrong_repository', r.repository === policy.repository, `${r.repository} != ${policy.repository}`);
   want('wrong_commit', r.commit === expect.commit, `${r.commit} != ${expect.commit}`);
   want('wrong_tree', r.tree === expect.tree, `${r.tree} != ${expect.tree}`);
+  want('wrong_source', DIGEST_RE.test(String(expect.sourceDigest)) && r.source.digest === expect.sourceDigest,
+    `the build read source ${r.source.digest}; the commit tree the API holds is ${String(expect.sourceDigest ?? 'not stated')}`);
   want('wrong_workflow', r.workflow.path === policy.certification.workflowPath && r.workflow.job === policy.certification.job, `${r.workflow.path}/${r.workflow.job}`);
   want('wrong_event', r.workflow.event === policy.certification.event && r.workflow.gitRef === policy.certification.ref,
     `certified on ${r.workflow.event} ${r.workflow.gitRef}; only ${policy.certification.event} to ${policy.certification.ref} certifies a production candidate`);

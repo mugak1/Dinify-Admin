@@ -133,7 +133,11 @@ Steps 3–10 are otherwise not built.
   A release is promoted only when the deploy can establish four things from its own
   evidence:
   1. the exact payload was built and checked by ONE selected successful `validate` run on a
-     push to main (its run, attempt and candidate artifact, by id and digest);
+     push to main (its run, attempt and candidate artifact, by id and digest), FROM THE
+     COMMIT'S OWN SOURCE: the worktree is read against the commit, byte for byte and mode
+     for mode, before and after the build. The deploy compares that digest with the commit
+     tree the API lists. A stale checkout, an `npm ci` script edit, a staged change and an
+     untracked or ignored file the build could read are all refused;
   2. a FRESH advisory assessment of that candidate's RETAINED lock graph, under the
      TRUSTED policy, passes inside a 24-hour window the HOST enforces;
   3. the host installs, reuses or rolls back to exactly those bytes — it recomputes the
@@ -2040,7 +2044,8 @@ Before raising a PR:
    the workflows, including the verify step running the real CLI. It takes about 12
    seconds. CI's three `release:*` certification steps are not mirrored locally:
    `prebuild` refuses any file already under `dist/` (Karma's empty `dist/test-out/`
-   is tolerated), and `certify` needs the GitHub run context
+   is tolerated) and any worktree that is not the commit byte for byte (a developer
+   checkout rarely is), and `certify` needs the GitHub run context
 9. `npm run audit:deps` — the dependency audit, NETWORK. Bound to the inventory
    `npm run audit:snapshot` recorded right after `npm ci`; a scan that cannot complete
    FAILS, it is never skipped. See "Dependency Audit" below

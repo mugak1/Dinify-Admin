@@ -28,7 +28,7 @@
  * retiring it (release/README.md → "Legacy rollback"). It is never described as certified.
  */
 
-import { INPUTS, inspectCandidate } from './certification.mjs';
+import { INPUTS, inspectCandidate, sourceDigestOf } from './certification.mjs';
 import { verifyAssessment } from './assessment.mjs';
 import { DIGEST_RE, ID_RE, SHA_RE, candidateArtifactName, canonicalJson, isObject, parseJson, reason, same } from './common.mjs';
 import { sha256Hex } from './tree.mjs';
@@ -109,7 +109,13 @@ export function commitFacts({ target, commit, tree }) {
   const blobs = new Map(tree.tree.filter((e) => e?.type === 'blob').map((e) => [e.path, e.sha]));
   const inputBlobs = {};
   for (const p of INPUTS) inputBlobs[p] = blobs.get(p) ?? null;
-  return { problems, facts: { tree: commit.tree.sha, inputBlobs, hasContract: blobs.has(CONTRACT_MARKER) } };
+  // The commit's source as the API states it — every non-directory entry's path, mode and
+  // object id. A listing that does not state a mode yields NO source fact (null), which the
+  // certified path refuses; the legacy rollback path does not read it.
+  const leaves = tree.tree.filter((e) => e?.type !== 'tree');
+  const stated = leaves.every((e) => typeof e?.path === 'string' && /^\d{6}$/.test(String(e.mode)) && /^[0-9a-f]{40}$/.test(String(e.sha)));
+  const sourceDigest = stated && leaves.length ? sourceDigestOf(leaves.map((e) => ({ path: e.path, mode: e.mode, id: e.sha }))) : null;
+  return { problems, facts: { tree: commit.tree.sha, inputBlobs, sourceDigest, hasContract: blobs.has(CONTRACT_MARKER) } };
 }
 
 /** The git tree ids of the trusted paths in a top-level tree listing (GET /git/trees/{tree}). */
@@ -132,7 +138,7 @@ export function trustedTrees(listing, paths) {
  * @param {string} i.target
  * @param {'deploy'|'rollback'} i.mode
  * @param {'automatic'|'manual'} i.source
- * @param {object} i.commit            commitFacts() facts (hasContract, tree, inputBlobs)
+ * @param {object} i.commit            commitFacts() facts (hasContract, tree, inputBlobs, sourceDigest)
  * @param {object} [i.certification]   {ciWorkflow, run, artifacts} as the API answered
  * @param {Map}    [i.candidateFiles]  the downloaded candidate
  * @param {Map}    [i.assessmentFiles] the assessment directory
@@ -186,7 +192,7 @@ export function decideAdmission(i) {
   reasons.push(...sel.problems);
   if (!sel.selection) return refuse({ kind: 'certified' });
   const inspection = inspectCandidate(i.candidateFiles ?? new Map(), {
-    policy: i.policy, commit: i.target, tree: i.commit.tree, inputBlobs: i.commit.inputBlobs,
+    policy: i.policy, commit: i.target, tree: i.commit.tree, inputBlobs: i.commit.inputBlobs, sourceDigest: i.commit.sourceDigest,
     runId: sel.selection.runId, runAttempt: sel.selection.runAttempt,
   });
   reasons.push(...inspection.problems);
@@ -214,7 +220,7 @@ export function decideAdmission(i) {
     ...base,
     decision: 'admitted',
     kind: 'certified',
-    certification: { ...sel.selection, recordDigest: inspection.recordDigest },
+    certification: { ...sel.selection, recordDigest: inspection.recordDigest, sourceDigest: inspection.record.source.digest },
     payload: {
       treeDigest: inspection.payload.treeDigest,
       entryCount: inspection.payload.entryCount,

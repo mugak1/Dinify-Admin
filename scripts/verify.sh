@@ -27,9 +27,11 @@
 #
 # NOT MIRRORED HERE: CI's three `release:*` certification steps. `release:prebuild`
 # refuses a dist/ that already holds any file (output from anywhere else cannot be
-# certified) and `release:certify` requires the GitHub run context it records; neither
-# precondition holds in a developer workspace, and this script will not delete dist/ to
-# manufacture one. Step 7 exercises the same code against disposable projects.
+# certified) and a worktree that is not the commit byte for byte (the build must read the
+# source the record names), and `release:certify` requires the GitHub run context it
+# records. None of those preconditions holds in a developer workspace, and this script
+# will not delete dist/ or discard edits to manufacture them. Step 7 exercises the same
+# code against disposable projects.
 #
 # There is no `/dinify-check` for this repo — that command is backend-only. CI is the
 # gate; this is the local mirror of it.

@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { CLEAN, CLEAN_SCANNER, cannedRunner, fakeInstall, npmReport, via } from '../../dependency-audit/tests/project.mjs';
+import { commitFacts } from '../lib/admission.mjs';
 import { ASSESSMENT_DOC, assess, assessmentDeadline, verifyAssessment } from '../lib/assessment.mjs';
 import { inspectCandidate } from '../lib/certification.mjs';
 import { loadReleasePolicy, recordBytes } from '../lib/common.mjs';
@@ -39,7 +40,8 @@ function expectFor(p) {
   const f = apiFacts(p);
   const { policy } = loadReleasePolicy(p.root);
   const inputBlobs = Object.fromEntries(f.tree.tree.filter((e) => e.type === 'blob').map((e) => [e.path, e.sha]));
-  return { policy, commit: p.commit, tree: f.commit.tree.sha, inputBlobs, runId: RUN_ID, runAttempt: RUN_ATTEMPT };
+  const sourceDigest = commitFacts({ target: p.commit, commit: f.commit, tree: f.tree }).facts?.sourceDigest;
+  return { policy, commit: p.commit, tree: f.commit.tree.sha, inputBlobs, sourceDigest, runId: RUN_ID, runAttempt: RUN_ATTEMPT };
 }
 
 /**

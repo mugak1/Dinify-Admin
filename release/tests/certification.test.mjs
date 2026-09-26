@@ -8,16 +8,17 @@
  */
 
 import { strict as assert } from 'node:assert';
-import { appendFileSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, mkdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { npmReport, via } from '../../dependency-audit/tests/project.mjs';
+import { commitFacts } from '../lib/admission.mjs';
 import { freeze, inspectCandidate, prebuild } from '../lib/certification.mjs';
 import { loadReleasePolicy } from '../lib/common.mjs';
 import { writeArchive, readArchive } from '../lib/tar.mjs';
 import { describeFiles, sha256Hex } from '../lib/tree.mjs';
-import { BUILT, NOW, RUN_ATTEMPT, RUN_ID, apiFacts, candidateFiles, certifiedProject, copyCandidate, freshProject, git, writeBuild } from './fixtures.mjs';
+import { BUILT, NOW, RUN_ATTEMPT, RUN_ID, SOURCE_MAIN, apiFacts, candidateFiles, certifiedProject, copyCandidate, freshProject, git, tempDir, writeBuild } from './fixtures.mjs';
 
 const codes = (problems) => problems.map((p) => p.code);
 
@@ -25,7 +26,8 @@ function expectFor(p, over = {}) {
   const f = apiFacts(p);
   const { policy } = loadReleasePolicy(p.root);
   const inputBlobs = Object.fromEntries(f.tree.tree.filter((e) => e.type === 'blob').map((e) => [e.path, e.sha]));
-  return { policy, commit: p.commit, tree: f.commit.tree.sha, inputBlobs, runId: RUN_ID, runAttempt: RUN_ATTEMPT, ...over };
+  const sourceDigest = commitFacts({ target: p.commit, commit: f.commit, tree: f.tree }).facts?.sourceDigest;
+  return { policy, commit: p.commit, tree: f.commit.tree.sha, inputBlobs, sourceDigest, runId: RUN_ID, runAttempt: RUN_ATTEMPT, ...over };
 }
 
 const withProject = (opts, fn) => { const p = certifiedProject(opts); try { return fn(p); } finally { p.cleanup(); } };
@@ -167,6 +169,135 @@ describe('the producer: only a job whose gates all passed yields a candidate', (
 
   it('REGRESSION MATRIX: no GitHub Actions run context → no candidate (a local build is never a certification)', () => withProject({ env: { GITHUB_RUN_ID: '' } }, (p) => {
     assert.ok(codes(p.stages.certify.problems).includes('no_workflow_context'));
+  }));
+});
+
+/**
+ * THE SOURCE THE BUILD READ IS THE COMMIT (Codex P1 on PR #31). The record names HEAD and
+ * HEAD^{tree}, and `ng build` reads the WORKING TREE. Anything that runs in `validate`
+ * before the build — an `npm ci` lifecycle script, an earlier check — could leave a tracked
+ * source file different from the commit, and nothing downstream would notice: the freeze
+ * and the consumer see only the payload and the five retained inputs. So the producer now
+ * reads the worktree's own bytes against the commit at prebuild, freeze and certify, and
+ * the consumer compares the digest it recorded with the commit tree the API holds.
+ */
+describe('the source the build read is the commit, byte for byte', () => {
+  const src = (p) => join(p.root, 'src', 'main.ts');
+  const refusedAt = (p, stage, code) => {
+    assert.equal(p.stages[stage].ok, false, `${stage} must refuse`);
+    assert.ok(codes(p.stages[stage].problems).includes(code), `${stage}: ${JSON.stringify(p.stages[stage].problems)}`);
+    assert.equal(p.stages.certify.ok, false, 'and no candidate may exist');
+  };
+
+  it('REGRESSION: a tracked source file changed after installation (a lifecycle script, an earlier step) is refused BEFORE the build', () => withProject({
+    between: { beforePrebuild: (p) => appendFileSync(src(p), 'console.log("injected");\n') },
+  }, (p) => refusedAt(p, 'prebuild', 'source_modified')));
+
+  it('REGRESSION: a tracked source file changed during the build and left changed is refused at freeze', () => withProject({
+    between: { afterBuild: (p) => appendFileSync(src(p), 'console.log("injected");\n') },
+  }, (p) => refusedAt(p, 'freeze', 'source_modified')));
+
+  it('REGRESSION: a tracked source file changed after the freeze is refused at certify', () => withProject({
+    between: { afterAudit: (p) => appendFileSync(src(p), 'console.log("injected");\n') },
+  }, (p) => refusedAt(p, 'certify', 'source_modified')));
+
+  it('REGRESSION: a deleted tracked file, a flipped executable bit and a file replaced by a link to identical bytes are each a different source', () => {
+    const outside = tempDir('outside-');
+    try {
+      writeFileSync(join(outside.dir, 'main.ts'), SOURCE_MAIN);
+      for (const edit of [
+        (p) => unlinkSync(src(p)),
+        (p) => chmodSync(src(p), 0o755),
+        (p) => { unlinkSync(src(p)); symlinkSync(join(outside.dir, 'main.ts'), src(p)); },
+      ]) withProject({ between: { beforePrebuild: edit } }, (p) => refusedAt(p, 'prebuild', 'source_modified'));
+    } finally { outside.cleanup(); }
+  });
+
+  it('REGRESSION: a modification hidden from `git status` by the index (skip-worktree) is still refused — the rule reads bytes, not git\'s opinion', () => withProject({
+    between: {
+      beforePrebuild: (p) => {
+        git(p.root, 'update-index', '--skip-worktree', 'src/main.ts');
+        appendFileSync(src(p), 'console.log("hidden");\n');
+        assert.equal(git(p.root, 'status', '--porcelain', '--untracked-files=no'), '', 'premise: git status reports nothing');
+      },
+    },
+  }, (p) => refusedAt(p, 'prebuild', 'source_modified')));
+
+  it('REGRESSION: a STAGED change (the index agrees with the worktree) is still refused — the commit, not the index, is the reference', () => withProject({
+    between: { beforePrebuild: (p) => { appendFileSync(src(p), 'console.log("staged");\n'); git(p.root, 'add', 'src/main.ts'); } },
+  }, (p) => refusedAt(p, 'prebuild', 'source_modified')));
+
+  it('REGRESSION: an untracked file the build could read is refused, whether or not .gitignore names it', () => {
+    for (const rel of ['src/extra.ts', '.env', '.angular/cache/21.2.21/dinify_admin/poisoned.json']) {
+      withProject({
+        between: { beforePrebuild: (p) => { mkdirSync(join(p.root, rel, '..'), { recursive: true }); writeFileSync(join(p.root, rel), 'x'); } },
+      }, (p) => {
+        refusedAt(p, 'prebuild', 'source_untracked');
+        assert.match(JSON.stringify(p.stages.prebuild.problems), new RegExp(rel.replace(/[.*/]/g, '\\$&')));
+      });
+    }
+  });
+
+  it('REGRESSION: a generated root that is a link (bytes from outside the checkout) is refused', () => {
+    const outside = tempDir('outside-');
+    try {
+      writeFileSync(join(outside.dir, 'x.js'), 'x');
+      withProject({
+        between: {
+          beforePrebuild: (p) => {
+            const root = join(p.root, 'dependency-audit', 'scanner', 'node_modules');
+            rmSync(root, { recursive: true, force: true });
+            symlinkSync(outside.dir, root);
+          },
+        },
+      }, (p) => refusedAt(p, 'prebuild', 'source_untracked'));
+    } finally { outside.cleanup(); }
+  });
+
+  it('CONTROL: rewriting a file with its committed bytes (a touch, a checkout) is no change — only bytes count', () => withProject({
+    between: { beforePrebuild: (p) => { rmSync(src(p)); writeFileSync(src(p), SOURCE_MAIN); } },
+  }, (p) => assert.deepEqual(p.stages.certify.problems, [])));
+
+  it('CONTROL: everything the job legitimately writes is tolerated, and the record states what was verified at all three stages', () => withProject({
+    between: { beforePrebuild: (p) => mkdirSync(join(p.root, 'dist', 'test-out'), { recursive: true }) },
+  }, (p) => {
+    assert.deepEqual(p.stages.certify.problems, []);
+    const s = p.stages.certify.record.source;
+    assert.equal(s.verification, 'worktree-bytes-equal-commit-tree');
+    assert.match(s.digest, /^sha256:[0-9a-f]{64}$/);
+    assert.equal(s.files, Number(git(p.root, 'ls-tree', '-r', 'HEAD').split('\n').filter(Boolean).length));
+    assert.deepEqual(Object.keys(s.verifiedAt), ['prebuild', 'freeze', 'certify']);
+    assert.deepEqual(s.generatedRoots, ['dependency-audit/evidence', 'dependency-audit/scanner/node_modules', 'dist', 'node_modules', 'release/.work']);
+  }));
+
+  it('CONTRACT: the digest the producer took of the worktree is the digest of the commit tree as the API lists it', () => withProject({}, (p) => {
+    const f = apiFacts(p);
+    assert.equal(p.stages.certify.record.source.digest, commitFacts({ target: p.commit, commit: f.commit, tree: f.tree }).facts.sourceDigest);
+  }));
+
+  it('REGRESSION: a candidate whose recorded source is not the commit tree the API holds is refused by the consumer', () => withProject({}, (p) => {
+    const ins = inspectCandidate(candidateFiles(p.candidateDir), expectFor(p, { sourceDigest: `sha256:${'0'.repeat(64)}` }));
+    assert.ok(codes(ins.problems).includes('wrong_source'), JSON.stringify(ins.problems));
+  }));
+
+  it('REGRESSION: a certification record that says nothing about its source is invalid', () => withProject({}, (p) => {
+    const c = copyCandidate(p.candidateDir, (dir) => {
+      const r = JSON.parse(readFileSync(join(dir, 'certification.json'), 'utf8'));
+      delete r.source;
+      writeFileSync(join(dir, 'certification.json'), `${JSON.stringify(r, null, 2)}\n`);
+    });
+    try {
+      assert.ok(codes(inspectCandidate(candidateFiles(c.dir), expectFor(p)).problems).includes('certification_invalid'));
+    } finally { c.cleanup(); }
+  }));
+
+  it('FAILS CLOSED: a tree listing that does not state modes yields no source fact, and the candidate is refused rather than assumed', () => withProject({}, (p) => {
+    const f = apiFacts(p);
+    const bare = { ...f.tree, tree: f.tree.tree.map(({ mode, ...rest }) => rest) };
+    const c = commitFacts({ target: p.commit, commit: f.commit, tree: bare });
+    assert.deepEqual(c.problems, [], 'the commit is still readable for everything else (the legacy rollback path needs none of this)');
+    assert.equal(c.facts.sourceDigest, null);
+    assert.ok(codes(inspectCandidate(candidateFiles(p.candidateDir), expectFor(p, { sourceDigest: c.facts.sourceDigest })).problems).includes('wrong_source'));
   }));
 });
 

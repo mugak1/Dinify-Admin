@@ -1,0 +1,28 @@
+{
+  "schema": "dinify.admin.release-policy/1",
+  "repository": "mugak1/Dinify-Admin",
+  "certification": {
+    "workflowPath": ".github/workflows/ci.yml",
+    "job": "validate",
+    "event": "push",
+    "ref": "refs/heads/main",
+    "artifactPrefix": "admin-candidate"
+  },
+  "build": {
+    "configuration": "production",
+    "command": "npm run build:prod",
+    "outputPath": "dist",
+    "nodeMajor": 20
+  },
+  "evaluation": {
+    "workflowPath": ".github/workflows/deploy.yml",
+    "admissionPrefix": "admin-admission"
+  },
+  "freshness": {
+    "assessmentWindowHours": 24,
+    "dispatchMarginMinutes": 30
+  },
+  "trusted": {
+    "paths": ["release", "dependency-audit"]
+  }
+}

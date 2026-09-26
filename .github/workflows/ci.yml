@@ -11,11 +11,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Pinned to the same reviewed commits deploy.yml uses: since D08 B2.4 this job is
+      # the one that builds, checks and retains the bytes a deployment promotes.
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '20'
           cache: 'npm'
@@ -76,8 +78,20 @@ jobs:
       - name: Guard qualification tests
         run: npm run test:guards
 
+      # The release-certification contract's own regression matrix (D08 B2.4) — offline:
+      # the candidate, assessment and admission records, the archive, the tree digest the
+      # host recomputes, and the embedded remote procedure run against a model host.
+      - name: Release-contract tests
+        run: npm run test:release
+
       - name: Test
         run: npm run test:ci
+
+      # RELEASE CERTIFICATION, part 1 of 3 (D08 B2.4 — release/README.md). There must be no
+      # build output yet, and the installed inventory must still be the audit snapshot, so
+      # the output the next step produces is this job's, built from that inventory.
+      - name: Release certification — assert a clean build from the snapshotted inventory
+        run: npm run release:prebuild
 
       - name: Build (production)
         run: npm run build:prod
@@ -92,6 +106,11 @@ jobs:
       - name: Mock-isolation gate
         run: npm run check:mock-isolation
 
+      # RELEASE CERTIFICATION, part 2 of 3: record the tree digest of EXACTLY the output the
+      # mock-isolation gate just scanned. The candidate must still be that tree.
+      - name: Release certification — freeze the scanned output
+        run: npm run release:freeze
+
       # DEPENDENCY AUDIT, part 2 of 2 — part of THIS required check, not a separate one.
       # Scans the snapshotted inventory (and the pinned scanner's own graph) against the
       # public advisory database and enforces the policy: a high/critical finding
@@ -102,6 +121,28 @@ jobs:
       # fails. No `if:`, no `continue-on-error`, no pipe: its exit status is the step's.
       - name: Dependency audit — scan the validated inventory and enforce the policy
         run: npm run audit:deps
+
+      # RELEASE CERTIFICATION, part 3 of 3: only a job in which EVERY gate above passed
+      # reaches this step (no `if:`, no `continue-on-error`). It proves the output is still
+      # the frozen tree, the inventory still the snapshot and the audit evidence this
+      # checkout's, passing and reproducible, then writes the candidate: the payload
+      # archive, the certification record, and the dependency evidence BESIDE (never
+      # inside) the served payload. A pull-request candidate is produced the same way and
+      # is never promotable: deploy.yml accepts only a push to main.
+      - name: Release certification — certify and package the candidate
+        run: npm run release:certify
+
+      # The candidate, named by THIS run and attempt, so a deployment can select exactly
+      # it by id and digest. Uploaded only on success — it is certification, not evidence.
+      - name: Retain the certified candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: admin-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release/.work/candidate/
+          if-no-files-found: error
+          retention-days: ${{ github.event_name == 'push' && 90 || 7 }}
+          # The payload is already gzipped and the evidence is small text.
+          compression-level: 6
 
       # The complete raw scanner output, the inventory and the decision, kept whether the
       # job passed or not. `always()` here only retains evidence; it cannot turn a failed

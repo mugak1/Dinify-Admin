@@ -129,6 +129,24 @@ Steps 3–10 are otherwise not built.
   platform-admin login (password + TOTP, session bootstrap, the CSRF-protected
   `auth/elevate/` write) was exercised end to end. 0C.2's first real automatic
   deployment ran on the Step-1 merge and succeeded — see "Deployment" below.
+- **Certified promotion (D08 B2.4): ✅ IMPLEMENTED, NOT YET EXERCISED ON THE LIVE HOST.**
+  A release is promoted only when the deploy can establish four things from its own
+  evidence:
+  1. the exact payload was built and checked by ONE selected successful `validate` run on a
+     push to main (its run, attempt and candidate artifact, by id and digest), FROM THE
+     COMMIT'S OWN SOURCE: the worktree is read against the commit, byte for byte and mode
+     for mode, before and after the build. The deploy compares that digest with the commit
+     tree the API lists. A stale checkout, an `npm ci` script edit, a staged change and an
+     untracked or ignored file the build could read are all refused;
+  2. a FRESH advisory assessment of that candidate's RETAINED lock graph, under the
+     TRUSTED policy, passes inside a 24-hour window the HOST enforces;
+  3. the host installs, reuses or rolls back to exactly those bytes — it recomputes the
+     payload tree digest before any promotion;
+  4. missing evidence stops the promotion and says so.
+
+  `deploy.yml` no longer builds. Pre-contract releases (`eb54c92` and earlier) stay
+  reachable by an unchanged, labelled LEGACY rollback, and retiring that is the owner's
+  pending decision. See "Deployment" and `release/README.md`.
 
 ### What Step 1 deliberately does NOT claim
 The backend reports several concepts as unconfigured because the models behind them do
@@ -1970,8 +1988,10 @@ false-clean states — details below.
 
 **Exit status: 0 complete and clean · 1 violation · 2 INCOMPLETE (never clean) · 3
 self-test failed.** `npm run check:mock-isolation` is `--self-test && scan` — the same
-pattern as `check:tokens` and `check:claim-code` — and it is the command `ci.yml`,
-`verify.sh` and `deploy.yml`'s prepare job all run, so none of them changed. The self-test
+pattern as `check:tokens` and `check:claim-code` — and it is the command `ci.yml` and
+`verify.sh` both run. Since D08 B2.4 `deploy.yml` builds nothing and runs no gate: it
+promotes the tree this gate scanned in `validate`, which `release:freeze` binds straight
+after the scan. The self-test
 drives every check over an in-memory workspace and an in-memory output filesystem
 (reader failures are simulated, because permission bits mean nothing to a root process).
 
@@ -2018,13 +2038,24 @@ Before raising a PR:
    broken — none of them is clean
 8a. `npm run test:guards` — the gate's own qualification, OFFLINE, including five real
    optimized builds of broken workspace copies (runs anywhere after `npm ci`; ~1.5 min)
+8b. `npm run test:release` — the release contract (D08 B2.4), OFFLINE. It covers
+   certification, the fresh assessment, admission, the host procedure `deploy.yml`
+   embeds (run against a model host, with the pre-change procedure as a control), and
+   the workflows, including the verify step running the real CLI. It takes about 12
+   seconds. CI's three `release:*` certification steps are not mirrored locally:
+   `prebuild` refuses any file already under `dist/` (Karma's empty `dist/test-out/`
+   is tolerated) and any worktree that is not the commit byte for byte (a developer
+   checkout rarely is), and `certify` needs the GitHub run context
 9. `npm run audit:deps` — the dependency audit, NETWORK. Bound to the inventory
    `npm run audit:snapshot` recorded right after `npm ci`; a scan that cannot complete
    FAILS, it is never skipped. See "Dependency Audit" below
 
 `.github/workflows/ci.yml` (job `validate`, on `pull_request` to `main` **and on push
 to `main`**) runs all of them on Node 20 with plain `npm ci`, the snapshot directly
-after the install and the scan last. `.github/workflows/audit.yml` is a weekly
+after the install and the scan last. After the scan it **certifies and uploads the
+candidate** (`release:prebuild` before the build, `release:freeze` after mock-isolation,
+`release:certify` last, then `admin-candidate-<run>-<attempt>`). The upload has no `if:`,
+so a failed gate leaves no candidate. `.github/workflows/audit.yml` is a weekly
 re-scan of main with the SAME evaluator — scheduled and manual only, never a PR check,
 and consumed by nothing (deploy.yml triggers on the workflow named "CI" and re-verifies
 the run is `ci.yml` by path).
@@ -2070,17 +2101,23 @@ a successful CI push to main, or on `workflow_dispatch`.
   owner, a linked mugak1 review and an expiry ≤ 90 days, and is refused otherwise.
 - **The raw evidence is retained** as the artifact `dependency-audit-<run>-<attempt>`,
   pass or fail.
-- **What it does not do:** bind a fresh audit to the artifact a deploy promotes (the deploy
-  re-installs from the same lockfile but does not re-audit), audit GitHub Actions or
-  the runner image, or change branch protection. Those are later B2 deliveries (the
-  mock-isolation scanner's self-test/coverage work landed in B2.3 — see "Neither the mock
-  nor the gallery reaches production").
+- **The deploy now re-assesses (B2.4).** It promotes the certified candidate rather than
+  rebuilding it, after a FRESH scan-only replay of the candidate's retained lock graph
+  (`dependency-audit/lib/retained.mjs`, byte-identical to Frontend's) under the trusted
+  policy. See "Deployment".
+- **What it does not do:** audit GitHub Actions or the runner image, or change branch
+  protection. The mock-isolation scanner's self-test and coverage work landed in B2.3 —
+  see "Neither the mock nor the gallery reaches production".
 
 ## Deployment — 0C.1 AND 0C.2 BOTH ACCEPTED
 
-`.github/workflows/deploy.yml` is the deploy mechanism: **build → tar.gz artefact to a
-private S3 prefix → GitHub OIDC → `aws ssm send-command` → immutable release directory
-→ symlink promotion.**
+`.github/workflows/deploy.yml` is the deploy mechanism: **the certified candidate
+(built and checked by `validate`) → a fresh dependency assessment → a privileged
+re-decision → GitHub OIDC → private S3 → `aws ssm send-command` → an immutable release
+directory the host verifies → symlink promotion.** Since D08 B2.4 nothing in
+`deploy.yml` builds anything. `release/README.md` is the full account of certification,
+the assessment, the admission record, the host procedure, legacy rollback and the
+first-merge effect.
 
 **0C.1 (the manual exact-SHA path) was empirically accepted on 2026-08-20.** What was
 proven against the real host and public origin, not merely reviewed:
@@ -2140,14 +2177,17 @@ incorrectly claimed. Step ordering inside one job protects nothing.
 
 | job | `id-token` | runs |
 |---|---|---|
-| `prepare` | **absent** (`contents: read`, `actions: read` only) | certification, `npm ci`, `build:prod`, mock-isolation, packaging |
-| `deploy` | `write` | artifact validation, OIDC, S3, SSM, served-state assertions |
+| `prepare` | **absent** (`contents: read`, `actions: read` only) | selection of the certified candidate by id, the fresh assessment (the pinned scanner — third-party code), the admission |
+| `deploy` | `write` | the trusted verifier's re-decision, OIDC, S3, SSM, served-state assertions |
 
-`deploy` has **no checkout at all**, no `npm`, no package.json script and no Angular
-build. It runs workflow shell, first-party actions and the AWS CLI, and it treats the
-incoming tarball strictly as DATA — validated, hashed, uploaded, never extracted and
-never executed on the privileged side. Do not merge these jobs, and do not add a build
-or a checkout to `deploy`.
+`deploy` runs no `npm`, no package.json script, no build, no scanner and no checkout
+of the TARGET. Its one checkout is the TRUSTED VERIFIER: `release/` and
+`dependency-audit/`, sparse, depth 1, at `github.sha` (the workflow's own revision),
+asserted pristine and credential-free. `node trusted/release/cli.mjs` imports only
+`node:` built-ins and those two directories, and a test pins that import graph. The
+candidate and the admission are DATA: downloaded by id with `digest-mismatch: error`,
+re-derived, re-hashed before upload, and never executed. Do not merge these jobs, and do
+not add a build, an `npm` command or a target checkout to `deploy`.
 
 Two consequences worth keeping straight:
 
@@ -2157,25 +2197,32 @@ Two consequences worth keeping straight:
   mode from the raw workflow inputs and requires exact equality with what `prepare`
   certified, and re-runs the ancestry and CI checks against *current* main through the
   API — no checkout needed.
-- **The authoritative artifact digest is computed in `deploy`, not in `prepare`.** The
-  build job's digest is diagnostic only. What names the S3 key and what the box
-  re-derives is the SHA-256 of the bytes that actually arrived, so the attestation
-  covers what crossed the boundary rather than what the build claimed it sent. The
-  archive is also validated there — member shapes, and `release.txt` read out of the
-  tarball in memory and required to attest the revalidated SHA — all **before** OIDC
-  authentication.
+- **`prepare`'s admission is a HINT, not a warrant.** It ran third-party code (the
+  scanner). The privileged job runs the SAME decision (`release/lib/admission.mjs`) over
+  its own facts: the candidate's bytes, the assessment reproduced from its raw output
+  under the trusted policy, the run and listing as the API states them now, and the
+  verifier and policy trees on `main` now. The uploaded admission must bind exactly the
+  same things, and the assessment deadline must be at least 30 minutes away. A
+  disagreement is a refusal before any credential is requested.
 
-`prepare` checks out with `persist-credentials: false` and then asserts no
-`http.*.extraheader` credential is present, because that job goes on to run `npm ci`.
-Nothing after checkout needs an authenticated git operation: `fetch-depth: 0` brings the
-history down, so the ancestry proof and the target checkout are both purely local.
+`prepare`'s verifier checkout is `persist-credentials: false` and is asserted to hold
+no `http.*.extraheader` credential, because that job goes on to run the pinned scanner.
+Ancestry is established through the API; no history is fetched.
 
 ### The release layout on the box
 ```
-/var/www/dinify-admin                      → SYMLINK to the live release
-/var/www/dinify-admin-releases/<sha>/      → immutable, root:root, dirs 0755 / files 0644
-/var/www/dinify-admin-releases/placeholder/→ the pre-0C.1 holding page
+/var/www/dinify-admin                          → SYMLINK to the live release
+/var/www/dinify-admin-releases/<sha>-<tree>/   → CERTIFIED (B2.4+): named by the commit AND
+                                                 the payload tree digest
+/var/www/dinify-admin-releases/<sha>/          → LEGACY (pre-contract, eb54c92 and earlier)
+/var/www/dinify-admin-releases/placeholder/    → the pre-0C.1 holding page
 ```
+All immutable, `root:root`, dirs 0755 / files 0644. **The host recomputes a certified
+directory's payload tree digest before it promotes it: install, reuse and rollback
+alike.** A same-commit directory holding other bytes is refused, never overwritten or
+repaired. The pre-change procedure reused a same-SHA directory by `release.txt` alone.
+That was reproduced against `eb54c92`'s procedure under the host model, and the tests
+keep the reproduction as a control.
 A release is never edited in place, never synced into, and never extracted over. A new
 one is staged in a temporary directory INSIDE the release root (same filesystem), fully
 validated, then `mv`-renamed into its final path — so it either appears complete or not
@@ -2209,6 +2256,7 @@ deploy would train the operator to ignore this workflow's red.
 |---|---|
 | `sha` | full 40-character lowercase commit SHA |
 | `mode` | `deploy` (default) or `rollback` |
+| `ci_run_id` | optional: the certifying CI run, needed only when more than one successful push-to-main run exists for the SHA |
 
 Both paths run from `refs/heads/main` — the workflow refuses any other ref, because the
 OIDC role's trust is pinned there. That holds for `workflow_run` too: GitHub takes the
@@ -2227,6 +2275,22 @@ no extraction, no repair. If the release directory is not already on the box it 
 rollback never reconstructs one. That makes reverting a seconds-scale operation rather
 than a rebuild of old code.
 
+**Since B2.4 there are two kinds of rollback.**
+- **Rolling back to a CERTIFIED release** needs the same evidence as promoting it:
+  - its candidate artifact must still be retained (90 days, or less under a
+    repository cap that is not observable from here);
+  - a fresh assessment must pass;
+  - the host verifies the directory's bytes.
+
+  A newer advisory can therefore refuse a certified rollback.
+- **Rolling back to a pre-contract release** is the LEGACY path. It is preserved
+  exactly as before, validated by `release.txt`, and labelled NOT certified and NOT
+  freshly assessed in every record and summary.
+
+A pre-contract target can never be DEPLOYED: a rebuild is not a certified candidate.
+**Retiring legacy rollback is the owner's pending decision** (`release/README.md` →
+"Legacy rollback"). It is not a flag, and nothing here takes it.
+
 **The free-space floor does not apply to rollback**, and that is deliberate. The 512 MiB
 check guards the one path that writes bytes — installing a NEW release — and lives
 inside that branch. A rollback downloads nothing, extracts nothing and installs nothing,
@@ -2243,13 +2307,14 @@ The guard compares the target against **what the public origin is actually servi
 read back from `release.txt` — not against a commit ordering the workflow assumes. The
 served SHA is the only statement of live state that is not the workflow's own opinion,
 which is the same principle `DEPLOYED-HEAD` and the public assertion rest on. It runs
-**before the artifact is consumed, before the role is validated and before OIDC**, so a
-stale automatic run never authenticates to AWS at all.
+**after the privileged verification and before the role is validated and before OIDC**,
+so a stale automatic run never authenticates to AWS at all.
 
 | situation | decision | effect |
 |---|---|---|
 | target descends from served SHA | `AUTO-PROCEED` | deploy normally |
-| target == served SHA | `AUTO-SKIP-IDENTICAL` | green no-op; no AWS, S3 or SSM |
+| target == served SHA and EVERY admitted file matches publicly | `AUTO-SKIP-IDENTICAL-ARTIFACT` | green no-op; no AWS, S3 or SSM |
+| target == served SHA but some file differs or is unreachable | `AUTO-SKIP-SAME-COMMIT` | green no-op that says it is NOT evidence this candidate is served; promote with a manual deploy if intended |
 | target is an ancestor of served SHA | `AUTO-SKIP-STALE` | green skip; no AWS, S3 or SSM |
 | histories diverge, or served state is unreadable/not `no-store`/not one 40-hex SHA | **fail closed** | no AWS; recover with a manual dispatch |
 
@@ -2265,7 +2330,14 @@ SPA route); if any fail it atomically restores the previous symlink target and *
 exits non-zero** — a successful restoration is not a successful deployment. The runner
 then independently re-reads `https://admin.dinifyapp.com/release.txt` over the public
 internet and requires it to equal the requested SHA and to be `no-store`. A missing or
-mismatched marker, or an SSM status other than `Success`, fails loudly. This is the
+mismatched marker, or an SSM status other than `Success`, fails loudly.
+
+For a certified release the host also requires `/index.html` to match the admitted
+digest before it attests `DEPLOYED-PAYLOAD: sha256:<tree>`. The runner requires that
+marker exactly once, and fetches every admitted file back from the public origin and
+compares it byte for byte. That is one vantage point at one moment. A public failure
+after the host switched is a red run reported as **DEGRADED**, and the manual rollback is
+the recovery. This is the
 defect class backend PR #283 closed after a deploy reported success while the box stayed
 39 hours behind.
 

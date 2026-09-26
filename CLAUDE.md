@@ -129,7 +129,12 @@ Steps 3–10 are otherwise not built.
   platform-admin login (password + TOTP, session bootstrap, the CSRF-protected
   `auth/elevate/` write) was exercised end to end. 0C.2's first real automatic
   deployment ran on the Step-1 merge and succeeded — see "Deployment" below.
-- **Certified promotion (D08 B2.4): ✅ IMPLEMENTED, NOT YET EXERCISED ON THE LIVE HOST.**
+- **Certified promotion (D08 B2.4): ✅ IMPLEMENTED, and its FORWARD PATH was EXERCISED ON
+  THE LIVE HOST (2026-09-26).** Merging #31 (`a7ef20c`) produced the first certified
+  automatic promotion. It replaced the pre-contract `eb54c92`, and every check passed
+  from the host through to the public origin. Only that forward path has run for real;
+  rollback, reuse, the skip decisions and the refusal paths have not. See "Deployment"
+  for the evidence and the full list.
   A release is promoted only when the deploy can establish four things from its own
   evidence:
   1. the exact payload was built and checked by ONE selected successful `validate` run on a
@@ -2109,7 +2114,7 @@ a successful CI push to main, or on `workflow_dispatch`.
   protection. The mock-isolation scanner's self-test and coverage work landed in B2.3 —
   see "Neither the mock nor the gallery reaches production".
 
-## Deployment — 0C.1 AND 0C.2 BOTH ACCEPTED
+## Deployment — 0C.1 AND 0C.2 ACCEPTED · B2.4'S FORWARD PATH EXERCISED LIVE
 
 `.github/workflows/deploy.yml` is the deploy mechanism: **the certified candidate
 (built and checked by `validate`) → a fresh dependency assessment → a privileged
@@ -2151,6 +2156,56 @@ So the whole chain — merge → CI on main → automatic exact-SHA deploy → s
 attestation — is now proven end to end rather than reviewed. The forward-only guard has
 still never had to REFUSE a stale automatic run; that path remains reasoned but
 unexercised.
+
+**B2.4 (certified promotion) had its FORWARD PATH exercised on the live host on
+2026-09-26.** As with 0C.2, the first automatic run was its own acceptance gate. It
+passed on the merge of #31. Everything below is read from the runs' own records through
+the GitHub API. None of it is a later live probe.
+
+- merging #31 put `a7ef20c452062e95f24ecec2a506d27882db587b` on `main`. `ci.yml` ran on
+  the **push** (run `36245066677`, attempt 1) and succeeded. It uploaded the first
+  certified candidate, `admin-candidate-36245066677-1`: artifact `10907053040`, digest
+  `sha256:f37fad00cd863436feb3f8a0d6385ed6743322a81c102517c6ae629d39877043`;
+- `deploy.yml` started on its own through **`workflow_run`** (run `36245215836`), and
+  both jobs succeeded. `prepare` (job `108413049301`) selected and downloaded that
+  artifact by id, the digest matched, and its fresh assessment of the retained graph
+  answered **WITHIN POLICY: no advisories reported**. It collected
+  13:27:38.097Z → 13:27:40.713Z, which set the promotion deadline to
+  2026-09-27T13:27:38Z (epoch `1790515658`). The admission was retained as artifact
+  `10906024764`;
+- in `deploy` (job `108413111466`) the privileged re-decision succeeded. The ordering
+  guard read the served commit `eb54c92` (a pre-contract release) and decided
+  `AUTO-PROCEED` — "target descends from the served commit";
+- the host's own output (SSM command `8a17f265-1071-4580-8133-f3dbd880887d`, status
+  `Success`) shows:
+  - `ARTIFACT-VERIFIED` for archive `1175a79d…` and `ARCHIVE-MEMBERS: 16`;
+  - `PAYLOAD-VERIFIED sha256:2a0ec6a6…` for both the staged and the installed release;
+  - the install at the NEW naming scheme,
+    `/var/www/dinify-admin-releases/a7ef20c…-2a0ec6a6…`;
+  - the promotion from the previous target `…/eb54c92…`;
+  - `DEPLOYED-PAYLOAD` and `DEPLOYED-HEAD`, each exactly once;
+- the public verification (13:28:22–25Z) read `release.txt` as `a7ef20c…` with
+  `no-store`, admin health `ok`, `/` 200, and **16/16 admitted files served byte for
+  byte**.
+
+The coordination the README forecast also happened. Dinify-Frontend's next readiness
+run (`36247543634`) refused `peers.admin_serving_unapproved`, because `a7ef20c` was not
+in that Frontend compatible set (`2026-09-26-pilot-6`). Frontend #704 approved the
+receipt (`2026-09-26-pilot-7`). Its merge's readiness run (`36249940983`) then completed
+as a green, non-publishing evaluation, with the publisher skipped.
+
+**WHAT HAS STILL NEVER RUN ON THE LIVE HOST.** Only the forward certified path above
+ran. The following are backed by the source, the tests and the local host model, and
+nothing more:
+- a certified ROLLBACK — the artifact for `a7ef20c` is retained until 2026-12-25 per its
+  listing;
+- REUSE of an already-installed certified directory for the same commit;
+- the `AUTO-SKIP-*` decisions, including refusing a stale automatic run;
+- the host REFUSING a lapsed assessment deadline or a payload-tree mismatch;
+- the **DEGRADED** outcome and the host restoring the previous release after a failed
+  post-switch check;
+- a LEGACY rollback under the B2.4 procedure. The legacy rollback proven in 0C.1 ran
+  the pre-contract procedure.
 
 **TRANSPORT IS SSM OVER OIDC, NEVER SSH. Do NOT add** `firebase.json`, `.firebaserc`,
 rsync, `appleboy/ssh-action`, or any stored SSH secret. That transport was deliberately
@@ -2319,9 +2374,11 @@ so a stale automatic run never authenticates to AWS at all.
 | histories diverge, or served state is unreadable/not `no-store`/not one 40-hex SHA | **fail closed** | no AWS; recover with a manual dispatch |
 
 **It applies to automatic runs only.** Manual deploy and manual rollback are never
-blocked by it — deliberate backward movement and re-promotion are proven operational
-capabilities and must stay available. A skip is reported honestly in the job summary
-with the target, the served SHA and the reason; it is never dressed up as a deployment.
+blocked by it — deliberate backward movement and re-promotion are operational
+capabilities that must stay available. 0C.1 proved them on the live host under the
+pre-contract procedure; a certified rollback has not yet run there. A skip is reported
+honestly in the job summary with the target, the served SHA and the reason; it is never
+dressed up as a deployment.
 
 ### What makes the run green
 Nothing the workflow believes about itself. The box asserts `DEPLOYED-HEAD: <sha>` only
@@ -2346,8 +2403,10 @@ defect class backend PR #283 closed after a deploy reported success while the bo
   after CI, so the deployed commit is always one CI actually certified. A `push`
   trigger would deploy commits whose CI had not finished — or had failed.
 - **No release pruning.** Every deployed SHA and the original placeholder are retained.
-  Retention is what keeps recovery cheap, and rollback is now a proven, exercised path;
-  pruning would trade that away for disk that is not scarce.
+  Retention is what keeps recovery cheap. Rollback is a proven, exercised path under the
+  PRE-CONTRACT procedure (0C.1), and the legacy rollback that follows it depends on those
+  retained directories. A CERTIFIED rollback has not yet run on the live host. Pruning
+  would trade recovery away for disk that is not scarce.
 - **The backend's forward-only mechanism was NOT ported.** It compares
   `git merge-base --is-ancestor` against a Git checkout on the box, and the admin box
   has no checkout. The served-state guard above solves the same problem with the

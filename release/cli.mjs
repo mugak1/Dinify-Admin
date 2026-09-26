@@ -140,7 +140,7 @@ function main(argv) {
     case 'freeze': {
       const r = (command === 'prebuild' ? prebuild : freeze)(ROOT, { now: clock() });
       if (!r.ok) { report(r.problems, `release ${command}: REFUSED — no candidate can be certified from this build.`); return 1; }
-      console.log(command === 'freeze' ? `release freeze: the output the mock-isolation gate scanned is ${r.treeDigest} (${r.entryCount} files)` : 'release prebuild: no prior output; the installed inventory is still the audit snapshot');
+      console.log(command === 'freeze' ? `release freeze: the output the mock-isolation gate scanned is ${r.treeDigest} (${r.entryCount} files)` : `release prebuild: no prior output bytes${r.emptyDirectories.length ? ` (${r.emptyDirectories.length} empty director${r.emptyDirectories.length === 1 ? 'y' : 'ies'} tolerated: ${r.emptyDirectories.join(', ')})` : ''}; the installed inventory is still the audit snapshot`);
       return 0;
     }
     case 'certify': {

@@ -8,9 +8,10 @@
  *
  * PRODUCER (runs inside `validate`, in the job that built and checked the payload):
  *
- *   prebuild  before `npm run build:prod`. There must be NO build output yet (a stale
- *             dist/ from anywhere else cannot be certified), and the installed inventory
- *             must still be the one the audit snapshot recorded after `npm ci`.
+ *   prebuild  before `npm run build:prod`. The output path must hold no file, link or
+ *             other entry yet (a stale dist/ from anywhere else cannot be certified; an
+ *             EMPTY directory, which carries no byte, is tolerated — see priorOutput), and
+ *             the installed inventory must still be the audit snapshot taken after `npm ci`.
  *   freeze    after the mock-isolation gate. Records the tree digest of the output that
  *             gate scanned, and again proves the inventory has not moved.
  *   certify   after the dependency audit. Proves the output is still exactly the frozen
@@ -33,7 +34,7 @@
  * candidate cannot vouch for itself.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import { capture, gitRevision, loadPolicy, reevaluate, SNAPSHOT_SCHEMA, COLLECTION_SCHEMA, RESULT_SCHEMA, POLICY_SCHEMA } from '../../dependency-audit/lib/audit.mjs';
@@ -121,14 +122,45 @@ const writeContinuity = (root, doc) => {
   writeFileSync(join(root, CONTINUITY_FILE), recordBytes(doc));
 };
 
+/**
+ * What the output directory already holds before the build: every entry that is not a
+ * directory (a file, a link, anything special), and every empty directory, by relative
+ * path. An unreadable entry counts as held — it cannot be shown to be empty.
+ *
+ * EMPTY DIRECTORIES ARE TOLERATED, and that is the whole of the tolerance. The rule
+ * exists so that no BYTE from anywhere else reaches the payload, and an empty directory
+ * carries none. It matters in practice: the Karma builder (`test:ci`, which `validate`
+ * runs before the build) writes to `dist/test-out/<uuid>/`, removes its own directory
+ * and leaves `dist/test-out/` behind, empty. The production build then deletes the
+ * output path, and the frozen tree is files only. A single file anywhere under the output
+ * path is still refused.
+ */
+export function priorOutput(dir) {
+  const entries = [];
+  const emptyDirectories = [];
+  if (!existsSync(dir)) return { entries, emptyDirectories };
+  const visit = (full, rel) => {
+    let st;
+    try { st = lstatSync(full); } catch (error) { entries.push(`${rel || '.'} (unreadable: ${error.code ?? error.message})`); return; }
+    if (!st.isDirectory()) { entries.push(rel || '.'); return; }
+    let names;
+    try { names = readdirSync(full).sort(); } catch (error) { entries.push(`${rel || '.'} (cannot be listed: ${error.code ?? error.message})`); return; }
+    if (names.length === 0 && rel) emptyDirectories.push(rel);
+    for (const name of names) visit(join(full, name), rel ? `${rel}/${name}` : name);
+  };
+  visit(dir, '');
+  return { entries, emptyDirectories };
+}
+
 /** Step 1 of 3, before the build. */
 export function prebuild(root, { now }) {
   const problems = [];
   const { policy, problems: pp } = loadReleasePolicy(root);
   problems.push(...pp);
   if (!policy) return { ok: false, problems };
-  if (existsSync(join(root, policy.build.outputPath))) {
-    problems.push(reason('stale_output', `${policy.build.outputPath}/ already exists before the build — output from anywhere else cannot be certified`));
+  const prior = priorOutput(join(root, policy.build.outputPath));
+  if (prior.entries.length) {
+    problems.push(reason('stale_output', `${policy.build.outputPath}/ already holds ${prior.entries.slice(0, 5).join(', ')}${prior.entries.length > 5 ? ` and ${prior.entries.length - 5} more` : ''} before the build — output from anywhere else cannot be certified`));
   }
   if (existsSync(join(root, CONTINUITY_FILE)) || existsSync(join(root, CANDIDATE_DIR))) {
     problems.push(reason('stale_work', `${WORK_DIR}/ already holds a continuity record or a candidate`));
@@ -138,8 +170,8 @@ export function prebuild(root, { now }) {
   if (snapshot) problems.push(...inventoryStill(root, snapshot));
   if (problems.length) return { ok: false, problems };
   const rev = gitRevision(root);
-  writeContinuity(root, { schema: CONTINUITY_SCHEMA, commit: rev.commit, tree: rev.tree, bindingDigest: digestOfValue(snapshot.binding), prebuildAt: now, frozen: null });
-  return { ok: true, problems: [] };
+  writeContinuity(root, { schema: CONTINUITY_SCHEMA, commit: rev.commit, tree: rev.tree, bindingDigest: digestOfValue(snapshot.binding), prebuildAt: now, emptyDirectoriesBeforeBuild: prior.emptyDirectories, frozen: null });
+  return { ok: true, problems: [], emptyDirectories: prior.emptyDirectories };
 }
 
 function continuityChecks(root, stage) {

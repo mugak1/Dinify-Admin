@@ -2039,7 +2039,8 @@ Before raising a PR:
    embeds (run against a model host, with the pre-change procedure as a control), and
    the workflows, including the verify step running the real CLI. It takes about 12
    seconds. CI's three `release:*` certification steps are not mirrored locally:
-   `prebuild` refuses an existing `dist/`, and `certify` needs the GitHub run context
+   `prebuild` refuses any file already under `dist/` (Karma's empty `dist/test-out/`
+   is tolerated), and `certify` needs the GitHub run context
 9. `npm run audit:deps` — the dependency audit, NETWORK. Bound to the inventory
    `npm run audit:snapshot` recorded right after `npm ci`; a scan that cannot complete
    FAILS, it is never skipped. See "Dependency Audit" below

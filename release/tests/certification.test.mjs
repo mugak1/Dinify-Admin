@@ -8,7 +8,7 @@
  */
 
 import { strict as assert } from 'node:assert';
-import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
@@ -66,6 +66,31 @@ describe('the producer: only a job whose gates all passed yields a candidate', (
       assert.equal(r.ok, false);
       assert.ok(codes(r.problems).includes('stale_output'));
     } finally { q.cleanup(); }
+  });
+
+  it('REGRESSION (found by CI): the empty dist/test-out/ Karma leaves behind does not block certification, and is recorded', () => {
+    const q = freshProject();
+    try {
+      mkdirSync(join(q.root, 'dist', 'test-out'), { recursive: true });
+      const r = prebuild(q.root, { now: NOW });
+      assert.deepEqual(r.problems, []);
+      assert.deepEqual(JSON.parse(readFileSync(join(q.root, 'release', '.work', 'continuity.json'), 'utf8')).emptyDirectoriesBeforeBuild, ['test-out']);
+    } finally { q.cleanup(); }
+  });
+
+  it('REGRESSION MATRIX: a single file anywhere under an otherwise empty output tree, or a link, is still refused', () => {
+    for (const plant of [
+      (root) => { mkdirSync(join(root, 'dist', 'test-out', 'a1b2'), { recursive: true }); writeFileSync(join(root, 'dist', 'test-out', 'a1b2', 'main.js'), 'left behind'); },
+      (root) => { mkdirSync(join(root, 'dist'), { recursive: true }); symlinkSync('/etc', join(root, 'dist', 'etc')); },
+    ]) {
+      const q = freshProject();
+      try {
+        plant(q.root);
+        const r = prebuild(q.root, { now: NOW });
+        assert.equal(r.ok, false);
+        assert.ok(codes(r.problems).includes('stale_output'));
+      } finally { q.cleanup(); }
+    }
   });
 
   it('REGRESSION MATRIX: freeze or certify without the prebuild that opened the chain is refused', () => {

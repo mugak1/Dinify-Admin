@@ -47,9 +47,11 @@ release:prebuild → build:prod → check:mock-isolation → release:freeze →
 audit:deps → release:certify → upload admin-candidate-<run>-<attempt>
 ```
 
-- **`prebuild`** refuses an existing `dist/`: output from anywhere else cannot be
-  certified. It also refuses an inventory that moved since the audit snapshot. It opens
-  the chain in `release/.work/continuity.json`.
+- **`prebuild`** refuses any file, link or other entry already under `dist/`: output
+  from anywhere else cannot be certified. Empty directories carry no byte, and are
+  tolerated and recorded. That matters because `test:ci` runs first, and the Karma
+  builder leaves an empty `dist/test-out/` behind. It also refuses an inventory that moved
+  since the audit snapshot. It opens the chain in `release/.work/continuity.json`.
 - **`freeze`** records the tree digest of exactly the output the mock-isolation gate
   scanned, and re-checks the inventory. The output must not contain `release.txt`, which
   is reserved.

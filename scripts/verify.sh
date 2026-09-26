@@ -15,13 +15,21 @@
 #                           can pass and refuse; scans nothing)
 #   6. guard qualification tests (OFFLINE — proves the mock-isolation gate fires, incl.
 #                           real optimized builds of deliberately broken workspace copies)
-#   7. test                (ng test, headless single run)
-#   8. build:prod          (ng build --configuration=production)
-#   9. mock-isolation gate (--self-test, then scans the build output from step 8)
-#  10. dependency audit    (NETWORK — scans the inventory snapshotted before step 1
+#   7. release-contract tests (OFFLINE — certification, the fresh assessment, admission,
+#                           the host procedure and the workflows; see release/README.md)
+#   8. test                (ng test, headless single run)
+#   9. build:prod          (ng build --configuration=production)
+#  10. mock-isolation gate (--self-test, then scans the build output from step 9)
+#  11. dependency audit    (NETWORK — scans the inventory snapshotted before step 1
 #                           against the public advisory database and enforces the
 #                           policy; a scan that cannot complete FAILS, it is never
 #                           skipped. See dependency-audit/README.md)
+#
+# NOT MIRRORED HERE: CI's three `release:*` certification steps. `release:prebuild`
+# refuses a workspace that already holds dist/ (output from anywhere else cannot be
+# certified) and `release:certify` requires the GitHub run context it records; neither
+# precondition holds in a developer workspace, and this script will not delete dist/ to
+# manufacture one. Step 7 exercises the same code against disposable projects.
 #
 # There is no `/dinify-check` for this repo — that command is backend-only. CI is the
 # gate; this is the local mirror of it.
@@ -61,6 +69,7 @@ run_step "design-token gate"   npm run check:tokens
 run_step "claim-code gate"     npm run check:claim-code
 run_step "dependency-audit evaluator tests (offline)" npm run test:audit
 run_step "guard qualification tests (offline)" npm run test:guards
+run_step "release-contract tests (offline)" npm run test:release
 run_step "test"                npm run test:ci
 run_step "build:prod"          npm run build:prod
 # Deliberately last: it reads dist/, which the step above produces.

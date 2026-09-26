@@ -44,14 +44,25 @@ describe('the audit is part of the required `validate` check', () => {
     assert.equal(indexOfRun(VALIDATE, SNAPSHOT), install + 1);
   });
 
-  it('CONTRACT: the scan is the LAST validation step — every existing gate still reports first — and only evidence retention follows it', () => {
+  // ORACLE CORRECTED (D08 B2.4), not relaxed: this used to require that ONLY the evidence
+  // upload follows the scan. Release certification now packages the candidate AFTER the
+  // scan — it has to, because the certification record binds the audit's result — so the
+  // contract is restated exactly: the scan is still the last GATE; what follows it is the
+  // certification of a job in which every gate passed (unconditional, so a failed scan
+  // skips it) and the always-run evidence upload, and nothing else.
+  it('CONTRACT: the scan is the LAST validation gate — every existing gate still reports first — and only certification and evidence retention follow it', () => {
     const scan = indexOfRun(VALIDATE, SCAN);
     assert.ok(scan > indexOfRun(VALIDATE, 'npm run check:mock-isolation'));
     const after = VALIDATE.slice(scan + 1);
-    assert.equal(after.length, 1);
-    assert.equal(after[0].if, 'always()');
-    assert.match(String(after[0].uses), /^actions\/upload-artifact@[0-9a-f]{40}$/);
-    assert.equal(after[0].with.path, 'dependency-audit/evidence/');
+    assert.equal(after.length, 3);
+    assert.equal(commandOf(after[0]), 'npm run release:certify');
+    assert.equal(after[0].if, undefined);
+    assert.match(String(after[1].uses), /^actions\/upload-artifact@[0-9a-f]{40}$/);
+    assert.equal(after[1].if, undefined, 'a candidate is uploaded only when every gate passed');
+    assert.equal(after[1].with.path, 'release/.work/candidate/');
+    assert.equal(after[2].if, 'always()');
+    assert.match(String(after[2].uses), /^actions\/upload-artifact@[0-9a-f]{40}$/);
+    assert.equal(after[2].with.path, 'dependency-audit/evidence/');
   });
 
   it('CONTRACT: the pre-existing gates are all still present — the audit replaces none of them', () => {

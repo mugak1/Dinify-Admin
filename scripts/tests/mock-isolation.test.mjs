@@ -61,15 +61,26 @@ describe('the required check runs the self-test before the real scan', () => {
     assert.ok(indexOfRun(VALIDATE, GUARDS) < indexOfRun(VALIDATE, 'npm run test:ci'), 'the qualification fails fast, before the long suite');
   });
 
-  it('CONTRACT (static, not an executed deployment): the deploy builds, then runs the SAME package script on the dist/ it packages', () => {
-    const prepare = DEPLOY.jobs.prepare.steps;
-    const build = indexOfRun(prepare, 'npm run build:prod');
-    const gate = indexOfRun(prepare, GATE);
-    assert.ok(build >= 0 && gate === build + 1);
-    assert.equal(prepare[gate].if, prepare[build].if, 'the gate runs whenever the build does');
-    assert.equal(prepare[gate]['continue-on-error'], undefined);
-    const stamp = prepare.findIndex((step) => /stamp release\.txt/.test(String(step.name)));
-    assert.ok(stamp > gate, 'nothing is stamped or packaged before the gate passes');
+  // CORRECTED ORACLE (D08 B2.4). This used to assert that the deploy's prepare job builds
+  // and then runs the gate on the dist/ it packages. Since B2.4 the deploy builds nothing:
+  // it promotes the candidate `validate` certified. The invariant is unchanged — the
+  // promoted bytes are the tree the gate scanned — and is now held where the build is:
+  // the gate runs straight after the build, and `release:freeze` records the digest of
+  // exactly that output, which `release:certify` requires the candidate still to be.
+  it('CONTRACT (static, not an executed deployment): the gate scans the output validate builds, freeze binds it, and the deploy builds nothing', () => {
+    const build = indexOfRun(VALIDATE, 'npm run build:prod');
+    const gate = indexOfRun(VALIDATE, GATE);
+    const freeze = indexOfRun(VALIDATE, 'npm run release:freeze');
+    const certify = indexOfRun(VALIDATE, 'npm run release:certify');
+    assert.ok(build >= 0 && gate === build + 1 && freeze === gate + 1, 'build → gate → freeze, adjacent');
+    assert.ok(certify > freeze);
+    for (const i of [build, gate, freeze, certify]) {
+      assert.equal(VALIDATE[i].if, undefined);
+      assert.equal(VALIDATE[i]['continue-on-error'], undefined);
+    }
+    for (const job of Object.values(DEPLOY.jobs)) {
+      for (const step of job.steps) assert.doesNotMatch(String(step.run ?? ''), /npm run (build:prod|check:mock-isolation)|\bng build\b/, `${step.name}: the deploy promotes the certified tree; it never builds or re-scans another one`);
+    }
   });
 
   it('CONTRACT: verify.sh mirrors both steps, the gate after the build it reads', () => {

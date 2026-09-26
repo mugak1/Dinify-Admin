@@ -17,8 +17,12 @@
     "check:mock-isolation": "node scripts/check-mock-isolation.mjs --self-test && node scripts/check-mock-isolation.mjs",
     "test:guards": "node --test scripts/tests/*.test.mjs",
     "test:audit": "node --test dependency-audit/tests/*.test.mjs",
+    "test:release": "node --test release/tests/*.test.mjs",
     "audit:snapshot": "node dependency-audit/cli.mjs snapshot",
-    "audit:deps": "node dependency-audit/cli.mjs self-test && node dependency-audit/cli.mjs audit"
+    "audit:deps": "node dependency-audit/cli.mjs self-test && node dependency-audit/cli.mjs audit",
+    "release:prebuild": "node release/cli.mjs prebuild",
+    "release:freeze": "node release/cli.mjs freeze",
+    "release:certify": "node release/cli.mjs certify"
   },
   "dependencies": {
     "@angular/common": "^21.2.18",

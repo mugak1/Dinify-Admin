@@ -58,3 +58,7 @@ Thumbs.db
 # installed, pinned scanner. Neither is source; CI uploads the evidence as an artifact.
 /dependency-audit/evidence/
 /dependency-audit/scanner/node_modules/
+
+# Release certification (release/README.md): the continuity record and the candidate
+# written inside `validate`. Not source; CI uploads the candidate as an artifact.
+/release/.work/

@@ -203,7 +203,7 @@ describe('STATIC: the verifier imports only what the privileged job has', () => 
     for (const [, cmd, rest] of calls) for (const [, opt] of rest.matchAll(/--([a-z-]+)/g)) assert.ok(accepted(cmd).includes(opt), `${cmd} --${opt}`);
   });
 
-  it('CONTRACT: dependency-audit/lib/retained.mjs is Dinify-Frontend\'s file, byte for byte (4ce0183)', () => {
+  it('CONTRACT: dependency-audit/lib/retained.mjs is Dinify-Frontend\'s file as of 4ce0183, byte for byte (not its current one)', () => {
     assert.equal(sha256Hex(readFileSync(join(REPO_ROOT, 'dependency-audit', 'lib', 'retained.mjs'))), '5453f5f289f5740ce82356a8fcfd310162bfdbf868b9f9efe527d81a976a7ab5');
   });
 });

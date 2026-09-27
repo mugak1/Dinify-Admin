@@ -187,8 +187,10 @@ checkout of the target.
 
 ## The fresh assessment
 
-`lib/assessment.mjs` runs over `dependency-audit/lib/retained.mjs`, which is copied
-byte-for-byte from Dinify-Frontend (`5453f5f2…7ab5`; a test pins the digest).
+`lib/assessment.mjs` runs over `dependency-audit/lib/retained.mjs`, which was copied
+byte-for-byte from Dinify-Frontend at `4ce0183` (`5453f5f2…7ab5`; a test pins the digest).
+The two have since diverged: Frontend #709 (merged at `a198090`) extended its copy with
+scanner diagnostics, and Admin's is still the pre-extension file.
 
 - **Scan-only replay.** The scanner runs in a directory holding exactly the retained
   `package.json` and `package-lock.json`. `npm audit` reads the lock graph. No

@@ -1,6 +1,7 @@
-import { ChangeDetectionStrategy, Component } from '@angular/core';
+import { ChangeDetectionStrategy, Component, DestroyRef, inject } from '@angular/core';
 import { RouterOutlet } from '@angular/router';
 
+import { SessionContinuityService } from '../core/auth/session-continuity.service';
 import { DefectBannerComponent } from '../ui/defect-banner.component';
 import { ElevationDialogComponent } from '../ui/elevation-dialog.component';
 import { NoticeBannerComponent } from '../ui/notice-banner.component';
@@ -25,6 +26,10 @@ import { SidebarComponent } from './sidebar.component';
  * THREE CHANNELS, EACH HOLDING AT MOST ONE MESSAGE — a live outage state, one defect,
  * one composed notice. Not a stack, and deliberately not a toast surface: see
  * `NoticeService` for the boundary and why it is drawn there.
+ *
+ * It also owns the RESUME CHECK (D10) for exactly as long as it exists: the listeners
+ * that revalidate the session when this tab is hidden or comes back are attached here
+ * and removed when the authenticated frame is destroyed.
  */
 @Component({
   selector: 'app-shell',
@@ -59,4 +64,9 @@ import { SidebarComponent } from './sidebar.component';
     <app-elevation-dialog />
   `,
 })
-export class ShellComponent {}
+export class ShellComponent {
+  constructor() {
+    const stop = inject(SessionContinuityService).start();
+    inject(DestroyRef).onDestroy(stop);
+  }
+}

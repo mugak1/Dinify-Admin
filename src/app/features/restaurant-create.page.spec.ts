@@ -5,8 +5,10 @@ import { RouterTestingHarness } from '@angular/router/testing';
 import { Observable, Subject, of, throwError } from 'rxjs';
 
 import { AdminServiceStatus } from '../core/api/service-status';
+import { ADMIN_AUTH, AdminAuthApi } from '../core/auth/admin-auth.api';
 import { ElevationCancelledError } from '../core/auth/elevation.service';
 import { RESTAURANT_API, RestaurantApi } from '../core/restaurants/restaurant.api';
+import { SessionStore } from '../core/auth/session.store';
 import {
   CreateRestaurantRequest,
   RestaurantCreationResult,
@@ -178,6 +180,24 @@ class LandingStub {}
  *   NOTHING IS SENT. The vocabulary is issue and hand over — never send, resend,
  *   delivered — and no claim link exists to be copied.
  */
+/**
+ * D10: the claim code renders only for a document whose session is signed in, bound to
+ * an owner and confirmed — which is what the shell guarantees before this screen exists.
+ */
+const OPERATOR_SESSION = {
+  username: 'operator',
+  email: 'operator@dinifyapp.com',
+  issued_at: '2026-08-19T09:00:00+00:00',
+  expires_at: '2026-08-19T17:00:00+00:00',
+  elevated_at: '2026-08-19T11:58:00+00:00',
+  server_time: '2026-08-19T12:00:00+00:00',
+  command_owner: {
+    version: 1,
+    actor: '0a0a0a0a-0000-4000-8000-0000000000aa',
+    session: '0b0b0b0b-0000-4000-8000-0000000000bb',
+  },
+};
+
 describe('RestaurantCreatePage', () => {
   let harness: RouterTestingHarness;
   let api: StubApi;
@@ -200,9 +220,12 @@ describe('RestaurantCreatePage', () => {
           withComponentInputBinding(),
         ),
         { provide: RESTAURANT_API, useValue: api },
+        // Read only by a resume check, which nothing here starts.
+        { provide: ADMIN_AUTH, useValue: {} as AdminAuthApi },
       ],
     });
     status = TestBed.inject(AdminServiceStatus);
+    TestBed.inject(SessionStore).adopt(OPERATOR_SESSION);
   });
 
   afterEach(() => {

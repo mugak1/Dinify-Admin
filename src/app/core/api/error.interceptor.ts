@@ -2,28 +2,66 @@ import {
   HttpErrorResponse,
   HttpEvent,
   HttpEventType,
-  HttpHandlerFn,
   HttpInterceptorFn,
   HttpRequest,
+  HttpResponse,
 } from '@angular/common/http';
 import { inject } from '@angular/core';
 import { Router } from '@angular/router';
-import { MonoTypeOperatorFunction, Observable, catchError, switchMap, tap, throwError } from 'rxjs';
+import {
+  catchError,
+  defer,
+  EMPTY,
+  mergeMap,
+  MonoTypeOperatorFunction,
+  Observable,
+  of,
+  switchMap,
+  tap,
+  throwError,
+} from 'rxjs';
 
 import { ADMIN_AUTH } from '../auth/admin-auth.api';
+import {
+  COMMAND_OWNER_HEADER,
+  CommandNotRunError,
+  CommandOwner,
+  CommandOutcomeUnknownError,
+  CommandResultWithheldError,
+  compareOwners,
+  formatCommandOwner,
+  readOwnerRefusal,
+  SessionEndedReadError,
+} from '../auth/command-owner';
 import { ElevationService } from '../auth/elevation.service';
+import { boundaryKindFor, SessionBoundary } from '../auth/session-boundary.service';
+import { SessionContinuityService } from '../auth/session-continuity.service';
+import { isAdminSessionResponse } from '../auth/session.model';
 import { SessionStore } from '../auth/session.store';
 import {
   apiUrl,
   AUTH_ROUTES,
   CSRF_FAILURE_DETAIL_PREFIX,
   ELEVATION_REQUIRED_DETAIL,
+  isAdminApiUrl,
+  SAFE_METHODS,
 } from './api.constants';
 import { DefectService } from './defect.service';
 import { extractDetail, extractErrorMessage } from './error-message';
-import { CSRF_RETRIED, ELEVATION_REPLAYED, SUPPRESS_DEFECT_REPORT } from './http-context';
+import {
+  COMMAND_OWNER,
+  CSRF_RETRIED,
+  ELEVATION_REPLAYED,
+  LIFECYCLE,
+  SIGN_OUT_TEARDOWN,
+  SUPPRESS_DEFECT_REPORT,
+} from './http-context';
 import { AdminServiceStatus } from './service-status';
-import { classifyTransportFailure, extractRequestId } from './transport-failure';
+import {
+  classifyTransportFailure,
+  extractRequestId,
+  IncoherentResponseError,
+} from './transport-failure';
 
 /**
  * Statuses that are an application OUTCOME rather than a defect. The screen that made
@@ -39,11 +77,12 @@ const EXPECTED_CLIENT_STATUSES = new Set([400, 401, 403, 404, 409, 422, 429]);
  *      or revocation. Client state is cleared and the operator is routed to
  *      /login?returnUrl=. NEVER retried: there is no credential left to retry with.
  *
- *   2. 403 carrying the CSRF message — THE TOKEN IS STALE. `verify/` ROTATES the CSRF
- *      secret, so another tab signing in invalidates this one's. Re-bootstrap ONCE
- *      with GET /auth/session/ (which ENSURES rather than rotates, so it cannot
- *      invalidate anyone else's), retry ONCE, then hard-fail as a defect. Not an
- *      infinite retry.
+ *   2. 403 carrying the CSRF message — THE TOKEN IS STALE: the cookie is missing, or
+ *      a sign-in in another tab rotated the secret. Re-read GET /auth/session/ ONCE
+ *      (which ENSURES rather than rotates, so it cannot invalidate anyone else's),
+ *      retry ONCE, then hard-fail as a defect. Not an infinite retry. D10: the retry is
+ *      allowed only when that read names the owner the command was issued under — a
+ *      repaired CSRF pair says nothing about which session the command belongs to.
  *
  *   3. 403 carrying the ELEVATION message — AN EXPECTED SECURITY STATE, not an error.
  *      Open one re-elevation modal, POST /auth/elevate/, and REPLAY THE ORIGINAL
@@ -97,6 +136,31 @@ const EXPECTED_CLIENT_STATUSES = new Set([400, 401, 403, 404, 409, 422, 429]);
  * bound would exist only in the comments. So `classify` calls itself on the replayed
  * request, and terminates because the replay carries a context flag that forces the
  * exhausted branch. One elevation, one replay; one re-bootstrap, one retry.
+ *
+ * ── D10: WHO A COMMAND BELONGS TO ─────────────────────────────────────────────────
+ *
+ * ISSUANCE. On first entry every request captures the local LIFECYCLE, and every
+ * guarded write — an unsafe admin request other than login/, verify/ and logout/ —
+ * also captures the COMMAND OWNER and carries it as `X-Admin-Command-Owner`. Both are
+ * fixed there: a retry or a replay re-enters `dispatch`, never this function, and
+ * carries the same header, method, URL and body. A guarded write with no owner to name
+ * is NOT SENT — an unnamed command is exactly the one the server cannot refuse. A
+ * document holding no session sends no admin read other than `session/` either: a
+ * screen still asking after its session ended would be reading under whatever cookie
+ * the browser holds by then.
+ *
+ * THE SERVER'S REFUSAL is read exactly (`readOwnerRefusal`) and never enters the CSRF
+ * or elevation recoveries: a different administrator, or a new session of the same one,
+ * crosses the session boundary and the command is reported as not run. An ordinary 409
+ * is an ordinary 409.
+ *
+ * AN ANSWER FOR AN ENDED LIFECYCLE DRIVES NOTHING. It adopts, clears, navigates,
+ * prompts, reports and replays nothing; the command it answers is told only what is
+ * true — refused before execution, reported complete but withheld, or unknown — and is
+ * never re-sent. Once this document holds a successor session, such an answer reaches
+ * no consumer at all.
+ *
+ * THE ONE TEARDOWN EXCEPTION is the named sign-out: see `SIGN_OUT_TEARDOWN`.
  */
 export const errorClassifierInterceptor: HttpInterceptorFn = (req, next) => {
   const router = inject(Router);
@@ -105,12 +169,103 @@ export const errorClassifierInterceptor: HttpInterceptorFn = (req, next) => {
   const defects = inject(DefectService);
   const status = inject(AdminServiceStatus);
   const auth = inject(ADMIN_AUTH);
+  const boundary = inject(SessionBoundary);
+  const continuity = inject(SessionContinuityService);
+
+  // ── THE NAMED SIGN-OUT ─────────────────────────────────────────────────────────
+  // Sent after its lifecycle ended, on purpose, naming the owner captured before that.
+  // Without one it is not sent at all. Its answer goes straight back to the sign-out
+  // that asked, and drives nothing else: no adoption, no navigation, no boundary, no
+  // outage report, no retry.
+  if (isRoute(req, AUTH_ROUTES.logout)) {
+    const owner = req.context.get(COMMAND_OWNER);
+    if (!req.context.get(SIGN_OUT_TEARDOWN) || owner === null) {
+      return throwError(() => new CommandNotRunError('owner-unknown', false));
+    }
+    return next(req.clone({ setHeaders: { [COMMAND_OWNER_HEADER]: formatCommandOwner(owner) } }));
+  }
+
+  // ── ISSUANCE ───────────────────────────────────────────────────────────────────
+  // A document holding no session reads nothing but `session/` itself. The only way
+  // to be here with a screen still asking is a lifecycle that just ENDED — a sign-out,
+  // a denial, a boundary — and a read sent now would go out under whatever cookie the
+  // browser holds by then, which may be someone else's.
+  if (isSignedInRead(req) && !store.isAuthenticated()) {
+    return throwError(() => new SessionEndedReadError());
+  }
+  const lifecycle = req.context.get(LIFECYCLE) ?? store.lifecycle();
+  let issued = req.clone({ context: req.context.set(LIFECYCLE, lifecycle) });
+  if (isGuardedWrite(req)) {
+    const admitted = admitOwner(store, lifecycle, req.context.get(COMMAND_OWNER));
+    if (admitted instanceof CommandNotRunError) return throwError(() => admitted);
+    issued = issued.clone({
+      setHeaders: { [COMMAND_OWNER_HEADER]: formatCommandOwner(admitted) },
+      context: issued.context.set(COMMAND_OWNER, admitted),
+    });
+  }
+
+  // login/ and verify/ come BEFORE a session: they belong to no lifecycle and are never
+  // fenced by one, so a document can always sign in. `AdminAuthService.verify` fences
+  // what it does with the answer.
+  const current = (request: HttpRequest<unknown>): boolean =>
+    isPreSession(request) || store.isCurrent(request.context.get(LIFECYCLE));
+
+  /**
+   * An answer that arrived after its lifecycle ended. What it may truthfully say
+   * depends on what the server said — and on nothing else, since no body, claim code or
+   * projection from it is delivered.
+   */
+  const late = (
+    request: HttpRequest<unknown>,
+    answer: HttpResponse<unknown> | HttpErrorResponse,
+  ): Observable<never> => {
+    // A successor session is held here: nothing from the old one crosses into it.
+    if (store.isAuthenticated()) return EMPTY;
+    if (isSafe(request)) return throwError(() => new SessionEndedReadError());
+    const requestId = extractRequestId(answer);
+    if (answer instanceof HttpResponse) {
+      return throwError(() =>
+        isContractSuccess(answer)
+          ? new CommandResultWithheldError(requestId)
+          : new CommandOutcomeUnknownError(requestId),
+      );
+    }
+    if (isPreHandlerRefusal(answer)) {
+      return throwError(() => new CommandNotRunError('session-ended', true));
+    }
+    return throwError(() => new CommandOutcomeUnknownError(requestId));
+  };
+
+  /** Re-checked before EVERY send: the first, the CSRF retry and the elevation replay. */
+  const dispatch = (request: HttpRequest<unknown>): Observable<HttpEvent<unknown>> =>
+    defer(() => {
+      if (!current(request)) {
+        return throwError(() =>
+          isSafe(request)
+            ? new SessionEndedReadError()
+            : new CommandNotRunError('session-ended', false),
+        );
+      }
+      return next(request).pipe(
+        mergeMap((event) =>
+          event instanceof HttpResponse && !current(request) ? late(request, event) : of(event),
+        ),
+        reachableOnResponse(status),
+        catchError((error: unknown) => classify(request, error)),
+      );
+    });
 
   const classify = (
     request: HttpRequest<unknown>,
     error: unknown,
   ): Observable<HttpEvent<unknown>> => {
     if (!(error instanceof HttpErrorResponse)) return throwError(() => error);
+
+    // --- D10: AN ANSWER FOR AN ENDED LIFECYCLE --------------------------------------
+    // Above everything, the transport precondition included. An old 401 must not sign
+    // out a later session; an old refusal must not prompt or cross a boundary; an old
+    // outage must not raise a banner about a session that is gone.
+    if (!current(request)) return late(request, error);
 
     const detail = extractDetail(error);
     const requestId = extractRequestId(error);
@@ -122,6 +277,31 @@ export const errorClassifierInterceptor: HttpInterceptorFn = (req, next) => {
       return throwError(() => error);
     }
 
+    // --- D10: THE SERVER'S OWNER PRECONDITION ---------------------------------------
+    // Refused before CSRF, permissions, the factor and the handler, so nothing ran and
+    // this is the one outcome that may say so. Only a request that NAMED an owner can
+    // be refused for it; anything else carrying these codes is not this contract.
+    const refusal = request.context.get(COMMAND_OWNER) ? readOwnerRefusal(error) : null;
+    if (refusal === 'actor-changed' || refusal === 'session-changed') {
+      status.markReachable();
+      boundary.cross(boundaryKindFor(refusal));
+      return throwError(() => new CommandNotRunError(refusal, true));
+    }
+    if (refusal === 'owner-malformed') {
+      // This client formatted a header its own server cannot read. Nothing ran, and it
+      // is a defect worth a report.
+      status.markReachable();
+      if (!request.context.get(SUPPRESS_DEFECT_REPORT)) {
+        defects.report({
+          message:
+            'A command could not be tied to its admin session, so it was not run. That is a defect worth reporting.',
+          requestId,
+          kind: 'unclassified',
+        });
+      }
+      return throwError(() => new CommandNotRunError('owner-malformed', true));
+    }
+
     // --- CASE 1 --------------------------------------------------------------------
     if (error.status === 401) {
       // A 401 from login/ or verify/ is a REJECTED CREDENTIAL, not a lost session. The
@@ -131,8 +311,10 @@ export const errorClassifierInterceptor: HttpInterceptorFn = (req, next) => {
         return throwError(() => error);
       }
 
+      // A GENUINE CURRENT-SESSION DENIAL ends the lifecycle — when there is a session to
+      // end. A signed-out document has none, and nothing it issued is outstanding.
       const wasAuthenticated = store.isAuthenticated();
-      store.clear();
+      if (wasAuthenticated) store.end();
 
       // The bootstrap read is expected to 401 for a signed-out operator; the guard
       // routes them. Navigating from here as well would race the first navigation.
@@ -159,9 +341,41 @@ export const errorClassifierInterceptor: HttpInterceptorFn = (req, next) => {
       }
 
       const retried = request.clone({ context: request.context.set(CSRF_RETRIED, true) });
+      const ticket = store.issueTicket();
+      const epoch = continuity.epoch();
       return auth.readSession().pipe(
-        tap((session) => store.adopt(session)),
-        switchMap(() => replay(retried, next, classify, status)),
+        // The read is its own request, issued in this command's lifecycle and fenced by
+        // its own dispatch — so no second lifecycle check is needed here. If the
+        // lifecycle ended while it was in flight, what the COMMAND gets told is that it
+        // was not run: CSRF refused it. (With a successor held, the read reaches nobody
+        // and neither does this command.)
+        catchError((readError: unknown) =>
+          throwError(() =>
+            readError instanceof SessionEndedReadError
+              ? new CommandNotRunError('session-ended', true)
+              : readError,
+          ),
+        ),
+        switchMap((session) => {
+          if (!isAdminSessionResponse(session)) {
+            return throwError(() => new IncoherentResponseError());
+          }
+          // ONE bounded retry, and only across PROVEN continuity: the read must name the
+          // owner the command was issued under. The command was refused by CSRF, before
+          // any handler, so every other answer here is "not run".
+          const observed = continuity.apply(ticket, epoch, session);
+          switch (observed) {
+            case 'same':
+              return dispatch(retried);
+            case 'actor-changed':
+            case 'session-changed':
+              return throwError(() => new CommandNotRunError(observed, true));
+            case 'unbound':
+              return throwError(() => new CommandNotRunError('binding-unsupported', true));
+            default:
+              return throwError(() => new CommandNotRunError('session-ended', true));
+          }
+        }),
       );
     }
 
@@ -187,7 +401,15 @@ export const errorClassifierInterceptor: HttpInterceptorFn = (req, next) => {
       const replayed = request.clone({
         context: request.context.set(ELEVATION_REPLAYED, true),
       });
-      return elevation.request().pipe(switchMap(() => replay(replayed, next, classify, status)));
+      // The prompt is bound to THIS command's owner and lifecycle, and the replay is
+      // re-checked before it is sent — a prompt settled after its lifecycle ended
+      // releases nothing.
+      return elevation
+        .request('action-required', {
+          owner: request.context.get(COMMAND_OWNER),
+          lifecycle: request.context.get(LIFECYCLE) ?? store.lifecycle(),
+        })
+        .pipe(switchMap(() => dispatch(replayed)));
     }
 
     // --- CASE 4 --------------------------------------------------------------------
@@ -204,22 +426,87 @@ export const errorClassifierInterceptor: HttpInterceptorFn = (req, next) => {
     return throwError(() => error);
   };
 
-  return next(req).pipe(
-    reachableOnResponse(status),
-    catchError((error: unknown) => classify(req, error)),
-  );
+  return dispatch(issued);
 };
 
-/** Re-issue a request and classify ITS failure too, so every recovery stays bounded. */
-function replay(
-  request: HttpRequest<unknown>,
-  next: HttpHandlerFn,
-  classify: (request: HttpRequest<unknown>, error: unknown) => Observable<HttpEvent<unknown>>,
-  status: AdminServiceStatus,
-): Observable<HttpEvent<unknown>> {
-  return next(request).pipe(
-    reachableOnResponse(status),
-    catchError((error: unknown) => classify(request, error)),
+/**
+ * D10. The owner a guarded write names, or why it is not sent. A command issued by an
+ * ended lifecycle, a document with no session, or a session whose owner is unknown is
+ * refused here — `sent: false` — rather than sent unnamed. `supplied` is an owner the
+ * caller captured earlier (an elevation attempt); it must still be this lifecycle's.
+ */
+function admitOwner(
+  store: SessionStore,
+  lifecycle: number,
+  supplied: CommandOwner | null,
+): CommandOwner | CommandNotRunError {
+  if (!store.isCurrent(lifecycle)) return new CommandNotRunError('session-ended', false);
+  if (!store.isAuthenticated()) return new CommandNotRunError('no-session', false);
+  const held = store.owner();
+  if (store.binding() !== 'supported' || held === null) {
+    return new CommandNotRunError('binding-unsupported', false);
+  }
+  if (supplied !== null && compareOwners(supplied, held) !== 'same') {
+    return new CommandNotRunError('session-ended', false);
+  }
+  return held;
+}
+
+function isSafe(request: HttpRequest<unknown>): boolean {
+  return SAFE_METHODS.includes(request.method.toUpperCase());
+}
+
+/**
+ * D10. The requests that must name their owner: unsafe, on this admin API, and
+ * authenticated by the session. login/ and verify/ come before a session exists and
+ * stay open to a document that holds none; logout/ has its own rule above.
+ */
+function isGuardedWrite(request: HttpRequest<unknown>): boolean {
+  if (isSafe(request) || !isAdminApiUrl(request.url)) return false;
+  return !(isPreSession(request) || isRoute(request, AUTH_ROUTES.logout));
+}
+
+/** D10. A safe admin request that only a signed-in document makes. */
+function isSignedInRead(request: HttpRequest<unknown>): boolean {
+  return (
+    isSafe(request) && isAdminApiUrl(request.url) && !isRoute(request, AUTH_ROUTES.session)
+  );
+}
+
+function isPreSession(request: HttpRequest<unknown>): boolean {
+  return isRoute(request, AUTH_ROUTES.login) || isRoute(request, AUTH_ROUTES.verify);
+}
+
+/**
+ * A success the admin plane STATED, not merely a 2xx: `{status: <the same 2xx>,
+ * data: {...}}`, the envelope every admin write returns. Anything less is inconclusive.
+ */
+function isContractSuccess(response: HttpResponse<unknown>): boolean {
+  if (response.status < 200 || response.status >= 300) return false;
+  const body = response.body;
+  if (typeof body !== 'object' || body === null) return false;
+  const envelope = body as Record<string, unknown>;
+  const data = envelope['data'];
+  return (
+    envelope['status'] === response.status &&
+    typeof data === 'object' &&
+    data !== null &&
+    !Array.isArray(data)
+  );
+}
+
+/**
+ * Refused before any handler could run: authentication, the owner precondition, CSRF
+ * or step-up. The only failures a late answer may report as "not run".
+ */
+function isPreHandlerRefusal(error: HttpErrorResponse): boolean {
+  if (error.status === 401) return true;
+  if (readOwnerRefusal(error) !== null) return true;
+  const detail = extractDetail(error);
+  return (
+    error.status === 403 &&
+    detail !== null &&
+    (detail.startsWith(CSRF_FAILURE_DETAIL_PREFIX) || detail === ELEVATION_REQUIRED_DETAIL)
   );
 }
 

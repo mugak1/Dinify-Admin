@@ -108,6 +108,16 @@ Steps 3–10 are otherwise not built.
   the existing machinery, one invitation write at a time per workspace, and the same
   409-then-reload gate the commercial writes use. Overview reports the state and links
   there. See "The Owner-Invitation Writes" below.
+- **D10 B2 — commands bound to the session that issued them: ✅ BUILT** (paired with
+  backend B1, merged 7845b1c). Every guarded write names its command owner and keeps
+  the SAME request across CSRF recovery and elevation replay; a different
+  administrator, or a new session of the same one, crosses a full-document boundary
+  instead of being adopted or replayed into; a server that publishes no owner gets no
+  guarded write at all; sign-out is named and ends the local lifecycle at intent; late
+  answers are withheld, not-run or unknown and never re-sent; resume revalidation
+  hides sensitive content until the same owner is confirmed. See "The Command Owner".
+  **D10 is still PARTIAL**: the operational acceptance (a live-origin check, retiring
+  old bundles) is separate and not claimed here.
 - **Readiness (the ENGINE half), Billing, Support and Activity tabs: ❌ still
   placeholders** with written empty states (spec §15 steps 3, 7, 6 and 8). The
   Readiness tab is no longer empty — the owner claim panel sits above the engine's
@@ -484,15 +494,21 @@ prefix, so Django's `admin/v1/...` routes are reached with it.
 | `authentication_classes` | **`[]`** | **`[]`** | **`[]`** | `AdminSessionAuthentication` | `AdminSessionAuthentication` |
 | CSRF required | No | No | No | No (safe method) | **YES** — `X-CSRFToken` |
 | Body | `{username, password}` | `{method, code}` | none | — | `{method, code}` |
-| Success | `200 {data:{second_factor_required, recovery_code_required}}` | `200 {data:{username, expires_at, used_recovery_code, lockout_cleared, recovery_codes_remaining}}` | `200` always | `200 {data:{…6 fields}}` | `200 {data:{elevated_at, used_recovery_code, recovery_codes_remaining}}` |
-| Failure | `401 {status,message:"Invalid credentials."}` · `429` | `401 {status,message:"Invalid or expired verification."}` · `429` | *cannot fail* | `401 {detail}` | `403 {status,message}` · `403 {detail:"CSRF Failed: …"}` · `401` · `429` |
-| Cookies | sets `__Host-dinify_admin_challenge` (5 min) | sets `__Host-dinify_admin_session` (8 h); **ROTATES** CSRF; clears challenge | clears session + challenge | **ENSURES** CSRF | none |
+| Success | `200 {data:{second_factor_required, recovery_code_required}}` | `200 {data:{username, expires_at, used_recovery_code, lockout_cleared, recovery_codes_remaining, command_owner}}` | `200` (named session ended, or no live session) | `200 {data:{…6 fields, command_owner}}` | `200 {data:{elevated_at, used_recovery_code, recovery_codes_remaining}}` |
+| Failure | `401 {status,message:"Invalid credentials."}` · `429` | `401 {status,message:"Invalid or expired verification."}` · `429` | `400` / `409` owner refusal (D10) | `401 {detail}` | owner refusal · `403 {status,message}` · `403 {detail:"CSRF Failed: …"}` · `401` · `429` |
+| Cookies | sets `__Host-dinify_admin_challenge` (5 min) | sets `__Host-dinify_admin_session` (8 h); **ROTATES** CSRF; clears challenge | clears session + challenge — unless refused, or no live session | **ENSURES** CSRF — re-emits the secret the request carried | none |
 
-- **`verify/` ROTATES the CSRF token** (`rotate_token`) — a fresh secret per session,
-  mirroring `django.contrib.auth.login()`. Another tab signing in therefore
-  invalidates this one's token.
-- **`session/` ENSURES it** (`get_token`) — reuses an existing secret, so bootstrapping
-  from any tab at any time cannot invalidate what the others hold.
+- **`verify/` ROTATES the CSRF token** (`rotate_token`) — a fresh secret per sign-in,
+  mirroring `django.contrib.auth.login()`. **It does NOT bind that secret to a session.**
+  This file used to say another tab signing in "therefore invalidates this one's
+  token"; that was never a guarantee (Stage A D10, CE1) — see the next line.
+- **`session/` ENSURES it** (`get_token`) — it reuses, and RE-EMITS, whatever secret the
+  request carried. So bootstrapping from any tab cannot invalidate what the others hold,
+  and also: a `session/` read sent before another sign-in and delivered after it writes
+  the OLDER secret back beside the NEWER session cookie, and a tab holding it then
+  passes CSRF as whoever signed in since. **A matched CSRF pair proves the request came
+  from this origin, never which session a command belongs to.** That is the command
+  owner's job — see "The Command Owner" below.
 - CSRF cookie: `__Host-dinify_admin_csrftoken`, `HttpOnly=false` (the SPA must read
   it), `Secure`, `Path=/`, no `Domain`, `SameSite=Strict`. **Not** Django's default
   `csrftoken` — that belongs to the customer plane.
@@ -535,6 +551,11 @@ rather than a diagnosis.
 The third case is status 0, any 5xx, or a 2xx whose body is not a session — see
 `classifyTransportFailure` below.
 
+D10 refines the first two without adding a fourth: a 200 naming a DIFFERENT owner from
+the one this document holds is a session boundary rather than an adoption, and a read —
+success, 401 or outage — that lands after this document's lifecycle ended changes
+nothing, so a late 401 cannot sign out a session adopted since.
+
 **It was two, and collapsing them cost the operator the diagnosis.** A bare `catch`
 cleared the store for all three, so a dead backend routed to the login form, and the
 sign-in attempt that followed answered a correct password with **"Invalid
@@ -563,6 +584,80 @@ Deliberate. It is inert without a session, and `verify/` rotates it on the next
 sign-in — clearing it would only add a second place that touches CSRF state. Client
 state is cleared regardless of the logout response: a failed revoke must not leave the
 operator looking at a portal they believe they have left.
+
+**D10: THE LOCAL LIFECYCLE ENDS AT INTENT, AND THE SIGN-OUT IS NAMED.** `signOut()`
+captures the owner, ends the lifecycle (queued prompts drain as not run; every late
+answer for the session drives nothing), clears the notices, sends `logout/` naming that
+owner, and navigates without waiting for it. The server revokes the named session only;
+a stale tab's sign-out cannot end whoever has signed in since (409, nothing revoked).
+**With no owner to name — no session, or a server that publishes none — NO `logout/` is
+sent**: an unnamed one ends whatever session the browser holds, which may be another
+tab's, so it is never a silent fallback. `AdminAuthService.remoteSignOut` says which
+happened (`pending` / `ended` / `unconfirmed`), and the sign-in screen tells the operator
+when the server half was not established rather than implying it was. **Known and
+unchanged:** a delayed MATCHING sign-out still ends its own session whenever it lands —
+that is what it was asked to do.
+
+### The Command Owner — D10, `core/auth/command-owner.ts`
+Backend B1 (`platform_admin_app/command_owner.py`) publishes `command_owner =
+{version: 1, actor, session}` — `User.pk` and `AdminSession.id`, lowercase UUIDs, not
+credentials — on `verify/` and `session/`. An unsafe request may send
+`X-Admin-Command-Owner: 1;<actor>;<session>`, and the server refuses it BEFORE CSRF,
+elevation and the handler unless it names the session that authenticated it:
+`400 admin_command_owner_malformed`, `409 admin_command_actor_changed`,
+`409 admin_command_session_changed`, each `{detail, code}` and nothing else. **An
+absent header is the legacy contract and is not checked** — requiring it everywhere is
+a later backend contraction, and old bundles stay exposed until they reload or retire.
+
+- **`readCommandOwner` is STRICT and in memory only** — exactly those three keys,
+  version the number 1, canonical lowercase UUIDs; nothing is normalised, persisted,
+  logged or put in a URL. Absent and malformed are different answers.
+- **`SessionStore` holds a LIFECYCLE GENERATION** that `end()` advances — at sign-out
+  intent, a genuine current-session 401, a new sign-in replacing the session, and a
+  session boundary. Every request captures it at issuance, and every guarded write
+  (unsafe, admin API, not `login/` / `verify/` / `logout/`) also captures the OWNER and
+  carries the header. **Retries and replays reuse the ORIGINAL request** — same header,
+  method, URL, body and assertions — and are re-checked against the lifecycle before
+  each send.
+- **A guarded write with no owner is NOT SENT** (`CommandNotRunError`, `sent: false`):
+  no session, or a server that published no owner. `login/` and `verify/` stay open to a
+  document with none. A LATER read that stops publishing the owner withdraws it for the
+  rest of the lifecycle — a cached capability is not perpetual proof. A document holding
+  no session sends no admin read but `session/`.
+- **Every session read goes through ONE rule** (`SessionStore.observe`, with a ticket
+  taken before the read): stale / adopted / same / unbound / actor-changed /
+  session-changed. The last two are a **SESSION BOUNDARY** (`SessionBoundary.cross`):
+  the lifecycle ends, notices clear, and the document is REPLACED with
+  `/login?session=changed|renewed`, which renders fixed copy and never the query text.
+  **A new session of the SAME administrator is a boundary too, never a CSRF renewal.**
+  The post-verify read must match the verified owner on actor AND session, and a
+  mismatch is never retried (`PostVerifyCorrelationError`).
+- **Recovery is bounded AND gated on continuity.** A CSRF 403 re-reads `session/` once
+  and retries once ONLY when the read names the command's owner; an elevation prompt is
+  bound to the owner and lifecycle it opened under (`ElevationService` attempts, each
+  with its own Subject), drains its waiters as not run when that lifecycle ends, and
+  ignores an answer for a cancelled or replaced attempt. The owner refusal itself never
+  enters either recovery.
+- **An answer for an ENDED lifecycle drives nothing**, and the command is told only
+  what is true: once a successor session is held it reaches no consumer at all;
+  otherwise a pre-handler refusal (401, CSRF, elevation, owner) is
+  `CommandNotRunError`, a stated `{status, data:{…}}` success is
+  `CommandResultWithheldError` (the result is not delivered), and anything else —
+  missing, malformed, a 5xx, a handler 4xx — is `CommandOutcomeUnknownError`, which is
+  `incoherent`, so every consumer takes its existing INDETERMINATE branch. **No 2xx is
+  read as execution and no 4xx as non-execution**, and nothing is ever re-sent.
+- **RESUME REVALIDATION** (`SessionContinuityService`, wired and torn down by the shell):
+  hide, `pagehide`, `pageshow`, `focus` and `visibilitychange` mark the session
+  UNCONFIRMED synchronously and issue at most one coalesced `session/` read (one in
+  flight, one queued). Only a read issued after the latest event can confirm. Same owner
+  → confirmed; different → boundary; unavailable → still signed in, sensitive content
+  hidden, the existing outage recovery offered. **No polling, and no promise of instant
+  erasure.** It protects what is SHOWN; the server's precondition protects commands.
+- **Not closed here, and recorded rather than implied:** the development RESTAURANT mock
+  runs no interceptor, so in `npm start` the owner contract is visible on the auth
+  routes, resume and the boundary but not on restaurant writes; and a consumer's
+  indeterminate branch can still raise the outage banner in the brief window between a
+  lifecycle ending and the document leaving.
 
 ### TRANSPORT vs RESPONSE — `core/api/transport-failure.ts`
 **"Did we get a usable response at all" is PRIOR to "what did the server say."**
@@ -1482,6 +1577,22 @@ Twelve regressions pin it (`restaurant-detail.page.spec.ts`), and the negative c
 is recorded: restoring Step 2G's behaviour — no suppression at submit, an indeterminate
 outcome that leaves the plaintext in place — fails 8 of them.
 
+### AND ONLY WHILE THE SESSION IS CONFIRMED (D10)
+The code was issued to ONE admin session, so `app-owner-claim-code` renders the input
+and its copy control only while `SessionContinuityService.sensitiveHidden()` is false —
+signed in, owner-bound and confirmed since the last hide or resume. Otherwise both are
+REMOVED from the DOM (one fixed sentence in their place) and `copy()` does nothing; a
+clipboard write that completes after the code was hidden, replaced or its lifecycle
+ended publishes neither "copied" nor "failed". **Hiding is not discarding**: the holder
+still has the code, and the same owner's confirmation shows it again — but only if the
+holder still has it. An indeterminate mutation discards it on the Readiness tab exactly
+as above, and no resume read, unchanged invitation id or confirmation brings it back.
+The same applies to the creation screen's code. A reissue or creation answered after
+its lifecycle ended is withheld (`CommandResultWithheldError`) and its code is never
+rendered. Nothing here widens the code's lifetime or stores it anywhere new; the
+claim-code gate and the specs' sweeps are unchanged. Pinned by
+`core/auth/command-lifecycle.spec.ts`, which asserts the input's actual `.value`.
+
 ### THE MOCK RUNS THE SERVER'S RULES, AND MINTS WITHOUT KEEPING
 `MockRestaurantApi` implements creation (shape, the domain's phone and email refusals,
 the four owner conflicts, the duplicate-restaurant conflict, then the commit — with the
@@ -1502,9 +1613,11 @@ of "an error happened".
    or revocation. Clear client state, route to `/login?returnUrl=`. **Never retry.**
    Exception: a 401 from `login/` or `verify/` is a rejected credential, and the
    bootstrap `session/` read is expected to 401 for a signed-out operator.
-2. **403 carrying the CSRF message** — the token is stale (another tab signed in and
-   `verify/` rotated it). Re-bootstrap with `GET /auth/session/` **once**, retry
-   **once**, then hard-fail as a defect. Not an infinite retry.
+2. **403 carrying the CSRF message** — the token is stale or missing. Re-read
+   `GET /auth/session/` **once** and retry **once** — and since D10 ONLY when that read
+   names the owner the command was issued under; any other answer ends the command as
+   not run, and a different owner crosses the session boundary. Then hard-fail as a
+   defect. Not an infinite retry.
 3. **403 carrying the ELEVATION message** — an EXPECTED SECURITY STATE, not an error.
    Open one re-elevation modal, `POST /auth/elevate/`, and **replay the original
    request** on success. The failure mode being designed out is: click Suspend, get a
@@ -1514,6 +1627,12 @@ of "an error happened".
    elevation"**, or the operator loops.
 
 Everything else surfaces.
+
+**Above the four, in order (D10):** an answer for a lifecycle that has ENDED is typed
+and driven nowhere (see "The Command Owner"); then the transport precondition; then
+the server's OWNER REFUSAL, read exactly by `readOwnerRefusal` and only off a request
+that named an owner — an ordinary 409 is an ordinary 409. None of these enters the
+CSRF or elevation recovery.
 
 ### The two match strings, and why they are fragile
 ```
@@ -1599,8 +1718,8 @@ exactly as a sign-in does**. Running out with a lost authenticator means
   "something is wrong". **Do not introduce a toast library.**
 
 ### The recovery-code reload gap, and its queued fix
-`GET /auth/session/` returns **exactly six fields** and `recovery_codes_remaining` is
-NOT among them — only `verify/` and `elevate/` ever state it. So a mid-session page
+`GET /auth/session/` returns **six fields plus, since D10 B1, `command_owner`**, and
+`recovery_codes_remaining` is still NOT among them — only `verify/` and `elevate/` ever state it. So a mid-session page
 reload loses the count, and the service will not re-assert a warning it can no longer
 verify. The gap is **accepted**, not papered over with `sessionStorage`: persisting a
 security-adjacent count in the browser is a new surface for a marginal gain.

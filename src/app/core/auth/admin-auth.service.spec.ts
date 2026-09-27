@@ -1,12 +1,18 @@
 import { TestBed } from '@angular/core/testing';
 import { Router } from '@angular/router';
-import { Observable, of, throwError } from 'rxjs';
+import { Observable, of, Subject, throwError } from 'rxjs';
 
 import { AdminServiceStatus } from '../api/service-status';
 import { NoticeService } from '../notices/notice.service';
 import { MockAdminAuthApi } from '../../dev/mock-admin-auth';
 import { AdminAuthApi, ADMIN_AUTH } from './admin-auth.api';
-import { AdminAuthService, PostVerifyReadError } from './admin-auth.service';
+import {
+  AdminAuthService,
+  PostVerifyCorrelationError,
+  PostVerifyReadError,
+} from './admin-auth.service';
+import { CommandOwner } from './command-owner';
+import { DOCUMENT_REPLACE } from './session-boundary.service';
 import {
   AdminElevateResponse,
   AdminLoginResponse,
@@ -32,6 +38,16 @@ const VERIFIED: AdminVerifyResponse = {
   recovery_codes_remaining: 8,
 };
 
+/** D10: the owner a B1 backend publishes on `verify/` and `session/`. */
+const OWNER: CommandOwner = {
+  version: 1,
+  actor: '0a0a0a0a-0000-4000-8000-0000000000aa',
+  session: '0b0b0b0b-0000-4000-8000-0000000000bb',
+};
+const OTHER_SESSION = '0d0d0d0d-0000-4000-8000-0000000000dd';
+const BOUND: AdminSessionResponse = { ...SESSION, command_owner: OWNER };
+const BOUND_VERIFIED: AdminVerifyResponse = { ...VERIFIED, command_owner: OWNER };
+
 /** Not an `HttpErrorResponse` — deliberately, and see `classifyTransportFailure`. */
 class WireError extends Error {
   constructor(
@@ -48,6 +64,9 @@ class StubApi implements AdminAuthApi {
   /** Queued answers for successive `readSession()` calls; the last one repeats. */
   sessionAnswers: (() => Observable<AdminSessionResponse>)[] = [() => of(SESSION)];
   verifyAnswer: () => Observable<AdminVerifyResponse> = () => of(VERIFIED);
+  /** Every owner a sign-out named, in order. */
+  readonly logouts: CommandOwner[] = [];
+  logoutAnswer: () => Observable<void> = () => of(undefined);
 
   login(): Observable<AdminLoginResponse> {
     return of({ second_factor_required: true, recovery_code_required: false });
@@ -55,8 +74,9 @@ class StubApi implements AdminAuthApi {
   verify(): Observable<AdminVerifyResponse> {
     return this.verifyAnswer();
   }
-  logout(): Observable<void> {
-    return of(undefined);
+  logout(owner: CommandOwner): Observable<void> {
+    this.logouts.push(owner);
+    return this.logoutAnswer();
   }
   readSession(): Observable<AdminSessionResponse> {
     const answer =
@@ -76,9 +96,11 @@ describe('AdminAuthService', () => {
   let status: AdminServiceStatus;
   let notices: NoticeService;
   let router: jasmine.SpyObj<Router>;
+  let replaced: string[];
 
   beforeEach(() => {
     api = new StubApi();
+    replaced = [];
     router = jasmine.createSpyObj<Router>('Router', ['navigate']);
     router.navigate.and.resolveTo(true);
 
@@ -86,6 +108,8 @@ describe('AdminAuthService', () => {
       providers: [
         { provide: ADMIN_AUTH, useValue: api },
         { provide: Router, useValue: router },
+        // A session boundary replaces the document; recorded here, never performed.
+        { provide: DOCUMENT_REPLACE, useValue: (url: string) => replaced.push(url) },
       ],
     });
 
@@ -194,6 +218,7 @@ describe('AdminAuthService', () => {
           providers: [
             { provide: ADMIN_AUTH, useClass: MockAdminAuthApi },
             { provide: Router, useValue: router },
+            { provide: DOCUMENT_REPLACE, useValue: (url: string) => replaced.push(url) },
           ],
         });
         status = TestBed.inject(AdminServiceStatus);
@@ -293,6 +318,227 @@ describe('AdminAuthService', () => {
       // A recovery-code count must not greet the next operator to sign in here.
       expect(notices.notice()).toBeNull();
       expect(router.navigate).toHaveBeenCalledWith(['/login'], { replaceUrl: true });
+    });
+  });
+
+  // ── D10 ────────────────────────────────────────────────────────────────────────
+  describe('D10 — a read answers for the lifecycle it was issued in', () => {
+    it('adopts the owner a session publishes, and binds guarded writes to it', async () => {
+      api.sessionAnswers = [() => of(BOUND)];
+      await service.bootstrap();
+      expect(store.owner()).toEqual(OWNER);
+      expect(store.binding()).toBe('supported');
+    });
+
+    it('a late bootstrap SUCCESS adopts nothing over a session signed in since', async () => {
+      const late = new Subject<AdminSessionResponse>();
+      api.sessionAnswers = [() => late];
+      const running = service.bootstrap();
+
+      store.end();
+      store.adopt({ ...BOUND, username: 'successor', command_owner: { ...OWNER, session: OTHER_SESSION } });
+      late.next(BOUND);
+      late.complete();
+      await running;
+
+      expect(store.username()).toBe('successor');
+      expect(store.owner()?.session).toBe(OTHER_SESSION);
+      expect(replaced).toEqual([]);
+    });
+
+    it('a late bootstrap 401 does not sign out a session signed in since', async () => {
+      const late = new Subject<AdminSessionResponse>();
+      api.sessionAnswers = [() => late];
+      const running = service.bootstrap();
+
+      store.end();
+      store.adopt({ ...BOUND, command_owner: { ...OWNER, session: OTHER_SESSION } });
+      late.error(new WireError(401, { detail: 'gone' }));
+      await running;
+
+      expect(store.isAuthenticated()).toBeTrue();
+      expect(store.owner()?.session).toBe(OTHER_SESSION);
+    });
+
+    it('a late bootstrap SUCCESS does not clear a newer outage report — it drives nothing at all', async () => {
+      const late = new Subject<AdminSessionResponse>();
+      api.sessionAnswers = [() => late];
+      const running = service.bootstrap();
+
+      store.end();
+      status.reportUnavailable('req-newer');
+      late.next(BOUND);
+      late.complete();
+      await running;
+
+      expect(status.unavailable()).toBeTrue();
+      expect(status.requestId()).toBe('req-newer');
+    });
+
+    it('a late bootstrap OUTAGE raises no banner for a session that ended', async () => {
+      const late = new Subject<AdminSessionResponse>();
+      api.sessionAnswers = [() => late];
+      const running = service.bootstrap();
+
+      store.end();
+      late.error(new WireError(502));
+      await running;
+
+      expect(status.unavailable()).toBeFalse();
+    });
+
+    it('only the newest bootstrap settles `bootstrapped`', async () => {
+      const first = new Subject<AdminSessionResponse>();
+      const second = new Subject<AdminSessionResponse>();
+      api.sessionAnswers = [() => first, () => second];
+      const one = service.bootstrap();
+      const two = service.bootstrap();
+
+      first.next(SESSION);
+      first.complete();
+      await one;
+      expect(service.bootstrapped()).withContext('the older run settled; the newer is still reading').toBeFalse();
+
+      second.next(SESSION);
+      second.complete();
+      await two;
+      expect(service.bootstrapped()).toBeTrue();
+    });
+
+    it('a bootstrap read naming a DIFFERENT session crosses the boundary instead of swapping identity', async () => {
+      api.sessionAnswers = [() => of(BOUND), () => of({ ...BOUND, command_owner: { ...OWNER, session: OTHER_SESSION } })];
+      await service.bootstrap();
+      await service.bootstrap();
+
+      expect(replaced).toEqual(['/login?session=renewed']);
+      expect(store.isAuthenticated()).toBeFalse();
+    });
+
+    it('a bootstrap read naming a different ADMINISTRATOR crosses to the "changed" landing', async () => {
+      api.sessionAnswers = [
+        () => of(BOUND),
+        () => of({ ...BOUND, username: 'someone.else', command_owner: { ...OWNER, actor: '0c0c0c0c-0000-4000-8000-0000000000cc' } }),
+      ];
+      await service.bootstrap();
+      await service.bootstrap();
+
+      expect(replaced).toEqual(['/login?session=changed']);
+    });
+  });
+
+  describe('D10 — the post-verify read must be the session verify/ just minted', () => {
+    beforeEach(() => (api.verifyAnswer = () => of(BOUND_VERIFIED)));
+
+    it('adopts it when actor AND session match, and binds writes to that owner', async () => {
+      api.sessionAnswers = [() => of(BOUND)];
+      await service.verify('totp', '123456');
+      expect(store.owner()).toEqual(OWNER);
+      expect(store.binding()).toBe('supported');
+    });
+
+    for (const [label, read] of [
+      ['a different session', { ...BOUND, command_owner: { ...OWNER, session: OTHER_SESSION } }],
+      ['a different administrator', { ...BOUND, username: 'someone.else' }],
+      ['no owner at all', SESSION],
+    ] as const) {
+      it(`refuses a read naming ${label}, adopts nothing, publishes nothing, and never retries`, async () => {
+        api.verifyAnswer = () => of({ ...BOUND_VERIFIED, lockout_cleared: true });
+        api.sessionAnswers = [() => of(read)];
+
+        const error = await service.verify('totp', '123456').catch((raised: unknown) => raised);
+
+        expect(error).toBeInstanceOf(PostVerifyCorrelationError);
+        expect(api.sessionReads).withContext('a mismatch is not a transient read failure').toBe(1);
+        expect(store.isAuthenticated()).toBeFalse();
+        expect(notices.notice()).toBeNull();
+        expect(status.unavailable()).toBeFalse();
+      });
+    }
+
+    it('a verify/ that publishes no owner signs in with writes DISABLED — the capability is unsupported', async () => {
+      api.verifyAnswer = () => of(VERIFIED);
+      api.sessionAnswers = [() => of(BOUND)];
+
+      await service.verify('totp', '123456');
+
+      expect(store.isAuthenticated()).toBeTrue();
+      // Nothing ties that read's owner to this sign-in, so it is not adopted as one.
+      expect(store.owner()).toBeNull();
+      expect(store.binding()).toBe('unsupported');
+    });
+
+    it('ends the lifecycle the document held before — a new session is a new lifecycle', async () => {
+      store.adopt(BOUND);
+      const before = store.lifecycle();
+      const ended: number[] = [];
+      store.ended$.subscribe((n) => ended.push(n));
+      api.sessionAnswers = [() => of({ ...BOUND, command_owner: OWNER })];
+
+      await service.verify('totp', '123456');
+
+      expect(ended).toEqual([before]);
+      expect(store.lifecycle()).toBe(before + 1);
+    });
+  });
+
+  describe('D10 — sign-out', () => {
+    it('ends the lifecycle AT INTENT, before the server answers, and names the session it ends', async () => {
+      const answer = new Subject<void>();
+      api.logoutAnswer = () => answer;
+      store.adopt(BOUND);
+      const before = store.lifecycle();
+
+      const signingOut = service.signOut();
+
+      expect(store.isAuthenticated()).toBeFalse();
+      expect(store.lifecycle()).toBe(before + 1);
+      expect(api.logouts).toEqual([OWNER]);
+      expect(service.remoteSignOut()).toBe('pending');
+      await signingOut;
+      expect(router.navigate).toHaveBeenCalledWith(['/login'], { replaceUrl: true });
+
+      answer.next();
+      answer.complete();
+      expect(service.remoteSignOut()).toBe('ended');
+    });
+
+    it('does not claim the server session ended when the sign-out was refused or unanswered', async () => {
+      api.logoutAnswer = () => throwError(() => new WireError(409, { detail: 'x', code: 'admin_command_session_changed' }));
+      store.adopt(BOUND);
+      await service.signOut();
+      expect(service.remoteSignOut()).toBe('unconfirmed');
+    });
+
+    it('sends NO sign-out when the owner is unknown — never an unnamed one that could end another tab', async () => {
+      store.adopt(SESSION);
+      expect(store.binding()).toBe('unsupported');
+
+      await service.signOut();
+
+      expect(api.logouts).toEqual([]);
+      expect(store.isAuthenticated()).toBeFalse();
+      expect(service.remoteSignOut()).toBe('unconfirmed');
+    });
+
+    it('sends nothing and claims nothing when there was no session to sign out of', async () => {
+      await service.signOut();
+      expect(api.logouts).toEqual([]);
+      expect(service.remoteSignOut()).toBeNull();
+    });
+
+    it('an old sign-out answer says nothing once a new session is held', async () => {
+      const answer = new Subject<void>();
+      api.logoutAnswer = () => answer;
+      store.adopt(BOUND);
+      await service.signOut();
+
+      api.verifyAnswer = () => of(BOUND_VERIFIED);
+      api.sessionAnswers = [() => of(BOUND)];
+      await service.verify('totp', '123456');
+      answer.error(new WireError(502));
+
+      expect(service.remoteSignOut()).toBeNull();
+      expect(store.isAuthenticated()).toBeTrue();
     });
   });
 });

@@ -11,6 +11,8 @@ import {
 } from '../api/transport-failure';
 import { NoticeService } from '../notices/notice.service';
 import { ADMIN_AUTH } from './admin-auth.api';
+import { CommandOwner, compareOwners, OwnerReading, readCommandOwner } from './command-owner';
+import { SessionContinuityService } from './session-continuity.service';
 import {
   AdminLoginResponse,
   AdminVerifyResponse,
@@ -18,6 +20,17 @@ import {
   SecondFactorMethod,
 } from './session.model';
 import { SessionStore } from './session.store';
+
+/**
+ * What became of the remote half of the last sign-out (D10).
+ *
+ *   'pending'      the named `logout/` is on its way.
+ *   'ended'        the server answered it.
+ *   'unconfirmed'  it was not established: the owner was unknown so nothing was sent,
+ *                  or the request was refused or got no usable answer. This tab is
+ *                  signed out either way; the browser may still hold a session.
+ */
+export type RemoteSignOut = 'pending' | 'ended' | 'unconfirmed';
 
 /**
  * The second factor was ACCEPTED and the session cookie is live, but the session could
@@ -39,6 +52,21 @@ export class PostVerifyReadError extends Error {
 }
 
 /**
+ * The factor was accepted, but the session read back is not the one that `verify/`
+ * just minted — its actor or its session differs (D10). Another sign-in happened in
+ * this browser in between. Nothing is adopted and no notice is published: the verified
+ * operator's facts must not greet whoever the cookie now names. It is NEVER retried —
+ * a mismatch is not a transient read failure, and retrying it could only adopt the
+ * other operator.
+ */
+export class PostVerifyCorrelationError extends PostVerifyReadError {
+  constructor() {
+    super('other', null);
+    this.name = 'PostVerifyCorrelationError';
+  }
+}
+
+/**
  * Orchestration above the five-route transport: bootstrap, sign in, sign out.
  *
  * Deliberately NOT the thing behind the `ADMIN_AUTH` token. The token is the
@@ -53,6 +81,7 @@ export class AdminAuthService {
   private readonly status = inject(AdminServiceStatus);
   private readonly notices = inject(NoticeService);
   private readonly router = inject(Router);
+  private readonly continuity = inject(SessionContinuityService);
 
   /**
    * False while a session read is in flight, true once one has settled either way.
@@ -61,6 +90,14 @@ export class AdminAuthService {
    * re-enterable, so this doubles as "a read is happening right now".
    */
   readonly bootstrapped = signal(false);
+
+  /** The remote half of the last sign-out. Null until one happens. See `RemoteSignOut`. */
+  readonly remoteSignOut = signal<RemoteSignOut | null>(null);
+
+  /** Only the newest bootstrap may settle `bootstrapped`. */
+  private bootstrapRun = 0;
+  /** Only the newest sign-out may report its remote half. */
+  private signOutRun = 0;
 
   /**
    * THE BOOTSTRAP READ — `GET /auth/session/` before the shell renders.
@@ -92,27 +129,45 @@ export class AdminAuthService {
    *
    * NEVER REJECTS. `provideAppInitializer` awaits this, so a rejection here is a
    * blank page rather than a diagnosis.
+   *
+   * ── D10: THE READ ANSWERS FOR THE LIFECYCLE IT WAS ISSUED IN ──────────────────
+   *
+   * Its success, its failure and its finaliser are all fenced. A read that lands after
+   * this document's session ended adopts nothing and clears nothing — a late 401 cannot
+   * sign out whoever signed in since — and a read naming a different owner is a SESSION
+   * BOUNDARY, never a silent swap of who this document works for. Every read goes
+   * through the same rule as the resume check (`SessionContinuityService.apply`), which
+   * is what lets the outage banner's "Check again" confirm continuity too.
    */
   async bootstrap(): Promise<void> {
+    const run = ++this.bootstrapRun;
     this.bootstrapped.set(false);
+    const ticket = this.store.issueTicket();
+    const epoch = this.continuity.epoch();
     try {
-      await this.adoptSession();
+      const session = await firstValueFrom(this.api.readSession());
+      if (!this.store.isCurrent(ticket.lifecycle)) return;
+      if (!isAdminSessionResponse(session)) throw new IncoherentResponseError();
+      const observed = this.continuity.apply(ticket, epoch, session);
+      if (observed === 'actor-changed' || observed === 'session-changed') return;
       this.status.markReachable();
 
       // TODO(backend): when `GET /auth/session/` carries `recovery_codes_remaining`,
       // one `this.notices.record(...)` call here closes the reload gap documented on
       // `NoticeService` — a source change, not a redesign.
     } catch (error) {
+      if (!this.store.isCurrent(ticket.lifecycle)) return;
       if (classifyTransportFailure(error) === 'unavailable') {
         this.status.reportUnavailable(extractRequestId(error));
       } else {
         // 401, or anything else the server actually answered: it IS reachable, and
-        // this operator is not signed in.
-        this.store.clear();
+        // this operator is not signed in. Ending a lifecycle needs a session to end —
+        // a signed-out document has none, and nothing issued under it is outstanding.
+        if (this.store.isAuthenticated()) this.store.end();
         this.status.markReachable();
       }
     } finally {
-      this.bootstrapped.set(true);
+      if (run === this.bootstrapRun) this.bootstrapped.set(true);
     }
   }
 
@@ -145,22 +200,37 @@ export class AdminAuthService {
    * immediate — a timer would mean a spinner that hides the fact.
    */
   async verify(method: SecondFactorMethod, code: string): Promise<AdminVerifyResponse> {
+    const before = this.store.lifecycle();
     const result = await firstValueFrom(this.api.verify(method, code));
+    // Something ended this document's state while the factor was being checked. The
+    // new session exists, but this document is no longer the place to adopt it.
+    if (!this.store.isCurrent(before)) throw new PostVerifyCorrelationError();
+
+    // D10: A NEW SESSION IS A NEW LIFECYCLE — whatever this document held before is
+    // replaced, and anything still waiting on it drains as not run.
+    const expected = readCommandOwner(result);
+    this.store.end();
+    const lifecycle = this.store.lifecycle();
 
     try {
-      await this.adoptSession();
-    } catch {
+      await this.adoptVerified(result, expected);
+    } catch (first) {
+      if (first instanceof PostVerifyCorrelationError) throw first;
       try {
-        await this.adoptSession();
+        await this.adoptVerified(result, expected);
       } catch (error) {
+        if (error instanceof PostVerifyCorrelationError) throw error;
         const failure = classifyTransportFailure(error);
         const requestId = extractRequestId(error);
         if (failure === 'unavailable') this.status.reportUnavailable(requestId);
         throw new PostVerifyReadError(failure, requestId);
       }
     }
+    if (!this.store.isCurrent(lifecycle)) throw new PostVerifyCorrelationError();
 
     this.status.markReachable();
+    // A new session: whatever the last sign-out's server half was is no longer news.
+    this.remoteSignOut.set(null);
     this.notices.record({
       lockoutCleared: result.lockout_cleared,
       usedRecoveryCode: result.used_recovery_code,
@@ -170,35 +240,75 @@ export class AdminAuthService {
   }
 
   /**
-   * Sign out. Idempotent server-side, and CLIENT STATE IS CLEARED REGARDLESS of the
-   * response — a failed revoke must not leave the operator looking at a portal they
-   * believe they have left.
+   * Sign out. CLIENT STATE IS CLEARED AT INTENT, before the network — a failed or slow
+   * revoke must not leave the operator looking at a portal they believe they have left.
+   *
+   * D10: THE LIFECYCLE ENDS FIRST. Queued prompts drain as not run and every late
+   * answer for this session drives nothing. The owner is captured before that, so
+   * `logout/` names the session it means to end: a stale tab cannot end whoever has
+   * signed in since (the server answers 409 and revokes nothing).
+   *
+   * WHEN THE OWNER IS UNKNOWN, NO SIGN-OUT REQUEST IS SENT. An unnamed `logout/` ends
+   * whatever session the browser holds, which may be another tab's; downgrading to one
+   * silently would re-open exactly that. This tab is still signed out, and
+   * `remoteSignOut` says the server side was not established rather than implying it.
    *
    * The CSRF cookie is deliberately NOT cleared. It is inert without a session, and
    * `verify/` rotates it on the next sign-in, so clearing it here would only add a
    * second place that touches CSRF state. See CLAUDE.md.
    */
   async signOut(): Promise<void> {
-    try {
-      await firstValueFrom(this.api.logout());
-    } catch {
-      // Deliberately swallowed — see above.
-    }
-    this.store.clear();
+    const owner = this.store.binding() === 'supported' ? this.store.owner() : null;
+    const hadSession = this.store.isAuthenticated();
+    const run = ++this.signOutRun;
+
+    this.store.end();
     // Recovery-code counts and a cleared lockout are facts about ONE session and must
     // not greet the next operator to sign in on this machine.
     this.notices.clear();
+
+    if (owner) {
+      this.remoteSignOut.set('pending');
+      // Fenced: the answer reports on THIS sign-out only, and never once a newer one
+      // started or a successor session was adopted here.
+      const settle = (outcome: RemoteSignOut): void => {
+        if (run === this.signOutRun && !this.store.isAuthenticated()) {
+          this.remoteSignOut.set(outcome);
+        }
+      };
+      this.api.logout(owner).subscribe({
+        next: () => settle('ended'),
+        error: () => settle('unconfirmed'),
+      });
+    } else {
+      this.remoteSignOut.set(hadSession ? 'unconfirmed' : null);
+    }
+
     await this.router.navigate(['/login'], { replaceUrl: true });
   }
 
   /**
-   * Read the session and adopt it, or throw something `classifyTransportFailure` can
-   * classify. Shared by the bootstrap read and the post-verify read so the two cannot
-   * disagree about what counts as a usable answer.
+   * The post-verify read must be about the session `verify/` just minted. A server that
+   * published an owner is held to it exactly — actor AND session. One that published
+   * none (or one this client cannot read) is held to the username, which is all it
+   * states, and the lifecycle is then unsupported whatever the read says: nothing ties
+   * that read's owner to this sign-in.
    */
-  private async adoptSession(): Promise<void> {
+  private async adoptVerified(result: AdminVerifyResponse, expected: OwnerReading): Promise<void> {
+    const ticket = this.store.issueTicket();
     const session = await firstValueFrom(this.api.readSession());
+    if (!this.store.isCurrent(ticket.lifecycle)) throw new PostVerifyCorrelationError();
     if (!isAdminSessionResponse(session)) throw new IncoherentResponseError();
-    this.store.adopt(session);
+    if (session.username !== result.username) throw new PostVerifyCorrelationError();
+
+    let owner: CommandOwner | null = null;
+    if (expected.kind === 'owner') {
+      const reading = readCommandOwner(session);
+      if (reading.kind !== 'owner' || compareOwners(expected.owner, reading.owner) !== 'same') {
+        throw new PostVerifyCorrelationError();
+      }
+      owner = expected.owner;
+    }
+    if (!this.store.adoptVerified(ticket, session, owner)) throw new PostVerifyCorrelationError();
   }
 }

@@ -5,7 +5,11 @@ import { ActivatedRoute, Router } from '@angular/router';
 
 import { extractErrorMessage } from '../core/api/error-message';
 import { classifyTransportFailure, extractRequestId } from '../core/api/transport-failure';
-import { AdminAuthService, PostVerifyReadError } from '../core/auth/admin-auth.service';
+import {
+  AdminAuthService,
+  PostVerifyCorrelationError,
+  PostVerifyReadError,
+} from '../core/auth/admin-auth.service';
 import { sanitiseReturnUrl } from '../core/auth/return-url';
 import { SecondFactorMethod } from '../core/auth/session.model';
 import { AuthShellComponent } from '../shell/auth-shell.component';
@@ -83,6 +87,19 @@ type Step = 'credentials' | 'second-factor';
     <app-auth-shell [eyebrow]="eyebrow()" [heading]="heading()" [lede]="lede()">
       @if (step() === 'credentials') {
         <form class="mt-7" (ngSubmit)="submitCredentials()">
+          <!-- D10: why this tab is here. Fixed sentences keyed on a closed vocabulary —
+               nothing from the URL is ever rendered. Amber, not red: nothing the
+               operator typed was refused. -->
+          @if (sessionNotice(); as note) {
+            <div
+              role="status"
+              class="mb-5 rounded-auth-control border border-admin-warning/25 bg-admin-warning-soft
+                     px-3.5 py-3 text-left"
+              data-session-notice
+            >
+              <p class="text-admin-body text-ink">{{ note }}</p>
+            </div>
+          }
           <div class="group/field">
             <label [class]="labelClasses" for="username">Username</label>
             <div [class]="fieldShell">
@@ -375,6 +392,23 @@ export class LoginPage {
   private readonly route = inject(ActivatedRoute);
 
   /**
+   * D10. Why a document was replaced by a session boundary, read once from a closed
+   * vocabulary (`?session=changed|renewed`). Any other value renders nothing.
+   */
+  private readonly boundary = boundaryCopy(this.route.snapshot.queryParamMap.get('session'));
+
+  /**
+   * The one notice above the sign-in form: the boundary this tab crossed, or — after a
+   * sign-out whose server half was not established — that the browser may still hold
+   * the session. Neither promises that earlier commands did not run: one already on its
+   * way can have an unknown outcome.
+   */
+  protected readonly sessionNotice = computed(() => {
+    if (this.boundary) return this.boundary;
+    return this.auth.remoteSignOut() === 'unconfirmed' ? SIGN_OUT_UNCONFIRMED : null;
+  });
+
+  /**
    * The field shell owns the border, the radius and the focus treatment; the input
    * inside it is transparent and outline-free (`data-focus-ring="self"` opts out of
    * the global `:focus-visible` outline, which would otherwise draw a second ring
@@ -564,6 +598,15 @@ export class LoginPage {
    * old behaviour walked them to step 1 with a message about a code that was fine.
    */
   private async handlePostVerifyReadFailure(error: PostVerifyReadError): Promise<void> {
+    // D10: the session read back is not the one `verify/` just minted — most likely
+    // another sign-in in this browser replaced it in between. Nothing was adopted, and
+    // signing in again is the honest instruction.
+    if (error instanceof PostVerifyCorrelationError) {
+      this.resetToCredentials(
+        'The session read back after this sign-in was not the one it created — another sign-in in this browser may have replaced it — so this sign-in was not completed in this tab. Sign in again.',
+      );
+      return;
+    }
     if (error.failure === 'unavailable') {
       // A live session and an unreachable service: signing in again is not what they
       // need. The unavailable view's retry re-runs the same read, and when the service
@@ -603,4 +646,24 @@ export class LoginPage {
     this.unreachable.set(null);
     this.message.set(text);
   }
+}
+
+/** D10. What the sign-in screen may say after a sign-out it could not confirm remotely. */
+const SIGN_OUT_UNCONFIRMED =
+  'You are signed out in this tab. The admin service did not confirm that the session itself was ended, so this browser may still hold it until it expires.';
+
+/**
+ * D10. The only sentences a `?session=` value can produce. Both describe what is known
+ * — this tab's session is over — and neither claims that earlier work did not run.
+ */
+function boundaryCopy(kind: string | null): string | null {
+  const caveat =
+    'Anything that was already on its way to the server when that happened may or may not have been applied — check before repeating it.';
+  if (kind === 'changed') {
+    return `This browser is now signed in as a different administrator, so this tab's admin session has ended. ${caveat}`;
+  }
+  if (kind === 'renewed') {
+    return `A new admin session was started in this browser, so this tab's earlier session has ended. ${caveat}`;
+  }
+  return null;
 }

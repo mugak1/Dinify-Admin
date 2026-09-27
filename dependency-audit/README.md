@@ -3,9 +3,8 @@
 A required dependency audit (D08 B2.1): what was inspected, what the advisory data says
 about it, and one policy decision — enforced inside the existing `validate` check. The
 same policy runs in Dinify-Frontend (this directory, byte-identical except `policy.json`,
-this README, `tests/workflow.test.mjs` and `lib/retained.mjs`, which Frontend has since
-extended with scanner diagnostics and a `tests/retained.test.mjs` of its own — see below)
-and in Dinify-Backend (`dependency_audit/`, the Python port). `conformance.json` is identical in all three, and each suite pins its
+this README and `tests/workflow.test.mjs`; `lib/retained.mjs` carries the same scanner
+diagnostics in both, see below) and in Dinify-Backend (`dependency_audit/`, the Python port). `conformance.json` is identical in all three, and each suite pins its
 digest.
 
 **A clean application test suite is not a dependency audit, and a scheduled audit that no
@@ -156,11 +155,11 @@ Stated so none of it is inferred:
   exact candidate `validate` certified, and before promotion it runs a FRESH assessment of
   that candidate's RETAINED lock graph (the `package.json` / `package-lock.json` the
   certification bound) and of the pinned scanner's own graph, under the trusted policy at
-  the deploy workflow's own revision. That replay is `lib/retained.mjs` — copied
-  byte-for-byte from Dinify-Frontend at `4ce0183` (`5453f5f2…7ab5`, pinned by a test). It
-  is NOT Frontend's current file: Frontend #709 (merged at `a198090`) extended its copy to
-  keep bounded, sanitized npm debug-log diagnostics beside the assessment, and Admin does
-  not carry that extension, so a timed-out Admin scan still keeps no npm log. It is SCAN-ONLY: a directory holding exactly
+  the deploy workflow's own revision. That replay is `lib/retained.mjs`, the module
+  Dinify-Frontend uses for the same purpose, INCLUDING the scanner diagnostics Frontend #709
+  added: each scan also keeps a bounded, sanitized projection of npm's own debug log beside
+  its raw output (a test pins the file's digest; see `release/README.md` → "Scanner
+  diagnostics"). It is SCAN-ONLY: a directory holding exactly
   the two retained files, no `node_modules`, no candidate script. It does not re-observe
   what was installed at certification (those bytes are gone); that is the certification
   snapshot, checked to be exactly the retained graph. The window is 24 hours from the

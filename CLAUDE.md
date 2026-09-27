@@ -2108,9 +2108,12 @@ a successful CI push to main, or on `workflow_dispatch`.
   pass or fail.
 - **The deploy now re-assesses (B2.4).** It promotes the certified candidate rather than
   rebuilding it, after a FRESH scan-only replay of the candidate's retained lock graph
-  (`dependency-audit/lib/retained.mjs`, copied from Frontend's at `4ce0183` and pinned by
-  digest; Frontend has since extended its copy with scanner diagnostics, which Admin does
-  not carry) under the trusted policy. See "Deployment".
+  (`dependency-audit/lib/retained.mjs`, Frontend's module, pinned by digest) under the
+  trusted policy. See "Deployment". Each scan also keeps a bounded, SANITIZED projection of
+  npm's own debug log beside its raw output, and the evaluate step prints the last observed
+  npm events for a scan that did not finish. It is DIAGNOSTIC ONLY: a timed-out scan stays
+  incomplete, and the cause of a past timeout is not recovered by it. See
+  `release/README.md` → "Scanner diagnostics".
 - **What it does not do:** audit GitHub Actions or the runner image, or change branch
   protection. The mock-isolation scanner's self-test and coverage work landed in B2.3 —
   see "Neither the mock nor the gallery reaches production".

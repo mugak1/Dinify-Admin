@@ -10,16 +10,16 @@
  */
 
 import { strict as assert } from 'node:assert';
-import { cpSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { CLEAN, CLEAN_SCANNER, cannedRunner, fakeInstall, npmReport, via } from '../../dependency-audit/tests/project.mjs';
 import { commitFacts } from '../lib/admission.mjs';
-import { ASSESSMENT_DOC, assess, assessmentDeadline, verifyAssessment } from '../lib/assessment.mjs';
+import { ASSESSMENT_DOC, assess, assessmentDeadline, diagnosticNotes, verifyAssessment } from '../lib/assessment.mjs';
 import { inspectCandidate } from '../lib/certification.mjs';
 import { loadReleasePolicy, recordBytes } from '../lib/common.mjs';
-import { walkTree } from '../lib/tree.mjs';
+import { sha256Hex, walkTree } from '../lib/tree.mjs';
 import { EVAL_RUN_ID, NOW, RUN_ATTEMPT, RUN_ID, apiFacts, candidateFiles, certifiedProject, steppingClock, tempDir } from './fixtures.mjs';
 
 const codes = (problems) => problems.map((p) => p.code);
@@ -68,13 +68,13 @@ function runAssess(p, { answers = {}, trustedRoot = p.root, clock = steppingCloc
   const out = tempDir('assessment-');
   const replay = tempDir('replay-');
   const runner = cannedRunner({ application: answers.application ?? CLEAN, scanner: answers.scanner ?? CLEAN_SCANNER });
-  const { doc, result } = assess({
+  const { doc, result, unfinished } = assess({
     trustedRoot, inspection,
     candidate: { commit: p.commit, runId: RUN_ID, runAttempt: RUN_ATTEMPT, artifactId: '5550001', artifactDigest: `sha256:${'a'.repeat(64)}` },
     assessor: { workflowPath: '.github/workflows/deploy.yml', runId: EVAL_RUN_ID, runAttempt: '1', revision: p.commit },
     outDir: out.dir, replayDir: replay.dir, runner, clock, installScanner: install,
   });
-  return { inspection, doc, result, runner, outDir: out.dir, replayDir: replay.dir, cleanup: () => { out.cleanup(); replay.cleanup(); } };
+  return { inspection, doc, result, unfinished, runner, outDir: out.dir, replayDir: replay.dir, cleanup: () => { out.cleanup(); replay.cleanup(); } };
 }
 
 /** The privileged side's check, against the trusted checkout `trustedRoot`. */
@@ -261,5 +261,150 @@ describe('the privileged re-check reproduces the decision instead of trusting it
   it('REGRESSION: collection times rewritten to move the window forward → the order check refuses', () => withAssessment({}, {}, (p, a) => {
     const files = tamper(a, editDoc((d) => { d.startedAt = '2026-09-26T09:20:00.000Z'; }));
     assert.ok(codes(verify(p, a, { files }).problems).includes('assessment_time_invalid'));
+  }));
+});
+
+// ── the scanner's own record (dependency-audit/lib/retained.mjs, "Scanner diagnostics") ──
+//
+// The runner below writes npm 11's debug-log FORMAT into the `--logs-dir` the assessment
+// passes, resolving it against the scan's cwd as npm does. It is npm's format, not npm: the
+// real pinned scanner writing a real log on termination is recorded in release/README.md.
+
+const BULK = 'https://registry.npmjs.org/-/npm/v1/security/advisories/bulk';
+const TIMED_OUT = { status: null, signal: 'SIGTERM', timedOut: true, stdout: '', stderr: '', durationMs: 300035 };
+const logsArgOf = (args) => { const a = args.find((x) => x.startsWith('--logs-dir=')); return a ? a.slice('--logs-dir='.length) : null; };
+/** An answer that also writes `lines` as npm's debug log, when it is given a log directory. */
+const logging = (answer, lines) => (call) => {
+  const value = logsArgOf(call.args);
+  if (value !== null && lines) {
+    const dir = resolve(call.cwd, value);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, '2026-09-27T12_00_00_000Z-debug-0.log'), lines.map((l, i) => `${i} ${l}\n`).join(''));
+  }
+  return answer;
+};
+const COMPLETE_LOG = ['info using npm@11.19.1', 'silly audit bulk request {', `http fetch POST 200 ${BULK} 147ms`, 'silly audit report {', 'verbose exit 0'];
+const withLogs = { answers: { application: logging(CLEAN, COMPLETE_LOG), scanner: logging(CLEAN_SCANNER, COMPLETE_LOG) } };
+
+describe('the scanner\'s own record: kept beside the raw output, checked on the receiving side', () => {
+  const tamper = (a, edit) => { const files = walkTree(a.outDir).files; edit(files); return files; };
+  const editDoc = (fn) => (files) => { const d = JSON.parse(files.get(ASSESSMENT_DOC)); fn(d); files.set(ASSESSMENT_DOC, recordBytes(d)); };
+
+  it('CONTROL: each graph keeps a sanitized diagnostic, declared by digest, and the privileged re-check admits it', () => withAssessment({}, withLogs, (p, a) => {
+    for (const g of ['application', 'scanner']) {
+      const d = a.doc.graphs[g].diagnostics;
+      assert.equal(d.state, 'retained', g);
+      assert.equal(d.file, `${g}.npm-diagnostics.txt`);
+      const bytes = readFileSync(join(a.outDir, d.file));
+      assert.equal(bytes.length, d.bytes);
+      assert.equal(sha256Hex(bytes), d.sha256);
+      assert.match(bytes.toString('latin1'), /^# dinify\.npm-diagnostic-events\/1: SANITIZED npm events, NOT a complete raw log\n/);
+    }
+    assert.equal(a.doc.outcome, 'within_policy');
+    assert.deepEqual(verify(p, a).problems, []);
+  }));
+
+  it('CONTRACT: the log directory is ABSOLUTE, outside everything scanned or written, and gone afterwards', () => withAssessment({}, withLogs, (p, a) => {
+    const dirs = a.runner.calls.map((c) => logsArgOf(c.args));
+    assert.equal(dirs.length, 2);
+    for (const d of dirs) {
+      assert.ok(d && isAbsolute(d), `absolute: ${d}`);
+      for (const other of [a.replayDir, a.outDir, p.root]) {
+        const r = relative(other, d);
+        assert.ok(r.startsWith('..') || isAbsolute(r), `${d} is inside ${other}`);
+      }
+      assert.equal(existsSync(d), false, 'the per-scan log directory is removed');
+      assert.equal(existsSync(resolve(d, '..')), false, 'the scratch root is removed');
+    }
+    assert.deepEqual(readdirSync(a.replayDir).sort(), ['package-lock.json', 'package.json'], 'the replay holds only the two retained files');
+  }));
+
+  it('CONTROL: an assessment made before diagnostics existed (no key, no file) is still admitted', () => withAssessment({}, withLogs, (p, a) => {
+    const files = tamper(a, (f) => {
+      editDoc((d) => { for (const g of ['application', 'scanner']) delete d.graphs[g].diagnostics; })(f);
+      f.delete('application.npm-diagnostics.txt');
+      f.delete('scanner.npm-diagnostics.txt');
+    });
+    assert.deepEqual(verify(p, a, { files }).problems, []);
+  }));
+
+  it('CONTROL: a scanner that left no log records `unavailable`, and that changes nothing about the verdict', () => withAssessment({}, {}, (p, a) => {
+    assert.deepEqual(a.doc.graphs.application.diagnostics, { state: 'unavailable', reason: 'no_log' });
+    assert.equal(a.doc.outcome, 'within_policy');
+    assert.deepEqual(verify(p, a).problems, []);
+  }));
+
+  it('REGRESSION: a declared diagnostic whose bytes changed → mismatch', () => withAssessment({}, withLogs, (p, a) => {
+    const files = tamper(a, (f) => { const b = Buffer.from(f.get('application.npm-diagnostics.txt')); b[b.length - 2] = 0x41; f.set('application.npm-diagnostics.txt', b); });
+    assert.ok(codes(verify(p, a, { files }).problems).includes('assessment_diagnostics_mismatch'));
+  }));
+
+  it('REGRESSION: a declared diagnostic that is missing → missing', () => withAssessment({}, withLogs, (p, a) => {
+    const files = tamper(a, (f) => f.delete('scanner.npm-diagnostics.txt'));
+    assert.ok(codes(verify(p, a, { files }).problems).includes('assessment_diagnostics_missing'));
+  }));
+
+  it('REGRESSION: raw log content with a descriptor rewritten to match → unsafe (printable is not sanitized)', () => withAssessment({}, withLogs, (p, a) => {
+    const raw = Buffer.from('# dinify.npm-diagnostic-events/1: SANITIZED npm events, NOT a complete raw log\n0 verbose argv "audit" "--//registry.npmjs.org/:_authToken=npm_SECRET"\n');
+    const files = tamper(a, (f) => {
+      f.set('application.npm-diagnostics.txt', raw);
+      editDoc((d) => { d.graphs.application.diagnostics.bytes = raw.length; d.graphs.application.diagnostics.sha256 = sha256Hex(raw); })(f);
+    });
+    assert.ok(codes(verify(p, a, { files }).problems).includes('assessment_diagnostics_unsafe'));
+  }));
+
+  it('REGRESSION: a diagnostic nobody declared → refused as an unexpected file', () => withAssessment({}, withLogs, (p, a) => {
+    const files = tamper(a, editDoc((d) => { d.graphs.scanner.diagnostics = { state: 'unavailable', reason: 'no_log' }; }));
+    assert.ok(codes(verify(p, a, { files }).problems).includes('assessment_unexpected_file'));
+  }));
+
+  for (const [label, descriptor] of [
+    ['an unknown state', { state: 'maybe' }],
+    ['an unknown reason', { state: 'unavailable', reason: 'because' }],
+    ['a file name that is not the graph\'s own', { state: 'retained', file: '../escape.txt', sha256: 'a'.repeat(64), bytes: 10, truncated: false }],
+    ['an extra key', { state: 'unavailable', reason: 'no_log', note: 'x' }],
+    ['a size over the ceiling', { state: 'retained', file: 'application.npm-diagnostics.txt', sha256: 'a'.repeat(64), bytes: 2 * 1024 * 1024, truncated: false }],
+  ]) {
+    it(`REGRESSION: a descriptor with ${label} → invalid`, () => withAssessment({}, withLogs, (p, a) => {
+      const files = tamper(a, editDoc((d) => { d.graphs.application.diagnostics = descriptor; }));
+      assert.ok(codes(verify(p, a, { files }).problems).includes('assessment_invalid'));
+    }));
+  }
+
+  it('CONTRACT: a scan killed at the limit stays INCOMPLETE with its diagnostic kept, and is never promotable', () => withAssessment({}, {
+    answers: { application: logging(TIMED_OUT, ['silly audit bulk request {', `http fetch POST 200 ${BULK} 12ms`, 'silly packumentCache corgi:https://registry.npmjs.org/answered cache-miss',
+      'http fetch GET 200 https://registry.npmjs.org/answered 9ms (cache miss)', 'silly packumentCache corgi:https://registry.npmjs.org/stuck cache-miss']) },
+  }, (p, a) => {
+    assert.equal(a.doc.outcome, 'incomplete');
+    assert.equal(a.doc.exitCode, 2);
+    assert.ok(a.doc.reasons.some((r) => r.code === 'scanner_timeout'));
+    assert.equal(a.doc.graphs.application.diagnostics.state, 'retained');
+    assert.deepEqual(a.unfinished, ['application']);
+    const c = codes(verify(p, a).problems);
+    assert.ok(c.includes('assessment_not_passing'));
+    assert.ok(!c.some((x) => x.startsWith('assessment_diagnostics')), 'the kept diagnostic is itself well-formed');
+    const notes = diagnosticNotes({ outDir: a.outDir, doc: a.doc, unfinished: a.unfinished });
+    assert.ok(notes.every((l) => l.startsWith('release: ') && /^[\x20-\x7e]*$/.test(l)), 'every line prefixed and printable');
+    const joined = notes.join('\n');
+    assert.match(joined, /last observed npm events/);
+    assert.match(joined, /not evidence of which request, if any, stalled/);
+    assert.match(joined, /started with no logged completion: .*stuck/);
+    assert.doesNotMatch(joined.split('started with no logged completion')[1], /answered/, 'a completed request is never listed as unfinished');
+  }));
+
+  it('CONTRACT: a timed-out scan with no log says so, and is still incomplete', () => withAssessment({}, { answers: { application: TIMED_OUT } }, (p, a) => {
+    assert.equal(a.doc.outcome, 'incomplete');
+    assert.deepEqual(a.doc.graphs.application.diagnostics, { state: 'unavailable', reason: 'no_log' });
+    assert.deepEqual(diagnosticNotes({ outDir: a.outDir, doc: a.doc, unfinished: a.unfinished }),
+      ['release: application: last observed npm events UNAVAILABLE (no_log); nothing is known about what the scanner was doing']);
+  }));
+
+  it('REGRESSION: credentials, queries and markup in the scanner\'s log do not reach the kept file or the job log', () => withAssessment({}, {
+    answers: { application: logging(TIMED_OUT, ['verbose argv "audit" "--//registry.npmjs.org/:_authToken=npm_SECRET"',
+      'http fetch GET 200 https://bob:hunter2@registry.npmjs.org/pkg?token=qs-secret 5ms (cache miss)', 'silly packumentCache corgi:https://registry.npmjs.org/<script> cache-miss']) },
+  }, (p, a) => {
+    const kept = readFileSync(join(a.outDir, 'application.npm-diagnostics.txt'), 'latin1');
+    const notes = diagnosticNotes({ outDir: a.outDir, doc: a.doc, unfinished: a.unfinished }).join('\n');
+    for (const text of [kept, notes]) for (const secret of ['npm_SECRET', 'hunter2', 'qs-secret', '<script>', 'argv']) assert.ok(!text.includes(secret), secret);
   }));
 });

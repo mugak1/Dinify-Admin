@@ -1,7 +1,13 @@
+import { signal } from '@angular/core';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
-import { ActivatedRoute, convertToParamMap, Router } from '@angular/router';
+import { ActivatedRoute, convertToParamMap, Params, Router } from '@angular/router';
 
-import { AdminAuthService, PostVerifyReadError } from '../core/auth/admin-auth.service';
+import {
+  AdminAuthService,
+  PostVerifyCorrelationError,
+  PostVerifyReadError,
+  RemoteSignOut,
+} from '../core/auth/admin-auth.service';
 import { AdminLoginResponse, AdminVerifyResponse } from '../core/auth/session.model';
 import { LoginPage } from './login.page';
 
@@ -27,6 +33,8 @@ class StubAuth {
   loginAnswer: () => Promise<AdminLoginResponse> = () =>
     Promise.resolve({ second_factor_required: true, recovery_code_required: false });
   verifyAnswer: () => Promise<AdminVerifyResponse> = () => Promise.resolve(VERIFIED);
+  /** D10: the remote half of the last sign-out, as the real service exposes it. */
+  readonly remoteSignOut = signal<RemoteSignOut | null>(null);
 
   login(): Promise<AdminLoginResponse> {
     return this.loginAnswer();
@@ -48,8 +56,11 @@ describe('LoginPage', () => {
   let page: LoginPage;
   let auth: StubAuth;
   let router: jasmine.SpyObj<Router>;
+  /** The query the page is created with. Read once, at construction. */
+  let query: Params;
 
   beforeEach(async () => {
+    query = {};
     auth = new StubAuth();
     router = jasmine.createSpyObj<Router>('Router', ['navigate', 'navigateByUrl']);
     router.navigate.and.resolveTo(true);
@@ -62,7 +73,11 @@ describe('LoginPage', () => {
         { provide: Router, useValue: router },
         {
           provide: ActivatedRoute,
-          useValue: { snapshot: { queryParamMap: convertToParamMap({}) } },
+          useValue: {
+            get snapshot() {
+              return { queryParamMap: convertToParamMap(query) };
+            },
+          },
         },
       ],
     }).compileComponents();
@@ -264,5 +279,66 @@ describe('LoginPage', () => {
     // VERBATIM. The uniform message is a disclosure control, so the styled block that
     // carries it must not have grown a prefix, a severity word or a hint around it.
     expect(refusal?.textContent?.trim()).toBe('Invalid credentials.');
+  });
+
+  // ── D10 ────────────────────────────────────────────────────────────────────────
+  describe('D10 — why this tab is back at sign-in', () => {
+    function recreate(params: Params): void {
+      query = params;
+      fixture = TestBed.createComponent(LoginPage);
+      page = fixture.componentInstance;
+      fixture.detectChanges();
+    }
+    const notice = () => el('[data-session-notice]');
+
+    it('says a different administrator is now signed in, and does not promise earlier work did not run', () => {
+      recreate({ session: 'changed' });
+      const copy = notice()?.textContent ?? '';
+      expect(copy).toContain('now signed in as a different administrator');
+      expect(copy).toContain('may or may not have been applied');
+      expect(copy).not.toContain('was not run');
+      expect(copy).not.toContain('Nothing was changed');
+      // Amber: nothing the operator typed was refused.
+      expect(notice()?.className).toContain('admin-warning');
+    });
+
+    it('says a new session was started — a renewal is a boundary, not a CSRF refresh', () => {
+      recreate({ session: 'renewed' });
+      expect(notice()?.textContent).toContain('A new admin session was started in this browser');
+      expect(notice()?.textContent).toContain('may or may not have been applied');
+    });
+
+    it('renders nothing it was not given as fixed copy — the query text never reaches the page', () => {
+      for (const value of ['<b>changed</b>', 'Changed', 'expired', 'changed renewed', '']) {
+        recreate({ session: value });
+        expect(notice()).withContext(value).toBeNull();
+        if (value) expect(text()).withContext(value).not.toContain(value);
+      }
+    });
+
+    it('says the server half of a sign-out was not established, and only then', () => {
+      for (const state of [null, 'pending', 'ended'] as const) {
+        auth.remoteSignOut.set(state);
+        fixture.detectChanges();
+        expect(notice()).withContext(String(state)).toBeNull();
+      }
+      auth.remoteSignOut.set('unconfirmed');
+      fixture.detectChanges();
+      expect(notice()?.textContent).toContain('You are signed out in this tab');
+      expect(notice()?.textContent).toContain('may still hold it');
+    });
+
+    it('starts over when the session read back is not the one just verified — never adopts, never retries', async () => {
+      await reachSecondFactor();
+      auth.verifyAnswer = () => Promise.reject(new PostVerifyCorrelationError());
+
+      await submitSecondFactor();
+      fixture.detectChanges();
+
+      expect(text()).toContain('was not the one it created');
+      expect(text()).toContain('Password');
+      expect(router.navigate).not.toHaveBeenCalled();
+      expect(router.navigateByUrl).not.toHaveBeenCalled();
+    });
   });
 });

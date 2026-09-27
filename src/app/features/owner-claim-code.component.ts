@@ -1,5 +1,7 @@
-import { ChangeDetectionStrategy, Component, computed, input, signal } from '@angular/core';
+import { ChangeDetectionStrategy, Component, computed, inject, input, signal } from '@angular/core';
 
+import { SessionContinuityService } from '../core/auth/session-continuity.service';
+import { SessionStore } from '../core/auth/session.store';
 import { formatEat } from '../core/formatting/time';
 import { AdminButtonComponent } from '../ui/button.component';
 
@@ -36,6 +38,17 @@ const NOTE = 'mt-2 max-w-prose text-admin-meta text-ink-subtle';
  * The primary action is PROJECTED by the parent (`<ng-content />`): after a creation it
  * is a real navigation to the new restaurant's workspace, after a reissue it is a Done
  * button that clears the code. The panel itself owns only the copy affordance.
+ *
+ * ── AND IT IS SHOWN ONLY WHILE THE SESSION IS CONFIRMED (D10) ─────────────────────
+ *
+ * The code was issued to ONE admin session. While this document cannot vouch that the
+ * browser still holds that session — the tab was hidden or has just come back, a check
+ * could not get an answer, there is no session, or its owner cannot be named — the
+ * plaintext is NOT IN THE DOM and the copy action does nothing. It is not destroyed
+ * here: the parent still holds it, and it comes back only if the parent still has it
+ * once the same owner is confirmed. Whether the code is still valid is the parent's
+ * decision under its existing rules; an indeterminate mutation discards it there for
+ * good, and no confirmation brings it back.
  */
 @Component({
   selector: 'app-owner-claim-code',
@@ -53,40 +66,54 @@ const NOTE = 'mt-2 max-w-prose text-admin-meta text-ink-subtle';
         <p class="mt-1 max-w-prose text-admin-body text-ink-muted">{{ copy }}</p>
       }
 
-      <label class="mt-3 flex flex-col gap-1">
-        <span class="text-admin-label text-ink">Owner claim code</span>
-        <span class="flex flex-wrap items-center gap-2">
-          <!-- A READONLY INPUT rather than prose, so the whole value can be selected
-               with one click and copied by hand when the clipboard API is unavailable.
-               No autocomplete and no spellcheck: a credential must not be offered
-               back by the browser later. -->
-          <input
-            type="text"
-            readonly
-            autocomplete="off"
-            spellcheck="false"
-            [value]="claimToken()"
-            (focus)="selectAll($event)"
-            class="min-w-0 flex-1 rounded bg-surface px-2 py-1.5 text-admin-body text-ink
-                   tabular-figures tracking-wide ring-1 ring-inset ring-line-strong"
-            data-claim-code
-          />
-          <app-admin-button variant="secondary" (pressed)="copy()" data-claim-copy
-            >Copy code</app-admin-button
-          >
-        </span>
-      </label>
-      <p class="mt-1 text-admin-meta text-ink-subtle" role="status" aria-live="polite">
-        @switch (copyState()) {
-          @case ('copied') {
-            Copied to the clipboard.
+      <!-- NOT DIMMED, NOT DISABLED: while the session is unconfirmed the input and its
+           copy control are not rendered at all, so the value is nowhere to be selected,
+           read out or copied. -->
+      @if (continuity.sensitiveHidden()) {
+        <p
+          class="mt-3 max-w-prose text-admin-body text-admin-warning"
+          role="status"
+          data-claim-code-unconfirmed
+        >
+          Confirming that this browser is still signed in to the same admin session before
+          showing the claim code.
+        </p>
+      } @else {
+        <label class="mt-3 flex flex-col gap-1">
+          <span class="text-admin-label text-ink">Owner claim code</span>
+          <span class="flex flex-wrap items-center gap-2">
+            <!-- A READONLY INPUT rather than prose, so the whole value can be selected
+                 with one click and copied by hand when the clipboard API is unavailable.
+                 No autocomplete and no spellcheck: a credential must not be offered
+                 back by the browser later. -->
+            <input
+              type="text"
+              readonly
+              autocomplete="off"
+              spellcheck="false"
+              [value]="claimToken()"
+              (focus)="selectAll($event)"
+              class="min-w-0 flex-1 rounded bg-surface px-2 py-1.5 text-admin-body text-ink
+                     tabular-figures tracking-wide ring-1 ring-inset ring-line-strong"
+              data-claim-code
+            />
+            <app-admin-button variant="secondary" (pressed)="copy()" data-claim-copy
+              >Copy code</app-admin-button
+            >
+          </span>
+        </label>
+        <p class="mt-1 text-admin-meta text-ink-subtle" role="status" aria-live="polite">
+          @switch (copyState()) {
+            @case ('copied') {
+              Copied to the clipboard.
+            }
+            @case ('failed') {
+              The clipboard could not be used. Select the code and copy it by hand.
+            }
+            @default {}
           }
-          @case ('failed') {
-            The clipboard could not be used. Select the code and copy it by hand.
-          }
-          @default {}
-        }
-      </p>
+        </p>
+      }
 
       @if (issuedLine(); as line) {
         <p class="mt-2 text-admin-meta text-ink-subtle" data-claim-code-window>{{ line }}</p>
@@ -130,6 +157,8 @@ export class OwnerClaimCodeComponent {
   readonly expiresAt = input<string | null>(null);
 
   protected readonly note = NOTE;
+  protected readonly continuity = inject(SessionContinuityService);
+  private readonly store = inject(SessionStore);
   protected readonly copyState = signal<'idle' | 'copied' | 'failed'>('idle');
 
   protected readonly issuedLine = computed(() => {
@@ -153,18 +182,32 @@ export class OwnerClaimCodeComponent {
    * when the document is not focused, so both are reported as a failure the operator
    * can act on — the readonly input above is the manual path — rather than as a
    * silent success that leaves them pasting nothing.
+   *
+   * D10: refused while the session is unconfirmed, and a completion that lands after
+   * the code was hidden, replaced or its lifecycle ended publishes nothing — a success
+   * reported under a successor would be about a code nobody can see.
    */
   protected async copy(): Promise<void> {
+    if (this.continuity.sensitiveHidden()) return;
+    const token = this.claimToken();
+    const lifecycle = this.store.lifecycle();
+    const epoch = this.continuity.epoch();
+    const stillShown = (): boolean =>
+      this.claimToken() === token &&
+      this.store.isCurrent(lifecycle) &&
+      this.continuity.epoch() === epoch &&
+      !this.continuity.sensitiveHidden();
+
     const clipboard = typeof navigator === 'undefined' ? undefined : navigator.clipboard;
     if (!clipboard || typeof clipboard.writeText !== 'function') {
       this.copyState.set('failed');
       return;
     }
     try {
-      await clipboard.writeText(this.claimToken());
-      this.copyState.set('copied');
+      await clipboard.writeText(token);
+      if (stillShown()) this.copyState.set('copied');
     } catch {
-      this.copyState.set('failed');
+      if (stillShown()) this.copyState.set('failed');
     }
   }
 }

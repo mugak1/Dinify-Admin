@@ -3,8 +3,14 @@ import { inject, Injectable } from '@angular/core';
 import { map, Observable } from 'rxjs';
 
 import { apiUrl, AUTH_ROUTES } from '../api/api.constants';
-import { SUPPRESS_DEFECT_REPORT } from '../api/http-context';
+import {
+  COMMAND_OWNER,
+  LIFECYCLE,
+  SIGN_OUT_TEARDOWN,
+  SUPPRESS_DEFECT_REPORT,
+} from '../api/http-context';
 import { AdminAuthApi } from './admin-auth.api';
+import { CommandOwner, IssuedUnder } from './command-owner';
 import {
   AdminElevateResponse,
   AdminLoginResponse,
@@ -51,12 +57,18 @@ export class AdminAuthHttp implements AdminAuthApi {
       .pipe(map((response) => response.data));
   }
 
-  logout(): Observable<void> {
+  logout(owner: CommandOwner): Observable<void> {
     // No CSRF token required: the route is AllowAny with `authentication_classes = []`,
-    // so no authenticator runs and nothing enforces the double-submit check. It is
-    // also idempotent and always 200s, including with no session at all.
+    // so no authenticator runs and nothing enforces the double-submit check.
+    //
+    // D10: it names the session it means to end. The error classifier attaches the
+    // header from `COMMAND_OWNER` and lets this ONE request out after its lifecycle
+    // ended (`SIGN_OUT_TEARDOWN`); a stale tab's sign-out is refused (409) rather than
+    // ending whoever signed in since.
     return this.http
-      .post<Envelope<unknown>>(apiUrl(AUTH_ROUTES.logout), {}, { context: ownedByCaller() })
+      .post<Envelope<unknown>>(apiUrl(AUTH_ROUTES.logout), {}, {
+        context: ownedByCaller().set(COMMAND_OWNER, owner).set(SIGN_OUT_TEARDOWN, true),
+      })
       .pipe(map(() => undefined));
   }
 
@@ -68,12 +80,22 @@ export class AdminAuthHttp implements AdminAuthApi {
       .pipe(map((response) => response.data));
   }
 
-  elevate(method: SecondFactorMethod, code: string): Observable<AdminElevateResponse> {
+  elevate(
+    method: SecondFactorMethod,
+    code: string,
+    issued: IssuedUnder,
+  ): Observable<AdminElevateResponse> {
+    // D10: the owner and lifecycle of the PROMPT, not whatever is current when the
+    // operator presses Enter. The classifier refuses to send it for an ended lifecycle.
     return this.http
       .post<Envelope<AdminElevateResponse>>(
         apiUrl(AUTH_ROUTES.elevate),
         { method, code },
-        { context: ownedByCaller() },
+        {
+          context: ownedByCaller()
+            .set(COMMAND_OWNER, issued.owner)
+            .set(LIFECYCLE, issued.lifecycle),
+        },
       )
       .pipe(map((response) => response.data));
   }

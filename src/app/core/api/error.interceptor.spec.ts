@@ -8,10 +8,19 @@ import {
 import { HttpTestingController, provideHttpClientTesting } from '@angular/common/http/testing';
 import { TestBed } from '@angular/core/testing';
 import { Router } from '@angular/router';
-import { Observable, Subject, of } from 'rxjs';
+import { Observable, Subject, of, throwError } from 'rxjs';
 
 import { AdminAuthApi, ADMIN_AUTH } from '../auth/admin-auth.api';
+import {
+  CommandNotRunError,
+  CommandOutcomeUnknownError,
+  CommandResultWithheldError,
+  CommandOwner,
+  COMMAND_OWNER_HEADER,
+  SessionEndedReadError,
+} from '../auth/command-owner';
 import { ElevationCancelledError, ElevationService } from '../auth/elevation.service';
+import { DOCUMENT_REPLACE } from '../auth/session-boundary.service';
 import { SessionStore } from '../auth/session.store';
 import {
   apiUrl,
@@ -22,7 +31,7 @@ import {
   REQUEST_ID_HEADER,
 } from './api.constants';
 import { csrfInterceptor } from './csrf.interceptor';
-import { SUPPRESS_DEFECT_REPORT } from './http-context';
+import { COMMAND_OWNER, SIGN_OUT_TEARDOWN, SUPPRESS_DEFECT_REPORT } from './http-context';
 import { DefectService } from './defect.service';
 import { errorClassifierInterceptor } from './error.interceptor';
 import { AdminServiceStatus } from './service-status';
@@ -34,11 +43,23 @@ const SESSION_BODY = {
   expires_at: '2026-08-19T17:00:00+00:00',
   elevated_at: '2026-08-19T11:58:00+00:00',
   server_time: '2026-08-19T12:00:00+00:00',
+  // D10: the owner the backend publishes beside the six session fields.
+  command_owner: {
+    version: 1,
+    actor: '0a0a0a0a-0000-4000-8000-0000000000aa',
+    session: '0b0b0b0b-0000-4000-8000-0000000000bb',
+  },
 };
+const OWNER = SESSION_BODY.command_owner;
+const OWNER_HEADER = `1;${OWNER.actor};${OWNER.session}`;
 
 /** A stand-in transport whose `readSession` is observable from the spec. */
 class StubAuthApi implements AdminAuthApi {
   sessionReads = 0;
+  /** What the next `readSession` answers. */
+  body: object = SESSION_BODY;
+  /** When set, the NEXT `readSession` answers this instead, once — a spec controls it. */
+  next: Observable<unknown> | null = null;
 
   login(): Observable<never> {
     throw new Error('not used');
@@ -51,7 +72,9 @@ class StubAuthApi implements AdminAuthApi {
   }
   readSession() {
     this.sessionReads += 1;
-    return of(SESSION_BODY);
+    const once = this.next;
+    this.next = null;
+    return (once ?? of(this.body)) as Observable<typeof SESSION_BODY>;
   }
   elevate(): Observable<never> {
     throw new Error('not used');
@@ -89,6 +112,7 @@ describe('errorClassifierInterceptor', () => {
   let store: SessionStore;
   let auth: StubAuthApi;
   let elevation: StubElevation;
+  let replaced: string[];
 
   const PROTECTED = apiUrl('/restaurants/abc/transition/');
 
@@ -97,6 +121,7 @@ describe('errorClassifierInterceptor', () => {
     router.navigate.and.resolveTo(true);
     auth = new StubAuthApi();
     elevation = new StubElevation();
+    replaced = [];
 
     TestBed.configureTestingModule({
       providers: [
@@ -105,6 +130,8 @@ describe('errorClassifierInterceptor', () => {
         { provide: Router, useValue: router },
         { provide: ADMIN_AUTH, useValue: auth },
         { provide: ElevationService, useValue: elevation },
+        // A session boundary replaces the document; recorded here, never performed.
+        { provide: DOCUMENT_REPLACE, useValue: (url: string) => replaced.push(url) },
       ],
     });
 
@@ -113,6 +140,9 @@ describe('errorClassifierInterceptor', () => {
     defects = TestBed.inject(DefectService);
     status = TestBed.inject(AdminServiceStatus);
     store = TestBed.inject(SessionStore);
+    // D10: every admin request below this line is made by a signed-in document whose
+    // session published an owner, which is what the application does after bootstrap.
+    store.adopt(SESSION_BODY);
   });
 
   afterEach(() => backend.verify());
@@ -217,6 +247,7 @@ describe('errorClassifierInterceptor', () => {
 
     it('does not redirect when the BOOTSTRAP session read 401s', () => {
       // Expected for a signed-out operator; the guard routes them.
+      store.end();
       http.get(apiUrl(AUTH_ROUTES.session)).subscribe({ error: () => undefined });
       backend
         .expectOne(apiUrl(AUTH_ROUTES.session))
@@ -655,6 +686,452 @@ describe('errorClassifierInterceptor', () => {
       expect(defects.current()?.kind).toBe('unclassified');
     });
   });
+
+  // ── D10 ────────────────────────────────────────────────────────────────────────
+  describe('D10 — a command names the owner it was issued under, and keeps it', () => {
+    const OTHER_ACTOR = '0c0c0c0c-0000-4000-8000-0000000000cc';
+    const OTHER_SESSION = '0d0d0d0d-0000-4000-8000-0000000000dd';
+    const refuse = (code: string, status: number) => ({
+      body: { detail: 'The command was not run.', code },
+      init: { status, statusText: status === 400 ? 'Bad Request' : 'Conflict' },
+    });
+    const notRun = (error: unknown) => error as CommandNotRunError;
+
+    it('names the owner on a guarded write, and on nothing else', () => {
+      http.post(PROTECTED, {}).subscribe();
+      const write = backend.expectOne(PROTECTED);
+      expect(write.request.headers.get(COMMAND_OWNER_HEADER)).toBe(OWNER_HEADER);
+      write.flush({});
+
+      http.get(PROTECTED).subscribe();
+      const read = backend.expectOne(PROTECTED);
+      expect(read.request.headers.has(COMMAND_OWNER_HEADER)).toBeFalse();
+      read.flush({});
+
+      for (const route of [AUTH_ROUTES.login, AUTH_ROUTES.verify]) {
+        http.post(apiUrl(route), {}).subscribe();
+        const pre = backend.expectOne(apiUrl(route));
+        expect(pre.request.headers.has(COMMAND_OWNER_HEADER)).withContext(route).toBeFalse();
+        pre.flush({});
+      }
+    });
+
+    it('keeps login/ and verify/ open to a document with no session and no owner', () => {
+      store.end();
+      for (const route of [AUTH_ROUTES.login, AUTH_ROUTES.verify]) {
+        let answered = false;
+        http.post(apiUrl(route), {}).subscribe(() => (answered = true));
+        backend.expectOne(apiUrl(route)).flush({});
+        expect(answered).withContext(route).toBeTrue();
+      }
+    });
+
+    it('sends NO guarded write when the session published no owner, and says why', () => {
+      store.end();
+      const legacy: Record<string, unknown> = { ...SESSION_BODY };
+      delete legacy['command_owner'];
+      store.adopt(legacy as typeof SESSION_BODY);
+      expect(store.binding()).toBe('unsupported');
+
+      let error: unknown = null;
+      http.post(PROTECTED, {}).subscribe({ error: (e: unknown) => (error = e) });
+
+      backend.expectNone(PROTECTED);
+      expect(error).toEqual(jasmine.any(CommandNotRunError));
+      expect(notRun(error).reason).toBe('binding-unsupported');
+      expect(notRun(error).sent).toBeFalse();
+      expect(notRun(error).error.detail).toContain('This command was not run.');
+
+      // Reads are not commands; they still work.
+      let read = false;
+      http.get(PROTECTED).subscribe(() => (read = true));
+      backend.expectOne(PROTECTED).flush({});
+      expect(read).toBeTrue();
+    });
+
+    it('sends NO guarded write, and no read but session/, from a document with no session', () => {
+      store.end();
+      let write: unknown = null;
+      let read: unknown = null;
+      http.post(PROTECTED, {}).subscribe({ error: (e: unknown) => (write = e) });
+      http.get(PROTECTED).subscribe({ error: (e: unknown) => (read = e) });
+
+      backend.expectNone(PROTECTED);
+      expect(notRun(write).reason).toBe('no-session');
+      expect(notRun(write).sent).toBeFalse();
+      expect(read).toEqual(jasmine.any(SessionEndedReadError));
+
+      http.get(apiUrl(AUTH_ROUTES.session)).subscribe({ error: () => undefined });
+      backend.expectOne(apiUrl(AUTH_ROUTES.session)).flush({}, { status: 401, statusText: 'Unauthorized' });
+    });
+
+    it('never sends a sign-out without naming the session it ends, and classifies nothing about it', () => {
+      const logout = apiUrl(AUTH_ROUTES.logout);
+      let refused: unknown = null;
+      http.post(logout, null).subscribe({ error: (e: unknown) => (refused = e) });
+      backend.expectNone(logout);
+      expect(notRun(refused).reason).toBe('owner-unknown');
+      expect(notRun(refused).sent).toBeFalse();
+
+      const context = new HttpContext()
+        .set(SIGN_OUT_TEARDOWN, true)
+        .set(COMMAND_OWNER, OWNER as CommandOwner);
+      http.post(logout, null, { context }).subscribe({ error: () => undefined });
+      const sent = backend.expectOne(logout);
+      expect(sent.request.headers.get(COMMAND_OWNER_HEADER)).toBe(OWNER_HEADER);
+      // Its answer goes back to the sign-out and drives nothing else: no navigation, no
+      // ended lifecycle, no boundary, no defect.
+      sent.flush({ detail: 'x', code: 'admin_command_session_changed' }, { status: 409, statusText: 'Conflict' });
+      expect(router.navigate).not.toHaveBeenCalled();
+      expect(replaced).toEqual([]);
+      expect(store.isAuthenticated()).toBeTrue();
+      expect(defects.current()).toBeNull();
+    });
+
+    it('crosses the boundary on a different administrator, and recovers nothing as CSRF or elevation', () => {
+      let error: unknown = null;
+      http.post(PROTECTED, {}).subscribe({ error: (e: unknown) => (error = e) });
+      const r = refuse('admin_command_actor_changed', 409);
+      backend.expectOne(PROTECTED).flush(r.body, r.init);
+
+      expect(notRun(error).reason).toBe('actor-changed');
+      expect(notRun(error).sent).toBeTrue();
+      expect(replaced).toEqual(['/login?session=changed']);
+      expect(store.isAuthenticated()).toBeFalse();
+      expect(auth.sessionReads).toBe(0);
+      expect(elevation.requests).toBe(0);
+      expect(defects.current()).toBeNull();
+      backend.expectNone(PROTECTED);
+    });
+
+    it('treats a NEW SESSION of the same administrator as a boundary too, not as a CSRF renewal', () => {
+      let error: unknown = null;
+      http.post(PROTECTED, {}).subscribe({ error: (e: unknown) => (error = e) });
+      const r = refuse('admin_command_session_changed', 409);
+      backend.expectOne(PROTECTED).flush(r.body, r.init);
+
+      expect(notRun(error).reason).toBe('session-changed');
+      expect(replaced).toEqual(['/login?session=renewed']);
+      expect(auth.sessionReads).toBe(0);
+      backend.expectNone(PROTECTED);
+    });
+
+    it('reads an ordinary 409 as an ordinary 409 — only the exact contract is an owner refusal', () => {
+      const shapes: [object, number][] = [
+        [{ status: 409, message: 'The terms changed.', code: 'stale_subscription_terms' }, 409],
+        // The right code with a key the contract does not have.
+        [{ detail: 'x', code: 'admin_command_actor_changed', extra: true }, 409],
+        // The right code on a status the contract never sends it with.
+        [{ detail: 'x', code: 'admin_command_actor_changed' }, 400],
+        [{ detail: 'x', code: 'admin_command_owner_malformed' }, 409],
+      ];
+      for (const [body, statusCode] of shapes) {
+        let error: unknown = null;
+        http.post(PROTECTED, {}).subscribe({ error: (e: unknown) => (error = e) });
+        backend.expectOne(PROTECTED).flush(body, { status: statusCode, statusText: 'x' });
+        expect(error).withContext(JSON.stringify(body)).toBeInstanceOf(HttpErrorResponse);
+      }
+      expect(replaced).toEqual([]);
+      expect(store.isAuthenticated()).toBeTrue();
+    });
+
+    it('does not read an owner refusal off a request that named no owner', () => {
+      let error: unknown = null;
+      http.get(PROTECTED).subscribe({ error: (e: unknown) => (error = e) });
+      const r = refuse('admin_command_actor_changed', 409);
+      backend.expectOne(PROTECTED).flush(r.body, r.init);
+      expect(error).toBeInstanceOf(HttpErrorResponse);
+      expect(replaced).toEqual([]);
+    });
+
+    it('reports a malformed-owner refusal as not run and as a defect, and crosses nothing', () => {
+      let error: unknown = null;
+      http.post(PROTECTED, {}).subscribe({ error: (e: unknown) => (error = e) });
+      const r = refuse('admin_command_owner_malformed', 400);
+      backend.expectOne(PROTECTED).flush(r.body, r.init);
+
+      expect(notRun(error).reason).toBe('owner-malformed');
+      expect(defects.current()?.kind).toBe('unclassified');
+      expect(replaced).toEqual([]);
+      expect(store.isAuthenticated()).toBeTrue();
+    });
+
+    it('retries a CSRF refusal ONCE, across proven continuity, byte for byte', () => {
+      const body = { value: 'pay_after', expected_current: null, reason: 'Switching to table service' };
+      let result: unknown = null;
+      http.post(PROTECTED, body).subscribe((r) => (result = r));
+
+      const first = backend.expectOne(PROTECTED);
+      first.flush({ detail: 'CSRF Failed: CSRF token incorrect.' }, { status: 403, statusText: 'Forbidden' });
+      const retry = backend.expectOne(PROTECTED);
+
+      expect(auth.sessionReads).toBe(1);
+      expect(retry.request.method).toBe(first.request.method);
+      expect(retry.request.urlWithParams).toBe(first.request.urlWithParams);
+      expect(JSON.stringify(retry.request.body)).toBe(JSON.stringify(first.request.body));
+      expect(retry.request.headers.get(COMMAND_OWNER_HEADER)).toBe(OWNER_HEADER);
+      expect(first.request.headers.get(COMMAND_OWNER_HEADER)).toBe(OWNER_HEADER);
+      retry.flush({ ok: true });
+      expect(result).toEqual({ ok: true });
+    });
+
+    for (const [label, change, landing, reason] of [
+      ['another administrator', { username: 'someone.else', command_owner: { ...OWNER, actor: OTHER_ACTOR } }, '/login?session=changed', 'actor-changed'],
+      ['a new session of the same administrator', { command_owner: { ...OWNER, session: OTHER_SESSION } }, '/login?session=renewed', 'session-changed'],
+    ] as const) {
+      it(`does not retry when the CSRF recovery read names ${label}`, () => {
+        auth.body = { ...SESSION_BODY, ...change };
+        let error: unknown = null;
+        http.post(PROTECTED, {}).subscribe({ error: (e: unknown) => (error = e) });
+        backend
+          .expectOne(PROTECTED)
+          .flush({ detail: 'CSRF Failed: CSRF token incorrect.' }, { status: 403, statusText: 'Forbidden' });
+
+        backend.expectNone(PROTECTED);
+        expect(notRun(error).reason).toBe(reason);
+        expect(notRun(error).sent).toBeTrue();
+        expect(replaced).toEqual([landing]);
+        // Nobody else's identity was adopted along the way.
+        expect(store.isAuthenticated()).toBeFalse();
+      });
+    }
+
+    it('does not retry when the CSRF recovery read publishes no owner — a cached capability is not proof', () => {
+      const legacy: Record<string, unknown> = { ...SESSION_BODY };
+      delete legacy['command_owner'];
+      auth.body = legacy;
+      let error: unknown = null;
+      http.post(PROTECTED, {}).subscribe({ error: (e: unknown) => (error = e) });
+      backend
+        .expectOne(PROTECTED)
+        .flush({ detail: 'CSRF Failed: CSRF token incorrect.' }, { status: 403, statusText: 'Forbidden' });
+
+      backend.expectNone(PROTECTED);
+      expect(notRun(error).reason).toBe('binding-unsupported');
+      expect(store.binding()).toBe('unsupported');
+      expect(replaced).toEqual([]);
+    });
+
+    // ── THE CSRF RECOVERY READ ITSELF FAILS OR IS OVERTAKEN (Codex review of #37) ──────
+    // The command was refused by CSRF, before any handler, and has not been retried: it
+    // did not run, whatever happens to the read. The read's own side effects belong to
+    // the read's own classification; the COMMAND is told only what is true of it.
+    const csrfRefuse = () =>
+      backend
+        .expectOne(PROTECTED)
+        .flush({ detail: 'CSRF Failed: CSRF token incorrect.' }, { status: 403, statusText: 'Forbidden' });
+
+    it('reports the command NOT RUN when its CSRF recovery read gets no usable answer — never as that answer', () => {
+      for (const failure of [
+        new HttpErrorResponse({ status: 0, statusText: 'Unknown Error', url: apiUrl(AUTH_ROUTES.session) }),
+        new HttpErrorResponse({ status: 502, statusText: 'Bad Gateway', url: apiUrl(AUTH_ROUTES.session) }),
+        new HttpErrorResponse({ status: 429, statusText: 'Too Many Requests', url: apiUrl(AUTH_ROUTES.session) }),
+      ]) {
+        auth.next = throwError(() => failure);
+        let error: unknown = null;
+        http.post(PROTECTED, {}).subscribe({ error: (e: unknown) => (error = e) });
+        csrfRefuse();
+
+        backend.expectNone(PROTECTED);
+        expect(error).withContext(String(failure.status)).toEqual(jasmine.any(CommandNotRunError));
+        expect(notRun(error).reason).toBe('continuity-unconfirmed');
+        expect(notRun(error).sent).toBeTrue();
+        expect(notRun(error).error.detail).toContain('command was not run.');
+      }
+      expect(store.isAuthenticated()).toBeTrue();
+      expect(replaced).toEqual([]);
+    });
+
+    it('reports the command NOT RUN when its recovery read is not a session — and keeps the outage report', () => {
+      auth.body = { nonsense: true };
+      let error: unknown = null;
+      http.post(PROTECTED, {}).subscribe({ error: (e: unknown) => (error = e) });
+      csrfRefuse();
+
+      backend.expectNone(PROTECTED);
+      expect(notRun(error).reason).toBe('continuity-unconfirmed');
+      expect(notRun(error).sent).toBeTrue();
+      // A 200 that is not a session is no usable answer: the same state the bootstrap
+      // and the resume check report.
+      expect(status.unavailable()).toBeTrue();
+      expect(store.isAuthenticated()).toBeTrue();
+    });
+
+    it('a recovery read OVERTAKEN by a newer one cannot cross a boundary — the command is not run', () => {
+      const late = new Subject<unknown>();
+      auth.next = late;
+      let error: unknown = null;
+      http.post(PROTECTED, {}).subscribe({ error: (e: unknown) => (error = e) });
+      csrfRefuse();
+
+      // A newer read settles first and names the held owner.
+      expect(store.adopt(SESSION_BODY)).toBe('same');
+      // The older recovery read then lands naming another session: an earlier moment.
+      late.next({ ...SESSION_BODY, command_owner: { ...OWNER, session: OTHER_SESSION } });
+      late.complete();
+
+      backend.expectNone(PROTECTED);
+      expect(notRun(error).reason).toBe('continuity-unconfirmed');
+      expect(replaced).toEqual([]);
+      expect(store.owner()?.session).toBe(OWNER.session);
+    });
+
+    it('CONTROL — a recovery read overtaken by a newer one that AGREES still retries once', () => {
+      const late = new Subject<unknown>();
+      auth.next = late;
+      let result: unknown = null;
+      http.post(PROTECTED, {}).subscribe((r) => (result = r));
+      csrfRefuse();
+
+      expect(store.adopt(SESSION_BODY)).toBe('same');
+      late.next(SESSION_BODY);
+      late.complete();
+
+      const retry = backend.expectOne(PROTECTED);
+      expect(retry.request.headers.get(COMMAND_OWNER_HEADER)).toBe(OWNER_HEADER);
+      retry.flush({ ok: true });
+      expect(result).toEqual({ ok: true });
+    });
+
+    it('replays after elevation under the SAME owner — and not at all once the lifecycle ended', () => {
+      http.post(PROTECTED, { n: 1 }).subscribe();
+      backend.expectOne(PROTECTED).flush({ detail: ELEVATION_REQUIRED_DETAIL }, { status: 403, statusText: 'Forbidden' });
+      elevation.succeed();
+      const replay = backend.expectOne(PROTECTED);
+      expect(replay.request.headers.get(COMMAND_OWNER_HEADER)).toBe(OWNER_HEADER);
+      replay.flush({});
+
+      let error: unknown = null;
+      http.post(PROTECTED, { n: 2 }).subscribe({ error: (e: unknown) => (error = e) });
+      backend.expectOne(PROTECTED).flush({ detail: ELEVATION_REQUIRED_DETAIL }, { status: 403, statusText: 'Forbidden' });
+      store.end();
+      elevation.succeed();
+      backend.expectNone(PROTECTED);
+      expect(notRun(error).reason).toBe('session-ended');
+      expect(notRun(error).sent).toBeFalse();
+    });
+
+    it('bounds the two recoveries together: one CSRF retry, one elevation replay, one owner', () => {
+      let result: unknown = null;
+      http.post(PROTECTED, { n: 1 }).subscribe((r) => (result = r));
+      const sent = [backend.expectOne(PROTECTED)];
+      sent[0].flush({ detail: 'CSRF Failed: CSRF cookie not set.' }, { status: 403, statusText: 'Forbidden' });
+      sent.push(backend.expectOne(PROTECTED));
+      sent[1].flush({ detail: ELEVATION_REQUIRED_DETAIL }, { status: 403, statusText: 'Forbidden' });
+      elevation.succeed();
+      sent.push(backend.expectOne(PROTECTED));
+      sent[2].flush({ ok: true });
+
+      expect(result).toEqual({ ok: true });
+      expect(auth.sessionReads).toBe(1);
+      expect(elevation.requests).toBe(1);
+      expect(sent.map((r) => r.request.headers.get(COMMAND_OWNER_HEADER))).toEqual([
+        OWNER_HEADER,
+        OWNER_HEADER,
+        OWNER_HEADER,
+      ]);
+    });
+
+    describe('an answer that lands after its session ended', () => {
+      function issue(): { next: number; error: unknown; completed: boolean } {
+        const outcome = { next: 0, error: null as unknown, completed: false };
+        http.post(PROTECTED, {}).subscribe({
+          next: () => (outcome.next += 1),
+          error: (e: unknown) => (outcome.error = e),
+          complete: () => (outcome.completed = true),
+        });
+        return outcome;
+      }
+
+      it('withholds a STATED success, and delivers none of it', () => {
+        const outcome = issue();
+        const request = backend.expectOne(PROTECTED);
+        store.end();
+        request.flush({ status: 200, data: { changed: true, owner_invitation: { claim_token: 'x' } } });
+
+        expect(outcome.next).toBe(0);
+        expect(outcome.error).toEqual(jasmine.any(CommandResultWithheldError));
+        expect(JSON.stringify(outcome.error)).not.toContain('claim_token');
+      });
+
+      it('reports a 2xx that states nothing as UNKNOWN — a 2xx is not proof of execution', () => {
+        for (const body of [{ ok: true }, { status: 201, data: {} }, { status: 200, data: [] }]) {
+          const outcome = issue();
+          const request = backend.expectOne(PROTECTED);
+          store.end();
+          request.flush(body);
+          expect(outcome.error).withContext(JSON.stringify(body)).toEqual(jasmine.any(CommandOutcomeUnknownError));
+          store.adopt(SESSION_BODY);
+        }
+      });
+
+      it('reports a lost answer as UNKNOWN, and raises no outage for a session that is gone', () => {
+        const outcome = issue();
+        const request = backend.expectOne(PROTECTED);
+        store.end();
+        request.flush('<html>502</html>', { status: 502, statusText: 'Bad Gateway' });
+
+        expect(outcome.error).toEqual(jasmine.any(CommandOutcomeUnknownError));
+        expect((outcome.error as CommandOutcomeUnknownError).incoherent).toBeTrue();
+        expect(status.unavailable()).toBeFalse();
+      });
+
+      it('reports a handler refusal as UNKNOWN — a 4xx is not proof nothing ran', () => {
+        const outcome = issue();
+        const request = backend.expectOne(PROTECTED);
+        store.end();
+        request.flush({ status: 409, message: 'x', code: 'stale_service_configuration' }, { status: 409, statusText: 'Conflict' });
+        expect(outcome.error).toEqual(jasmine.any(CommandOutcomeUnknownError));
+      });
+
+      it('reports a PRE-HANDLER refusal as not run — and signs out, prompts and crosses nothing', () => {
+        const refusals: [object, number][] = [
+          [{ detail: ELEVATION_REQUIRED_DETAIL }, 403],
+          [{ detail: 'CSRF Failed: CSRF token incorrect.' }, 403],
+          [{ detail: 'Invalid or expired admin session.' }, 401],
+          [{ detail: 'x', code: 'admin_command_actor_changed' }, 409],
+        ];
+        for (const [body, statusCode] of refusals) {
+          const outcome = issue();
+          const request = backend.expectOne(PROTECTED);
+          store.end();
+          request.flush(body, { status: statusCode, statusText: 'x' });
+          expect(outcome.error).withContext(JSON.stringify(body)).toEqual(jasmine.any(CommandNotRunError));
+          expect(notRun(outcome.error).reason).toBe('session-ended');
+          expect(notRun(outcome.error).sent).toBeTrue();
+          store.adopt(SESSION_BODY);
+        }
+        expect(elevation.requests).toBe(0);
+        expect(auth.sessionReads).toBe(0);
+        expect(router.navigate).not.toHaveBeenCalled();
+        expect(replaced).toEqual([]);
+        expect(defects.current()).toBeNull();
+      });
+
+      it('reaches nobody at all once a successor session is held — an old 401 cannot sign it out', () => {
+        const outcome = issue();
+        const request = backend.expectOne(PROTECTED);
+        store.end();
+        store.adopt({ ...SESSION_BODY, command_owner: { ...OWNER, session: OTHER_SESSION } });
+        request.flush({ detail: 'gone' }, { status: 401, statusText: 'Unauthorized' });
+
+        expect(outcome).toEqual({ next: 0, error: null, completed: true });
+        expect(store.isAuthenticated()).toBeTrue();
+        expect(store.owner()?.session).toBe(OTHER_SESSION);
+        expect(router.navigate).not.toHaveBeenCalled();
+      });
+
+      it('adopts no read that was issued before the session ended', () => {
+        let error: unknown = null;
+        http.get(apiUrl(AUTH_ROUTES.session)).subscribe({ error: (e: unknown) => (error = e) });
+        const request = backend.expectOne(apiUrl(AUTH_ROUTES.session));
+        store.end();
+        request.flush({ status: 200, data: SESSION_BODY });
+        expect(error).toEqual(jasmine.any(SessionEndedReadError));
+        expect(store.isAuthenticated()).toBeFalse();
+      });
+    });
+  });
 });
 
 /**
@@ -686,10 +1163,12 @@ describe('csrfInterceptor ordering', () => {
           useValue: jasmine.createSpyObj<Router>('Router', ['navigate'], { url: '/' }),
         },
         { provide: ADMIN_AUTH, useValue: new StubAuthApi() },
+        { provide: DOCUMENT_REPLACE, useValue: () => undefined },
       ],
     });
     http = TestBed.inject(HttpClient);
     backend = TestBed.inject(HttpTestingController);
+    TestBed.inject(SessionStore).adopt(SESSION_BODY);
   });
 
   afterEach(() => backend.verify());

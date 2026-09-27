@@ -1,8 +1,8 @@
 /**
  * The `GET /api/admin/v1/auth/session/` response body, verbatim.
  *
- * Exactly six fields — read from `platform_admin_app/endpoints/auth.py::AdminSessionView`
- * during recon, not from a summary.
+ * Six fields — read from `platform_admin_app/endpoints/auth.py::AdminSessionView`
+ * during recon, not from a summary — plus, since D10 B1, `command_owner`.
  */
 export interface AdminSessionResponse {
   /** Platform-staff username. */
@@ -27,6 +27,12 @@ export interface AdminSessionResponse {
    * clock is wrong; the server's is the only one worth trusting.
    */
   readonly server_time: string;
+  /**
+   * D10: `{version, actor, session}` from a server that binds commands to the session
+   * that issued them; absent from an older one. Typed `unknown` on purpose: it is read
+   * ONLY through `readCommandOwner`, never trusted by shape here.
+   */
+  readonly command_owner?: unknown;
 }
 
 /** `POST /auth/login/` — 200 means the password was accepted; a session does NOT exist yet. */
@@ -49,6 +55,8 @@ export interface AdminVerifyResponse {
   /** True when this sign-in CLEARED an account lockout (the break-glass path). */
   readonly lockout_cleared: boolean;
   readonly recovery_codes_remaining: number;
+  /** D10: the owner of the session this verify just minted. See `AdminSessionResponse`. */
+  readonly command_owner?: unknown;
 }
 
 /** `POST /auth/elevate/` — 200 means the session is now recently-elevated. */

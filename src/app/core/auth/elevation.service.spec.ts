@@ -4,16 +4,35 @@ import { Observable, Subject, of, throwError } from 'rxjs';
 import { AdminServiceStatus } from '../api/service-status';
 import { NoticeService } from '../notices/notice.service';
 import { AdminAuthApi, ADMIN_AUTH } from './admin-auth.api';
+import { CommandNotRunError, CommandOwner, IssuedUnder } from './command-owner';
 import {
   ElevationAbandonedError,
   ElevationCancelledError,
   ElevationService,
 } from './elevation.service';
-import { AdminElevateResponse, SecondFactorMethod } from './session.model';
+import { DOCUMENT_REPLACE } from './session-boundary.service';
+import { AdminElevateResponse, AdminSessionResponse, SecondFactorMethod } from './session.model';
 import { SessionStore } from './session.store';
+
+const OWNER: CommandOwner = {
+  version: 1,
+  actor: '0a0a0a0a-0000-4000-8000-0000000000aa',
+  session: '0b0b0b0b-0000-4000-8000-0000000000bb',
+};
+const BOUND: AdminSessionResponse = {
+  username: 'operator',
+  email: 'o@dinifyapp.com',
+  issued_at: '2026-08-19T09:00:00+00:00',
+  expires_at: '2026-08-19T17:00:00+00:00',
+  elevated_at: null,
+  server_time: '2026-08-19T12:00:00+00:00',
+  command_owner: OWNER,
+};
 
 class StubApi implements AdminAuthApi {
   calls: { method: SecondFactorMethod; code: string }[] = [];
+  /** What each attempt said it was issued under. */
+  issued: IssuedUnder[] = [];
   next: Observable<AdminElevateResponse> | null = null;
 
   login(): Observable<never> {
@@ -28,8 +47,13 @@ class StubApi implements AdminAuthApi {
   readSession(): Observable<never> {
     throw new Error('not used');
   }
-  elevate(method: SecondFactorMethod, code: string): Observable<AdminElevateResponse> {
+  elevate(
+    method: SecondFactorMethod,
+    code: string,
+    issued: IssuedUnder,
+  ): Observable<AdminElevateResponse> {
     this.calls.push({ method, code });
+    this.issued.push(issued);
     return (
       this.next ??
       of({ elevated_at: '2026-08-19T12:00:00+00:00', used_recovery_code: false, recovery_codes_remaining: 8 })
@@ -43,10 +67,18 @@ describe('ElevationService', () => {
   let store: SessionStore;
   let notices: NoticeService;
   let status: AdminServiceStatus;
+  let replaced: string[];
 
   beforeEach(() => {
     api = new StubApi();
-    TestBed.configureTestingModule({ providers: [{ provide: ADMIN_AUTH, useValue: api }] });
+    replaced = [];
+    TestBed.configureTestingModule({
+      providers: [
+        { provide: ADMIN_AUTH, useValue: api },
+        // A session boundary replaces the document; recorded here, never performed.
+        { provide: DOCUMENT_REPLACE, useValue: (url: string) => replaced.push(url) },
+      ],
+    });
     service = TestBed.inject(ElevationService);
     store = TestBed.inject(SessionStore);
     notices = TestBed.inject(NoticeService);
@@ -225,5 +257,123 @@ describe('ElevationService', () => {
     service.request().subscribe({ error: () => undefined });
     expect(service.isOpen()).toBeTrue();
     expect(service.waiting()).toBe(1);
+  });
+
+  // ── D10 ────────────────────────────────────────────────────────────────────────
+  describe('D10 — one attempt, bound to the owner and lifecycle it opened under', () => {
+    beforeEach(() => store.adopt(BOUND));
+
+    it('sends the owner and lifecycle the prompt was opened under', () => {
+      service.request().subscribe({ error: () => undefined });
+      service.submit('123456');
+      expect(api.issued).toEqual([{ owner: OWNER, lifecycle: store.lifecycle() }]);
+    });
+
+    it('Cancel, then a NEW prompt: the OLD success settles nothing, marks nothing, publishes nothing', () => {
+      const old = new Subject<AdminElevateResponse>();
+      api.next = old.asObservable();
+      service.request().subscribe({ error: () => undefined });
+      service.submit('111111');
+      service.cancel();
+
+      let settled = false;
+      api.next = null;
+      service.request().subscribe({ complete: () => (settled = true), error: () => (settled = true) });
+
+      old.next({ elevated_at: '2026-08-19T12:00:00+00:00', used_recovery_code: true, recovery_codes_remaining: 1 });
+      old.complete();
+
+      expect(settled).toBeFalse();
+      expect(service.isOpen()).toBeTrue();
+      expect(service.submitting()).toBeFalse();
+      expect(store.session()?.elevated_at).toBeNull();
+      expect(notices.notice()).toBeNull();
+    });
+
+    it('Cancel, then a NEW prompt: the OLD refusal does not appear in it', () => {
+      const old = new Subject<AdminElevateResponse>();
+      api.next = old.asObservable();
+      service.request().subscribe({ error: () => undefined });
+      service.submit('000000');
+      service.cancel();
+      service.request().subscribe({ error: () => undefined });
+
+      old.error({ status: 403, error: { status: 403, message: 'Invalid or expired verification.' } });
+
+      expect(service.isOpen()).toBeTrue();
+      expect(service.error()).toBeNull();
+    });
+
+    it('drains its waiters as NOT RUN the moment its lifecycle ends — and a late answer revives nothing', () => {
+      const late = new Subject<AdminElevateResponse>();
+      api.next = late.asObservable();
+      const errors: unknown[] = [];
+      let completed = 0;
+      service.request().subscribe({ error: (e) => errors.push(e), complete: () => (completed += 1) });
+      service.request().subscribe({ error: (e) => errors.push(e), complete: () => (completed += 1) });
+      service.submit('123456');
+
+      store.end();
+
+      expect(errors.length).toBe(2);
+      expect(errors.every((e) => e instanceof CommandNotRunError && e.reason === 'session-ended' && e.sent)).toBeTrue();
+      expect(service.isOpen()).toBeFalse();
+
+      store.adopt(BOUND);
+      late.next({ elevated_at: '2026-08-19T12:00:00+00:00', used_recovery_code: true, recovery_codes_remaining: 1 });
+      late.complete();
+      expect(completed).toBe(0);
+      expect(store.session()?.elevated_at).toBeNull();
+      expect(notices.notice()).toBeNull();
+    });
+
+    it('never opens a prompt for a command whose lifecycle already ended', () => {
+      const issued = { owner: OWNER, lifecycle: store.lifecycle() };
+      store.end();
+      let error: unknown = null;
+      service.request('action-required', issued).subscribe({ error: (e) => (error = e) });
+      expect(service.isOpen()).toBeFalse();
+      expect((error as CommandNotRunError).reason).toBe('session-ended');
+    });
+
+    it('a submit after the lifecycle ended sends nothing', () => {
+      service.request().subscribe({ error: () => undefined });
+      store.end();
+      service.submit('123456');
+      expect(api.calls).toEqual([]);
+    });
+
+    it('closes on a not-run refusal rather than asking for the code again', () => {
+      api.next = throwError(() => new CommandNotRunError('binding-unsupported', false));
+      let raised: unknown = null;
+      service.request().subscribe({ error: (e) => (raised = e) });
+      service.submit('123456');
+      expect((raised as CommandNotRunError).reason).toBe('binding-unsupported');
+      expect(service.isOpen()).toBeFalse();
+      expect(service.error()).toBeNull();
+    });
+
+    it('an owner refusal that reached it unclassified (the development mock) crosses the boundary', () => {
+      api.next = throwError(() => ({
+        status: 409,
+        error: { detail: 'x', code: 'admin_command_session_changed' },
+      }));
+      let raised: unknown = null;
+      service.request().subscribe({ error: (e) => (raised = e) });
+      service.submit('123456');
+      expect((raised as CommandNotRunError).reason).toBe('session-changed');
+      expect(replaced).toEqual(['/login?session=renewed']);
+      expect(store.isAuthenticated()).toBeFalse();
+    });
+
+    it('a lost elevate/ answer never claims re-authentication did not happen', () => {
+      api.next = throwError(() => ({ status: 0 }));
+      let raised: unknown = null;
+      service.request().subscribe({ error: (e) => (raised = e) });
+      service.submit('123456');
+      const message = (raised as Error).message;
+      expect(message).toContain('it is not known whether re-authentication completed');
+      expect(message).not.toContain('Nothing was changed');
+    });
   });
 });

@@ -1,5 +1,6 @@
 import { inject, Injectable, signal } from '@angular/core';
-import { Observable, Subject } from 'rxjs';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+import { Observable, Subject, throwError } from 'rxjs';
 
 import { extractErrorMessage } from '../api/error-message';
 import { AdminServiceStatus } from '../api/service-status';
@@ -10,6 +11,8 @@ import {
 } from '../api/transport-failure';
 import { NoticeService } from '../notices/notice.service';
 import { ADMIN_AUTH } from './admin-auth.api';
+import { CommandNotRunError, IssuedUnder, readOwnerRefusal } from './command-owner';
+import { boundaryKindFor, SessionBoundary } from './session-boundary.service';
 import { SecondFactorMethod } from './session.model';
 import { SessionStore } from './session.store';
 
@@ -60,6 +63,18 @@ export class ElevationAbandonedError extends Error {
 export type ElevationReason = 'action-required' | 'deliberate';
 
 /**
+ * ONE ATTEMPT = one prompt (D10), bound when it opens to the owner and the lifecycle it
+ * was opened under, with its own Subject. A response is applied only to the attempt
+ * that sent it: an answer for an attempt that was cancelled, drained by a lifecycle end
+ * or replaced by a newer prompt settles nothing, fails nothing, marks no elevation and
+ * publishes no notice.
+ */
+interface Attempt {
+  readonly subject: Subject<void>;
+  readonly issued: IssuedUnder;
+}
+
+/**
  * Step-up re-authentication — A SINGLETON WITH A QUEUE.
  *
  * Three concurrent requests refused for stale elevation must not open three modals.
@@ -82,9 +97,23 @@ export class ElevationService {
   private readonly store = inject(SessionStore);
   private readonly notices = inject(NoticeService);
   private readonly status = inject(AdminServiceStatus);
+  private readonly boundary = inject(SessionBoundary);
 
   /** The in-flight attempt every queued request is subscribed to, or null. */
-  private attempt: Subject<void> | null = null;
+  private attempt: Attempt | null = null;
+
+  constructor() {
+    // A lifecycle that ends drains ITS attempt at once, before the network call that
+    // ended it. Nothing waiting was executed — each request's only send was refused for
+    // stale elevation, before any handler ran — so "not run" is the truthful outcome,
+    // and no replay can follow: the waiters' Subject has errored.
+    this.store.ended$.pipe(takeUntilDestroyed()).subscribe((ended) => {
+      const attempt = this.attempt;
+      if (attempt && attempt.issued.lifecycle === ended) {
+        this.abandon(attempt, new CommandNotRunError('session-ended', true));
+      }
+    });
+  }
 
   readonly isOpen = signal(false);
   /** Why the prompt is open. Drives one sentence in the dialog. */
@@ -102,10 +131,20 @@ export class ElevationService {
    *
    * Completes when the second factor is accepted; errors with
    * `ElevationCancelledError` when the operator dismisses the modal.
+   *
+   * D10: `issued` is the owner and lifecycle of the command that needs it — or, for a
+   * deliberate re-authentication, of this document now. A request whose lifecycle has
+   * already ended never opens or joins a prompt.
    */
-  request(reason: ElevationReason = 'action-required'): Observable<void> {
+  request(
+    reason: ElevationReason = 'action-required',
+    issued: IssuedUnder = { owner: this.store.owner(), lifecycle: this.store.lifecycle() },
+  ): Observable<void> {
+    if (!this.store.isCurrent(issued.lifecycle)) {
+      return throwError(() => new CommandNotRunError('session-ended', true));
+    }
     if (!this.attempt) {
-      this.attempt = new Subject<void>();
+      this.attempt = { subject: new Subject<void>(), issued };
       this.error.set(null);
       this.submitting.set(false);
       this.method.set('totp');
@@ -120,7 +159,7 @@ export class ElevationService {
       this.reason.set('action-required');
     }
     this.waiting.update((count) => count + 1);
-    return this.attempt.asObservable();
+    return this.attempt.subject.asObservable();
   }
 
   setMethod(method: SecondFactorMethod): void {
@@ -134,13 +173,21 @@ export class ElevationService {
     if (this.submitting()) return;
     const trimmed = code.trim();
     if (!trimmed) return;
+    const attempt = this.attempt;
+    if (!attempt) return;
+    // RECHECKED BEFORE THE SEND. The prompt may have outlived its lifecycle.
+    if (!this.store.isCurrent(attempt.issued.lifecycle)) {
+      this.abandon(attempt, new CommandNotRunError('session-ended', true));
+      return;
+    }
 
     this.submitting.set(true);
     this.error.set(null);
 
-    this.api.elevate(this.method(), trimmed).subscribe({
+    this.api.elevate(this.method(), trimmed, attempt.issued).subscribe({
       next: (response) => {
-        this.store.markElevated(response.elevated_at);
+        if (!this.isCurrent(attempt)) return;
+        this.store.markElevated(response.elevated_at, attempt.issued.lifecycle);
         // `elevate/` reports the recovery-code count exactly as `verify/` does, and it
         // was being dropped here. A re-elevation SPENDS a recovery code just as a
         // sign-in does; dropping it is how an operator reaches zero without ever
@@ -149,10 +196,29 @@ export class ElevationService {
           usedRecoveryCode: response.used_recovery_code,
           recoveryCodesRemaining: response.recovery_codes_remaining,
         });
-        this.settle();
+        this.settle(attempt);
       },
       error: (error: unknown) => {
+        if (!this.isCurrent(attempt)) return;
         this.submitting.set(false);
+
+        // D10: refused before the factor was looked at — an owner refusal the classifier
+        // has already acted on, a binding this client cannot name, or a lifecycle that
+        // ended. Retrying the code cannot help, so the queue fails with that outcome.
+        if (error instanceof CommandNotRunError) {
+          this.abandon(attempt, error);
+          return;
+        }
+        // The same refusal as the development mock renders it — no interceptor runs
+        // there, so nothing else would act on it.
+        // The queue is told the precise reason BEFORE the boundary ends the lifecycle —
+        // crossing first would drain it as a generic "session ended".
+        const refusal = readOwnerRefusal(error);
+        if (refusal !== null) {
+          this.abandon(attempt, new CommandNotRunError(refusal, true));
+          if (refusal !== 'owner-malformed') this.boundary.cross(boundaryKindFor(refusal));
+          return;
+        }
 
         // NOT A REFUSED CODE — no answer, or the session died underneath us. Retrying
         // cannot help, so the queue is drained with a nameable failure rather than
@@ -167,10 +233,14 @@ export class ElevationService {
           // mode this work is reviewed in. Idempotent against the interceptor in live
           // mode: same state, same request id.
           this.status.reportUnavailable(extractRequestId(error));
+          // Not "nothing was re-authenticated": the answer is what is missing, and the
+          // server may have recorded the elevation. What IS known is that nothing
+          // waiting on it has been sent again.
           this.abandon(
+            attempt,
             new ElevationAbandonedError(
               failure,
-              'The admin service did not answer, so nothing was re-authenticated.',
+              'The admin service did not answer, so it is not known whether re-authentication completed. Nothing waiting on it was sent again.',
             ),
           );
           return;
@@ -180,6 +250,7 @@ export class ElevationService {
           // cleared it and routed to /login. A modal left open over the login form
           // would be gating an action that no longer has a session to run in.
           this.abandon(
+            attempt,
             new ElevationAbandonedError(
               failure,
               'The session ended before re-authentication could complete.',
@@ -200,21 +271,28 @@ export class ElevationService {
 
   /** Escape, backdrop, or the Cancel button. Every queued request fails explicitly. */
   cancel(): void {
-    this.abandon(new ElevationCancelledError());
+    const attempt = this.attempt;
+    if (attempt) this.abandon(attempt, new ElevationCancelledError());
   }
 
-  /** Close, and fail every queued request with a reason it can be named by. */
-  private abandon(error: Error): void {
-    const attempt = this.attempt;
+  /** Close THIS attempt, and fail its queue with a reason it can be named by. */
+  private abandon(attempt: Attempt, error: Error): void {
+    if (this.attempt !== attempt) return;
     this.reset();
-    attempt?.error(error);
+    attempt.subject.error(error);
   }
 
-  private settle(): void {
-    const attempt = this.attempt;
+  /** Settle THIS attempt; its waiters replay, each re-checked before it is sent. */
+  private settle(attempt: Attempt): void {
+    if (this.attempt !== attempt) return;
     this.reset();
-    attempt?.next();
-    attempt?.complete();
+    attempt.subject.next();
+    attempt.subject.complete();
+  }
+
+  /** Still the open prompt, in the lifecycle it was opened under. */
+  private isCurrent(attempt: Attempt): boolean {
+    return this.attempt === attempt && this.store.isCurrent(attempt.issued.lifecycle);
   }
 
   private reset(): void {

@@ -140,6 +140,8 @@ const newSessionId = () => `00000000-0000-4000-8000-${String(++sessionCounter).p
 class Plane {
   /** false models a server that predates B1: it publishes no owner and checks none. */
   binding = true;
+  /** true: `session/` publishes an owner this client cannot read (it still enforces). */
+  malformedReadOwner = false;
   readonly sessions = new Map<string, ServerSession>();
   readonly executed: Executed[] = [];
   readonly factors: string[] = [];
@@ -278,7 +280,13 @@ class Plane {
             expires_at: '2026-09-27T20:00:00+00:00',
             elevated_at: live.elevated ? '2026-09-27T09:59:00+00:00' : null,
             server_time: '2026-09-27T10:00:00+00:00',
-            ...(this.binding ? { command_owner: { version: 1, actor: live.principal.id, session: live.id } } : {}),
+            ...(this.binding
+              ? {
+                  command_owner: this.malformedReadOwner
+                    ? { version: 1, actor: 'not-a-uuid', session: live.id }
+                    : { version: 1, actor: live.principal.id, session: live.id },
+                }
+              : {}),
           },
         }),
         csrfEcho: cookieCsrf ?? `csrf-${live.id.slice(-4)}-ensured`,
@@ -732,6 +740,99 @@ describe('D10 command lifecycle — real client over a MODELLED plane', () => {
     }));
   });
 
+  // ── THE POST-VERIFY RECOVERY BELONGS TO ITS LIFECYCLE (review of #37) ──────────────
+  describe('the post-verify read and its one retry', () => {
+    function verifyWithDeferredRead(): { read: TestRequest; failure: () => unknown; reads: number } {
+      void auth.login('alice.synthetic', 'synthetic-password');
+      drain();
+      let failure: unknown = null;
+      void auth.verify('totp', '111111').catch((e: unknown) => (failure = e));
+      const reads = plane.sessionReads;
+      const [read] = drain(once(isRoute(AUTH_ROUTES.session), 'defer'));
+      return { read, failure: () => failure, reads };
+    }
+
+    it('a late failure after sign-out sends NO second read, adopts nothing, and routes nowhere', fakeAsync(() => {
+      const { read, failure, reads } = verifyWithDeferredRead();
+      void auth.signOut();
+      drain();
+      expect(router.url).toBe('/login');
+      expect(auth.remoteSignOut()).withContext('no session was held to name').toBeNull();
+
+      read.error(new ProgressEvent('error'), { status: 0, statusText: 'Unknown Error' });
+      drain();
+
+      expect(plane.sessionReads - reads).withContext('no read under the lifecycle sign-out began').toBe(0);
+      expect(http.match((q) => q.url === apiUrl(AUTH_ROUTES.session)).length).toBe(0);
+      expect(store.isAuthenticated()).toBeFalse();
+      expect(failure()).toEqual(jasmine.any(PostVerifyCorrelationError));
+      expect(status.unavailable()).toBeFalse();
+      expect(notices.notice()).toBeNull();
+      expect(router.url).toBe('/login');
+      expect(replaced).toEqual([]);
+    }));
+
+    it('invalidation during the SECOND read: its late failure starts nothing and reports nothing', fakeAsync(() => {
+      void auth.login('alice.synthetic', 'synthetic-password');
+      drain();
+      let failure: unknown = null;
+      void auth.verify('totp', '111111').catch((e: unknown) => (failure = e));
+      // The first read answers something that is not a session: transient, so retried.
+      const [first] = drain(once(isRoute(AUTH_ROUTES.session), 'defer'));
+      first.flush({ status: 200, data: { nonsense: true } }, { status: 200, statusText: 'OK' });
+      const [second] = drain(once(isRoute(AUTH_ROUTES.session), 'defer'));
+      expect(second).withContext('the one retry is out').toBeDefined();
+      const reads = plane.sessionReads;
+      void auth.signOut();
+      drain();
+
+      second.error(new ProgressEvent('error'), { status: 0, statusText: 'Unknown Error' });
+      drain();
+
+      expect(plane.sessionReads - reads).toBe(0);
+      expect(store.isAuthenticated()).toBeFalse();
+      expect(failure).toEqual(jasmine.any(PostVerifyCorrelationError));
+      expect(status.unavailable()).toBeFalse();
+      expect(notices.notice()).toBeNull();
+      expect(router.url).toBe('/login');
+    }));
+
+    it('a late failure after a SUCCESSOR was adopted leaves the successor exactly as it was', fakeAsync(() => {
+      const { read, failure, reads } = verifyWithDeferredRead();
+      // Something else in this document ends the lifecycle and adopts what the cookie
+      // names now — here, the same verified session, by a bootstrap.
+      store.end();
+      void auth.bootstrap();
+      drain();
+      const successor = store.lifecycle();
+      const owner = store.owner();
+      expect(store.username()).toBe('alice.synthetic');
+      const readsAfterBootstrap = plane.sessionReads;
+
+      read.error(new ProgressEvent('error'), { status: 0, statusText: 'Unknown Error' });
+      drain();
+
+      expect(plane.sessionReads).withContext('only the bootstrap read').toBe(readsAfterBootstrap);
+      expect(readsAfterBootstrap - reads).toBe(1);
+      expect(store.lifecycle()).toBe(successor);
+      expect(store.owner()).toEqual(owner);
+      expect(failure()).toEqual(jasmine.any(PostVerifyCorrelationError));
+      expect(status.unavailable()).toBeFalse();
+      expect(notices.notice()).toBeNull();
+    }));
+
+    it('CONTROL — an unchanged lifecycle keeps its one retry after a transient failure, and signs in', fakeAsync(() => {
+      const { read, failure, reads } = verifyWithDeferredRead();
+      read.error(new ProgressEvent('error'), { status: 0, statusText: 'Unknown Error' });
+      drain();
+
+      expect(plane.sessionReads - reads).withContext('the one retry').toBe(1);
+      expect(failure()).toBeNull();
+      expect(store.username()).toBe('alice.synthetic');
+      expect(store.binding()).toBe('supported');
+    }));
+  });
+
   // ── LIFECYCLE: SIGN-OUT, LATE ANSWERS, ELEVATION ATTEMPTS ───────────────────────────
 
   describe('the lifecycle', () => {
@@ -982,6 +1083,82 @@ describe('D10 command lifecycle — real client over a MODELLED plane', () => {
     }));
   });
 
+  // ── A CAPABILITY WITHDRAWN WHILE AN ELEVATION IS IN FLIGHT (review of #37) ─────────
+  // The command was refused for stale elevation and is waiting on the prompt; the
+  // factor is being checked; a NEWER read then stops naming a usable owner. The late
+  // elevation success must not resend anything on the strength of an owner this
+  // lifecycle no longer holds.
+  describe('a capability withdrawn while an elevation is in flight', () => {
+    const withdrawals: readonly (readonly [string, (p: Plane) => void])[] = [
+      ['publishes no owner', (p) => (p.binding = false)],
+      ['publishes an owner this client cannot read', (p) => (p.malformedReadOwner = true)],
+    ];
+    function promptHeldThenWithdrawn(withdraw: (p: Plane) => void, count = 1): { s1: string; outcomes: Outcome[] } {
+      const s1 = bootstrapAs('alice.synthetic', false);
+      const outcomes = Array.from({ length: count }, (_, i) => issueWrite(i % 2 ? 'pay_first' : 'pay_after'));
+      drain();
+      expect(elevation.isOpen()).toBeTrue();
+      expect(elevation.waiting()).toBe(count);
+      elevation.submit('111111');
+      const [heldElevate] = drain(once(isRoute(AUTH_ROUTES.elevate), 'hold'));
+      expect(plane.factors).withContext('the server accepted the factor').toEqual(['alice.synthetic: accepted']);
+      withdraw(plane);
+      void auth.bootstrap();
+      drain();
+      expect(store.binding()).toBe('unsupported');
+      plane.release(heldElevate);
+      drain();
+      return { s1, outcomes };
+    }
+
+    for (const [label, withdraw] of withdrawals) {
+      it(`a newer read that ${label}: the late elevation success resends NOTHING, and the command is not run`, fakeAsync(() => {
+        const { s1, outcomes } = promptHeldThenWithdrawn(withdraw);
+        const [write] = outcomes;
+
+        expect(writes().map((u) => u.owner)).withContext('the refused first send only').toEqual([ownerOf('alice.synthetic', s1)]);
+        expect(plane.executed).toEqual([]);
+        expect(write.next).toBe(0);
+        expect(write.error).toEqual(jasmine.any(CommandNotRunError));
+        expect(notRun(write.error).reason).toBe('binding-unsupported');
+        // Nothing restored the capability, and new commands stay disabled.
+        expect(store.binding()).toBe('unsupported');
+        expect(store.owner()).toBeNull();
+        expect(elevation.isOpen()).toBeFalse();
+        expect(replaced).toEqual([]);
+        const next = issueWrite('pay_first');
+        drain();
+        expect(writes().length).toBe(1);
+        expect(notRun(next.error).reason).toBe('binding-unsupported');
+      }));
+    }
+
+    it('several queued commands each settle as not run — finitely, and none is resent', fakeAsync(() => {
+      const { outcomes } = promptHeldThenWithdrawn((p) => (p.binding = false), 3);
+      expect(writes().length).withContext('three refused first sends, nothing more').toBe(3);
+      expect(plane.executed).toEqual([]);
+      expect(outcomes.map((o) => o.next)).toEqual([0, 0, 0]);
+      expect(outcomes.map((o) => notRun(o.error).reason)).toEqual(Array(3).fill('binding-unsupported'));
+    }));
+
+    it('CONTROL — an unchanged owner: several queued commands each replay once, under the same owner', fakeAsync(() => {
+      const s1 = bootstrapAs('alice.synthetic', false);
+      const outcomes = [issueWrite('pay_after'), issueWrite('pay_first'), issueWrite('pay_after')];
+      drain();
+      elevation.submit('111111');
+      const [heldElevate] = drain(once(isRoute(AUTH_ROUTES.elevate), 'hold'));
+      void auth.bootstrap(); // a newer read that AGREES
+      drain();
+      expect(store.binding()).toBe('supported');
+      plane.release(heldElevate);
+      drain();
+
+      expect(outcomes.map((o) => o.next)).toEqual([1, 1, 1]);
+      expect(plane.executed.length).toBe(3);
+      expect(writes().map((u) => u.owner)).toEqual(Array(6).fill(ownerOf('alice.synthetic', s1)));
+    }));
+  });
+
   // ── OUTCOMES REPORTED TO CONSUMERS ─────────────────────────────────────────────────
 
   describe('a dispatched write whose session ended before its answer', () => {
@@ -1044,6 +1221,22 @@ describe('D10 command lifecycle — real client over a MODELLED plane', () => {
       expect(codeValue()).toBeNull();
       expect(el().innerHTML).not.toContain(TOKEN);
       expect(text()).not.toContain(TOKEN);
+    }
+    /** The route-scoped workspace the rendered tab shares. */
+    const workspace = () => harness.routeDebugElement!.injector.get(RestaurantWorkspaceStore);
+    /**
+     * The three ways a CSRF recovery read can fail to prove continuity (review of #37):
+     * no answer, a 5xx, and a 200 that is not a session. Each is the READ's outcome and
+     * raises the outage state; none of them is the command's.
+     */
+    const RECOVERY_READ_FAILURES: readonly (readonly [string, (read: TestRequest) => void])[] = [
+      ['gets no answer', (read) => read.error(new ProgressEvent('error'), { status: 0, statusText: 'Unknown Error' })],
+      ['answers 502', (read) => read.flush('<html>502</html>', { status: 502, statusText: 'Bad Gateway' })],
+      ['answers a 200 that is not a session', (read) => read.flush({ status: 200, data: { nonsense: true } }, { status: 200, statusText: 'OK' })],
+    ];
+    function staleCsrf(): void {
+      plane.netCsrf = null;
+      plane.jsCsrf = null;
     }
 
     describe('Readiness claim code', () => {
@@ -1198,21 +1391,140 @@ describe('D10 command lifecycle — real client over a MODELLED plane', () => {
         flush();
       }));
 
-      it('a cancel refused by CSRF whose recovery read gets no answer is NOT RUN — no "not known", no indeterminate re-read', fakeAsync(async () => {
-        await withVisibleClaim();
-        const detailReads = plane.detailReads;
-        plane.netCsrf = null;
-        plane.jsCsrf = null;
+      // ── A CSRF REFUSAL WHOSE RECOVERY READ FAILS (review of #37) ──────────────────────
+      // Not run, and the code the operator was holding is KEPT — but not shown: the
+      // refusal is itself a reason to doubt continuity, so the code comes back only once
+      // a read issued after it names the same owner.
+      const reasonBox = () => claimPanel().querySelector<HTMLTextAreaElement>('[data-invitation-reason]');
+      function csrfRefusedCancel(): TestRequest {
+        staleCsrf();
         const [read] = act('Cancel invitation', once(isRoute(AUTH_ROUTES.session), 'defer'));
+        expect(codeValue()).withContext('not presented while the command is unresolved').toBeNull();
+        return read;
+      }
+
+      for (const [label, fail] of RECOVERY_READ_FAILURES) {
+        it(`a cancel refused by CSRF whose recovery read ${label} is NOT RUN: outage kept, draft kept, code held but hidden`, fakeAsync(async () => {
+          await withVisibleClaim();
+          const detailReads = plane.detailReads;
+          const read = csrfRefusedCancel();
+          fail(read);
+          drain();
+          harness.detectChanges();
+
+          expect(text()).toContain('could not confirm that its admin session is still current');
+          expect(text()).not.toContain('it is not known whether');
+          expect(status.unavailable()).withContext("the read's outage report stands").toBeTrue();
+          expect(plane.detailReads).withContext('no indeterminate re-read').toBe(detailReads);
+          expect(writes().length).withContext('the reissue, and this cancel sent once').toBe(2);
+          expect(plane.executed.length).withContext('only the reissue ran').toBe(1);
+          expect(workspace().invitationMutating()).withContext('the slot is released').toBeFalse();
+          expect(reasonBox()?.value).withContext('the draft is kept').toBe(REASON);
+          expect(store.username()).toBe('alice.synthetic');
+          // Held, but out of the DOM and out of reach of the clipboard.
+          tokenNowhere();
+          expect(el().querySelector('[data-claim-copy]')).toBeNull();
+          expect(el().querySelector('[data-claim-code-unconfirmed]')).toBeTruthy();
+          flush();
+        }));
+      }
+
+      it('the SAME token comes back only after a same-owner read confirms the session', fakeAsync(async () => {
+        await withVisibleClaim();
+        const read = csrfRefusedCancel();
         read.error(new ProgressEvent('error'), { status: 0, statusText: 'Unknown Error' });
         drain();
         harness.detectChanges();
+        tokenNowhere();
 
+        resume();
+        plane.answer(sessionRead());
+        drain();
+        harness.detectChanges();
+        expect(continuity.state()).toBe('confirmed');
+        expect(codeValue()).toBe(TOKEN);
+        expect(writes().length).withContext('nothing was re-sent along the way').toBe(2);
+        flush();
+      }));
+
+      it('an OWNER CHANGE after the failed recovery never brings the code back', fakeAsync(async () => {
+        await withVisibleClaim();
+        const read = csrfRefusedCancel();
+        read.error(new ProgressEvent('error'), { status: 0, statusText: 'Unknown Error' });
+        drain();
+        plane.signIn('bob.synthetic');
+        resume();
+        plane.answer(sessionRead());
+        drain();
+        harness.detectChanges();
+        expect(replaced).toEqual(['/login?session=changed']);
+        tokenNowhere();
+        resume();
+        drain();
+        harness.detectChanges();
+        tokenNowhere();
+        flush();
+      }));
+
+      it('a DENIAL after the failed recovery never brings the code back', fakeAsync(async () => {
+        await withVisibleClaim();
+        const read = csrfRefusedCancel();
+        read.error(new ProgressEvent('error'), { status: 0, statusText: 'Unknown Error' });
+        drain();
+        plane.signOutElsewhere();
+        resume();
+        plane.answer(sessionRead());
+        drain();
+        harness.detectChanges();
+        expect(store.isAuthenticated()).toBeFalse();
+        tokenNowhere();
+        flush();
+      }));
+
+      it('an OLDER recovery failure does not re-hide a code a NEWER same-owner read confirmed', fakeAsync(async () => {
+        await withVisibleClaim();
+        const read = csrfRefusedCancel();
+        // The tab regains focus while the recovery read is out; ITS read confirms.
+        resume();
+        plane.answer(sessionRead());
+        drain();
+        expect(continuity.state()).toBe('confirmed');
+
+        read.error(new ProgressEvent('error'), { status: 0, statusText: 'Unknown Error' });
+        drain();
+        harness.detectChanges();
         expect(text()).toContain('could not confirm that its admin session is still current');
-        expect(text()).not.toContain('it is not known whether');
-        expect(plane.detailReads).withContext('no indeterminate re-read').toBe(detailReads);
-        expect(writes().length).withContext('the reissue, and this cancel sent once').toBe(2);
-        expect(plane.executed.length).withContext('only the reissue ran').toBe(1);
+        expect(codeValue()).toBe(TOKEN);
+        flush();
+      }));
+
+      it('CONTROL — a recovered CSRF refusal confirms continuity on the way: the reissued code shows at once', fakeAsync(async () => {
+        bootstrapAs('alice.synthetic', true);
+        await openReadiness();
+        staleCsrf();
+        const reads = plane.sessionReads;
+        act('Reissue claim code');
+        expect(plane.sessionReads - reads).withContext('one recovery read').toBe(1);
+        expect(writes().length).withContext('the refused send and its one retry').toBe(2);
+        expect(continuity.state()).toBe('confirmed');
+        expect(codeValue()).toBe(TOKEN);
+        flush();
+      }));
+
+      it('CONTROL — a retry that goes INDETERMINATE still discards the code for good, whatever a resume confirms', fakeAsync(async () => {
+        await withVisibleClaim();
+        staleCsrf();
+        plane.nextWrite = { status: 502, body: '<html>502</html>' };
+        act('Cancel invitation');
+        expect(text()).toContain('it is not known whether the invitation was cancelled');
+        tokenNowhere();
+
+        resume();
+        drain();
+        harness.detectChanges();
+        expect(continuity.state()).toBe('confirmed');
+        expect(text()).toContain('The invitation on record was not cancelled.');
+        tokenNowhere();
         flush();
       }));
 
@@ -1346,6 +1658,29 @@ describe('D10 command lifecycle — real client over a MODELLED plane', () => {
         expect(writes().length).toBe(1);
         flush();
       }));
+
+      for (const [label, fail] of RECOVERY_READ_FAILURES) {
+        it(`a creation refused by CSRF whose recovery read ${label} is NOT RUN: outage kept, draft kept, never "unknown"`, fakeAsync(async () => {
+          bootstrapAs('alice.synthetic', true);
+          staleCsrf();
+          const [read] = await create(once(isRoute(AUTH_ROUTES.session), 'defer'));
+          fail(read);
+          drain();
+          harness.detectChanges();
+
+          expect(text()).toContain('could not confirm that its admin session is still current');
+          expect(el().querySelector('[data-create-indeterminate]')).toBeNull();
+          expect(status.unavailable()).withContext("the read's outage report stands").toBeTrue();
+          expect(writes().length).withContext('sent once, never retried').toBe(1);
+          expect(plane.executed).toEqual([]);
+          expect(el().querySelector<HTMLInputElement>('[data-create-name]')?.value).toBe('Speke Road Cafe');
+          expect(el().querySelector<HTMLTextAreaElement>('[data-create-reason]')?.value).toBe(REASON);
+          const submit = el().querySelector<HTMLButtonElement>('[data-create-submit] button')!;
+          expect(submit.disabled).withContext('pending is released').toBeFalse();
+          tokenNowhere();
+          flush();
+        }));
+      }
     });
 
     describe('commercial write (Overview)', () => {
@@ -1386,21 +1721,30 @@ describe('D10 command lifecycle — real client over a MODELLED plane', () => {
         flush();
       }));
 
-      it('a save refused by CSRF whose recovery read gets no answer is NOT RUN — never "not known"', fakeAsync(async () => {
-        bootstrapAs('alice.synthetic', true);
-        plane.netCsrf = null;
-        plane.jsCsrf = null;
-        const [read] = await saveTiming(once(isRoute(AUTH_ROUTES.session), 'defer'));
-        read.error(new ProgressEvent('error'), { status: 0, statusText: 'Unknown Error' });
-        drain();
-        harness.detectChanges();
+      for (const [label, fail] of RECOVERY_READ_FAILURES) {
+        it(`a save refused by CSRF whose recovery read ${label} is NOT RUN — outage kept, draft kept, never "not known"`, fakeAsync(async () => {
+          bootstrapAs('alice.synthetic', true);
+          staleCsrf();
+          const [read] = await saveTiming(once(isRoute(AUTH_ROUTES.session), 'defer'));
+          const detailReads = plane.detailReads;
+          fail(read);
+          drain();
+          harness.detectChanges();
 
-        expect(panel().textContent).toContain('could not confirm that its admin session is still current');
-        expect(panel().textContent).not.toContain('it is not known whether');
-        expect(writes().length).toBe(1);
-        expect(plane.executed).toEqual([]);
-        flush();
-      }));
+          expect(panel().textContent).toContain('could not confirm that its admin session is still current');
+          expect(panel().textContent).not.toContain('it is not known whether');
+          expect(status.unavailable()).withContext("the read's outage report stands").toBeTrue();
+          expect(writes().length).toBe(1);
+          expect(plane.executed).toEqual([]);
+          expect(plane.detailReads).withContext('no superseding re-read').toBe(detailReads);
+          expect(workspace().mutating()).withContext('the slot is released').toBeFalse();
+          expect(workspace().detailSuperseded()).toBeFalse();
+          expect(panel().querySelector<HTMLTextAreaElement>('[data-commercial-reason]')?.value)
+            .withContext('the draft is kept')
+            .toBe(REASON);
+          flush();
+        }));
+      }
 
       it('a lost commercial answer after the boundary takes the indeterminate branch and is never resent', fakeAsync(async () => {
         bootstrapAs('alice.synthetic', true);

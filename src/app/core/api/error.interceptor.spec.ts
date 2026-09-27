@@ -1011,6 +1011,37 @@ describe('errorClassifierInterceptor', () => {
       expect(notRun(error).sent).toBeFalse();
     });
 
+    // ── THE OWNER IS RE-CHECKED BEFORE THE REPLAY, NOT ONLY THE LIFECYCLE (review of #37)
+    // A newer read may withdraw the capability without ending the lifecycle. The
+    // elevation below is a stub that succeeds regardless, so this pins the SEND guard
+    // on its own; `ElevationService`'s own check is pinned in its spec.
+    for (const [label, withdrawn] of [
+      ['publishes no owner', (() => {
+        const legacy: Record<string, unknown> = { ...SESSION_BODY };
+        delete legacy['command_owner'];
+        return legacy;
+      })()],
+      ['publishes a malformed owner', { ...SESSION_BODY, command_owner: { ...OWNER, actor: 'not-a-uuid' } }],
+    ] as const) {
+      it(`does not replay after elevation once a newer read ${label} — compared, never replaced`, () => {
+        let error: unknown = null;
+        let result: unknown = null;
+        http.post(PROTECTED, { n: 1 }).subscribe({ next: (r) => (result = r), error: (e: unknown) => (error = e) });
+        const first = backend.expectOne(PROTECTED);
+        expect(first.request.headers.get(COMMAND_OWNER_HEADER)).toBe(OWNER_HEADER);
+        first.flush({ detail: ELEVATION_REQUIRED_DETAIL }, { status: 403, statusText: 'Forbidden' });
+
+        expect(store.adopt(withdrawn as typeof SESSION_BODY)).toBe('unbound');
+        elevation.succeed();
+
+        backend.expectNone(PROTECTED);
+        expect(result).toBeNull();
+        expect(notRun(error).reason).toBe('binding-unsupported');
+        expect(store.binding()).toBe('unsupported');
+        expect(store.owner()).toBeNull();
+      });
+    }
+
     it('bounds the two recoveries together: one CSRF retry, one elevation replay, one owner', () => {
       let result: unknown = null;
       http.post(PROTECTED, { n: 1 }).subscribe((r) => (result = r));

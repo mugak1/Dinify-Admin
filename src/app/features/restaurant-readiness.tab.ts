@@ -3,6 +3,7 @@ import { ChangeDetectionStrategy, Component, computed, DestroyRef, inject, signa
 import { AdminServiceStatus } from '../core/api/service-status';
 import { extractErrorMessage, extractFieldErrors } from '../core/api/error-message';
 import { classifyTransportFailure, extractRequestId } from '../core/api/transport-failure';
+import { CommandNotRunError } from '../core/auth/command-owner';
 import { ElevationAbandonedError, ElevationCancelledError } from '../core/auth/elevation.service';
 import { formatEat } from '../core/formatting/time';
 import {
@@ -155,6 +156,13 @@ const INVITATION_COPY: Record<
     submit: 'Cancel invitation',
   },
 };
+
+/**
+ * A write refused by CSRF whose recovery read could not confirm continuity (D10). Fixed
+ * copy, never the server's: nothing ran, and that is all this tab knows.
+ */
+const CONTINUITY_UNCONFIRMED =
+  'This tab could not confirm that its admin session is still current, so this command was not run and the invitation was not changed. Try again once the admin service is reachable.';
 
 @Component({
   selector: 'app-restaurant-readiness-tab',
@@ -826,6 +834,20 @@ export class RestaurantReadinessTab {
     // ones that prove the invitation was not touched, so they are the only ones that
     // leave the plaintext in place.
     this.settleWrite();
+
+    // NOT RUN, AND THIS TAB COULD NOT CONFIRM ITS SESSION (D10). The write was refused by
+    // CSRF before any handler, and the read that would have proved continuity got no
+    // usable answer (or was overtaken by a newer read) — so it was never retried, and
+    // nothing about the invitation moved. Unlike every branch below, that is KNOWN
+    // rather than indeterminate: nothing is re-read, nothing is resent, and any outage
+    // the read reported is left standing (the shell's recovery owns it). The draft and its reviewed invitation id stay. The
+    // code the operator was holding stays in this tab, too — out of the DOM until a read
+    // issued after the refusal names the same owner (`SessionContinuityService`), and
+    // gone with the tab if it never does.
+    if (error instanceof CommandNotRunError && error.reason === 'continuity-unconfirmed') {
+      this.writeError.set(CONTINUITY_UNCONFIRMED);
+      return;
+    }
 
     // Re-authentication dismissed. NOTHING was sent — the first POST was refused for
     // stale elevation, which mutates nothing, and the replay never went out — so the

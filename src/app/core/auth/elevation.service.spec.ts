@@ -366,6 +366,60 @@ describe('ElevationService', () => {
       expect(store.isAuthenticated()).toBeFalse();
     });
 
+    // ── A NEWER READ WITHDREW THE OWNER WHILE THE FACTOR WAS CHECKED (review of #37) ──
+    const UNBOUND: AdminSessionResponse = (() => {
+      const legacy: Record<string, unknown> = { ...BOUND };
+      delete legacy['command_owner'];
+      return legacy as unknown as AdminSessionResponse;
+    })();
+
+    it('a late SUCCESS after the owner was withdrawn releases nothing as confirmed', () => {
+      const late = new Subject<AdminElevateResponse>();
+      api.next = late.asObservable();
+      const errors: unknown[] = [];
+      let completed = 0;
+      service.request().subscribe({ error: (e) => errors.push(e), complete: () => (completed += 1) });
+      service.request().subscribe({ error: (e) => errors.push(e), complete: () => (completed += 1) });
+      service.submit('123456');
+
+      expect(store.adopt(UNBOUND)).toBe('unbound');
+      late.next({ elevated_at: '2026-08-19T12:00:00+00:00', used_recovery_code: true, recovery_codes_remaining: 1 });
+      late.complete();
+
+      expect(completed).withContext('no waiter is released to replay').toBe(0);
+      expect(errors.length).toBe(2);
+      expect(errors.every((e) => e instanceof CommandNotRunError && e.reason === 'binding-unsupported' && e.sent)).toBeTrue();
+      expect(service.isOpen()).toBeFalse();
+      // It cannot undo the withdrawal, and it is not recorded as this lifecycle's.
+      expect(store.binding()).toBe('unsupported');
+      expect(store.owner()).toBeNull();
+      expect(store.session()?.elevated_at).toBeNull();
+      expect(notices.notice()).toBeNull();
+    });
+
+    it('a submit after the owner was withdrawn sends nothing, and the waiters are not run', () => {
+      let raised: unknown = null;
+      service.request().subscribe({ error: (e) => (raised = e) });
+      expect(store.adopt(UNBOUND)).toBe('unbound');
+      service.submit('123456');
+      expect(api.calls).toEqual([]);
+      expect((raised as CommandNotRunError).reason).toBe('binding-unsupported');
+      expect(service.isOpen()).toBeFalse();
+    });
+
+    it('CONTROL — a newer read that AGREES leaves the attempt to settle as usual', () => {
+      const late = new Subject<AdminElevateResponse>();
+      api.next = late.asObservable();
+      let completed = 0;
+      service.request().subscribe({ complete: () => (completed += 1) });
+      service.submit('123456');
+      expect(store.adopt(BOUND)).toBe('same');
+      late.next({ elevated_at: '2026-08-19T12:00:00+00:00', used_recovery_code: false, recovery_codes_remaining: 8 });
+      late.complete();
+      expect(completed).toBe(1);
+      expect(store.session()?.elevated_at).toBe('2026-08-19T12:00:00+00:00');
+    });
+
     it('a lost elevate/ answer never claims re-authentication did not happen', () => {
       api.next = throwError(() => ({ status: 0 }));
       let raised: unknown = null;

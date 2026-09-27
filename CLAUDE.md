@@ -117,7 +117,12 @@ Steps 3–10 are otherwise not built.
   answers are withheld, not-run or unknown and never re-sent; resume revalidation
   hides sensitive content until the same owner is confirmed. See "The Command Owner".
   **D10 is still PARTIAL**: the operational acceptance (a live-origin check, retiring
-  old bundles) is separate and not claimed here.
+  old bundles) is separate and not claimed here. **The deployed Backend's negative
+  capability/header-traversal probe was NOT established before #37 merged** and remains
+  an owner-controlled operational gap; a static check of the Admin bytes is not that
+  proof. **Backend enforcement stays in place through any Admin rollback**, and a
+  rollback is not a safe no-op on that account: a pre-D10 Admin bundle sends no owner
+  header, and under the headerless compatibility contract it is exposed again.
 - **Readiness (the ENGINE half), Billing, Support and Activity tabs: ❌ still
   placeholders** with written empty states (spec §15 steps 3, 7, 6 and 8). The
   Readiness tab is no longer empty — the owner claim panel sits above the engine's
@@ -617,8 +622,13 @@ a later backend contraction, and old bundles stay exposed until they reload or r
   session boundary. Every request captures it at issuance, and every guarded write
   (unsafe, admin API, not `login/` / `verify/` / `logout/`) also captures the OWNER and
   carries the header. **Retries and replays reuse the ORIGINAL request** — same header,
-  method, URL, body and assertions — and are re-checked against the lifecycle before
-  each send.
+  method, URL, body and assertions — and are re-checked before EACH send against the
+  lifecycle AND the captured owner, which must still be this lifecycle's under a
+  supported binding: compared, never replaced. A newer read can withdraw the owner
+  without ending the lifecycle, so a pending elevation replay is then not sent (not
+  run, `binding-unsupported`), and an elevation success that lands after the withdrawal
+  releases nothing — no elevation or notice recorded, every waiter told it did not run.
+  New commands stay disabled for the rest of that lifecycle.
 - **A guarded write with no owner is NOT SENT** (`CommandNotRunError`, `sent: false`):
   no session, or a server that published no owner. `login/` and `verify/` stay open to a
   document with none. A NEWER read that stops publishing the owner withdraws it for the
@@ -634,14 +644,21 @@ a later backend contraction, and old bundles stay exposed until they reload or r
   `/login?session=changed|renewed`, which renders fixed copy and never the query text.
   **A new session of the SAME administrator is a boundary too, never a CSRF renewal.**
   The post-verify read must match the verified owner on actor AND session, and a
-  mismatch is never retried (`PostVerifyCorrelationError`).
+  mismatch is never retried (`PostVerifyCorrelationError`). **The read and its one retry
+  are ONE operation owned by the lifecycle `verify/` began**: the retry and each read are
+  refused, and no failure is reported or routed on, once that lifecycle is over — a late
+  failure after a sign-out or a successor reads nothing more and adopts nothing. The one
+  retry of a transient failure in an unchanged lifecycle is kept.
 - **Recovery is bounded AND gated on continuity.** A CSRF 403 re-reads `session/` once
   and retries once ONLY when the read names the command's owner. **The command was
   refused before any handler, so a recovery read that fails, is not a session or is
   superseded ends it as not run** (`continuity-unconfirmed`, or `session-ended` once a
   401 has ended the lifecycle) — never as the read's own failure, which would send every
   consumer to its indeterminate branch; the read's own outage or sign-out handling
-  stands. An elevation prompt is
+  stands. **The refusal marks continuity UNCONFIRMED synchronously, before the read is
+  issued** (the epoch is taken after), because a stale CSRF token is itself a reason to
+  doubt the session: a claim code hides at once and returns only on a same-owner read
+  issued after the refusal. An elevation prompt is
   bound to the owner and lifecycle it opened under (`ElevationService` attempts, each
   with its own Subject), drains its waiters as not run when that lifecycle ends, and
   ignores an answer for a cancelled or replaced attempt. The owner refusal itself never
@@ -665,11 +682,16 @@ a later backend contraction, and old bundles stay exposed until they reload or r
   runs no interceptor, so in `npm start` the owner contract is visible on the auth
   routes, resume and the boundary but not on restaurant writes; a consumer's
   indeterminate branch can still raise the outage banner in the brief window between a
-  lifecycle ending and the document leaving; and a command reported not run because its
-  CSRF recovery read got no usable answer reaches each write screen's GENERAL branch,
-  which still marks the service reachable (hiding the outage the read reported) and, on
-  Readiness, discards a displayed claim code. Handling `CommandNotRunError` explicitly
-  there is a consumer change outside this contract, recorded as a separate reservation.
+  lifecycle ending and the document leaving.
+- **`continuity-unconfirmed` has its own branch on all three write screens** (creation,
+  Overview, Readiness), right after the slot is released and before any status-based
+  branch: fixed not-run copy, the draft and its concurrency assertion kept, the read's
+  outage report left standing, and nothing re-read or resent. On Readiness the claim
+  code the operator held is KEPT in the tab but stays out of the DOM and the clipboard
+  until a same-owner read confirms the session; an owner change or a denial never
+  brings it back. A mutation that went genuinely INDETERMINATE still discards the code
+  for good, whatever a later read confirms. Every other not-run reason keeps the general
+  branch.
 
 ### TRANSPORT vs RESPONSE — `core/api/transport-failure.ts`
 **"Did we get a usable response at all" is PRIOR to "what did the server say."**
@@ -1597,8 +1619,10 @@ REMOVED from the DOM (one fixed sentence in their place) and `copy()` does nothi
 clipboard write that completes after the code was hidden, replaced or its lifecycle
 ended publishes neither "copied" nor "failed". **Hiding is not discarding**: the holder
 still has the code, and the same owner's confirmation shows it again — but only if the
-holder still has it. An indeterminate mutation discards it on the Readiness tab exactly
-as above, and no resume read, unchanged invitation id or confirmation brings it back.
+holder still has it. A CSRF refusal hides it the same way, and a write refused by CSRF
+whose recovery read failed keeps it hidden (and held) until that confirmation. An
+indeterminate mutation discards it on the Readiness tab exactly as above, and no resume
+read, unchanged invitation id or confirmation brings it back.
 The same applies to the creation screen's code. A reissue or creation answered after
 its lifecycle ended is withheld (`CommandResultWithheldError`) and its code is never
 rendered. Nothing here widens the code's lifetime or stores it anywhere new; the

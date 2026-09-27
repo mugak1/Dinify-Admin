@@ -481,6 +481,113 @@ describe('AdminAuthService', () => {
     });
   });
 
+  // ── THE RECOVERY BELONGS TO THE LIFECYCLE verify/ BEGAN (review of #37) ───────────
+  // The post-verify read and its one retry are ONE operation, bound to the lifecycle
+  // verify/ started. A retry, a read, an adoption and every effect of a failure are
+  // asked for that lifecycle — never re-derived from whatever lifecycle holds when the
+  // first answer lands. Held answers below are `Subject`s; nothing runs an interceptor
+  // here, which is the development mock's shape.
+  describe('D10 — the post-verify recovery belongs to the lifecycle verify/ began', () => {
+    beforeEach(() => (api.verifyAnswer = () => of({ ...BOUND_VERIFIED, lockout_cleared: true })));
+
+    /** Start a verify whose first post-verify read is held; resolves once it is out. */
+    async function verifyWithHeldRead(): Promise<{ first: Subject<AdminSessionResponse>; outcome: Promise<unknown> }> {
+      const first = new Subject<AdminSessionResponse>();
+      api.sessionAnswers = [() => first, () => of(BOUND)];
+      const outcome = service.verify('totp', '123456').then(
+        () => 'resolved',
+        (raised: unknown) => raised,
+      );
+      await Promise.resolve();
+      expect(api.sessionReads).withContext('the first read is out').toBe(1);
+      return { first, outcome };
+    }
+
+    it('a late FAILURE after sign-out starts no second read and adopts nothing', async () => {
+      const { first, outcome } = await verifyWithHeldRead();
+      await service.signOut();
+      const navigations = router.navigate.calls.count();
+
+      first.error(new WireError(0));
+      const result = await outcome;
+
+      expect(api.sessionReads).withContext('no retry under the lifecycle sign-out began').toBe(1);
+      expect(store.isAuthenticated()).toBeFalse();
+      expect(result).toEqual(jasmine.any(PostVerifyCorrelationError));
+      expect(status.unavailable()).toBeFalse();
+      expect(notices.notice()).toBeNull();
+      expect(router.navigate.calls.count()).toBe(navigations);
+    });
+
+    it('a late failure after the lifecycle was REPLACED touches the successor not at all', async () => {
+      const { first, outcome } = await verifyWithHeldRead();
+      store.end();
+      store.adopt({ ...BOUND, command_owner: { ...OWNER, session: OTHER_SESSION } });
+      const successor = store.lifecycle();
+      notices.record({ usedRecoveryCode: true, recoveryCodesRemaining: 1 });
+      const successorNotice = notices.notice();
+
+      first.error(new WireError(502));
+      const result = await outcome;
+
+      expect(api.sessionReads).toBe(1);
+      expect(result).toEqual(jasmine.any(PostVerifyCorrelationError));
+      expect(store.lifecycle()).toBe(successor);
+      expect(store.owner()?.session).toBe(OTHER_SESSION);
+      expect(status.unavailable()).toBeFalse();
+      expect(notices.notice()).toEqual(successorNotice);
+    });
+
+    it('invalidation DURING THE SECOND READ: no outage, no read failure to route on, nothing adopted', async () => {
+      const second = new Subject<AdminSessionResponse>();
+      api.sessionAnswers = [() => throwError(() => new WireError(0)), () => second, () => of(BOUND)];
+      const outcome = service.verify('totp', '123456').then(
+        () => 'resolved',
+        (raised: unknown) => raised,
+      );
+      for (let turn = 0; turn < 20 && api.sessionReads < 2; turn += 1) await Promise.resolve();
+      expect(api.sessionReads).withContext('the one retry is out').toBe(2);
+
+      await service.signOut();
+      second.error(new WireError(0));
+      const result = await outcome;
+
+      expect(api.sessionReads).toBe(2);
+      // Not a PostVerifyReadError('unavailable'): the login page would route that to the
+      // unavailable view on behalf of a lifecycle that is over.
+      expect(result).toEqual(jasmine.any(PostVerifyCorrelationError));
+      expect(status.unavailable()).toBeFalse();
+      expect(store.isAuthenticated()).toBeFalse();
+      expect(notices.notice()).toBeNull();
+    });
+
+    it('a late SUCCESS after sign-out is not adopted either', async () => {
+      const { first, outcome } = await verifyWithHeldRead();
+      await service.signOut();
+
+      first.next(BOUND);
+      first.complete();
+      const result = await outcome;
+
+      expect(api.sessionReads).toBe(1);
+      expect(result).toEqual(jasmine.any(PostVerifyCorrelationError));
+      expect(store.isAuthenticated()).toBeFalse();
+      expect(notices.notice()).toBeNull();
+    });
+
+    it('CONTROL — an unchanged lifecycle still gets its one retry after a transient failure', async () => {
+      const { first, outcome } = await verifyWithHeldRead();
+
+      first.error(new WireError(0));
+      const result = await outcome;
+
+      expect(result).toBe('resolved');
+      expect(api.sessionReads).toBe(2);
+      expect(store.owner()).toEqual(OWNER);
+      expect(notices.notice()).not.toBeNull();
+    });
+  });
+
   describe('D10 — sign-out', () => {
     it('ends the lifecycle AT INTENT, before the server answers, and names the session it ends', async () => {
       const answer = new Subject<void>();

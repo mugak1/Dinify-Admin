@@ -139,11 +139,13 @@ const EXPECTED_CLIENT_STATUSES = new Set([400, 401, 403, 404, 409, 422, 429]);
  * guarded write — an unsafe admin request other than login/, verify/ and logout/ —
  * also captures the COMMAND OWNER and carries it as `X-Admin-Command-Owner`. Both are
  * fixed there: a retry or a replay re-enters `dispatch`, never this function, and
- * carries the same header, method, URL and body. A guarded write with no owner to name
- * is NOT SENT — an unnamed command is exactly the one the server cannot refuse. A
- * document holding no session sends no admin read other than `session/` either: a
- * screen still asking after its session ended would be reading under whatever cookie
- * the browser holds by then.
+ * carries the same header, method, URL and body. `dispatch` re-checks, before every
+ * send, that the captured owner is still the one this lifecycle holds under a
+ * supported binding — a newer read can withdraw it without ending the lifecycle. A
+ * guarded write with no owner to name is NOT SENT — an unnamed command is exactly the
+ * one the server cannot refuse. A document holding no session sends no admin read
+ * other than `session/` either: a screen still asking after its session ended would be
+ * reading under whatever cookie the browser holds by then.
  *
  * THE SERVER'S REFUSAL is read exactly (`readOwnerRefusal`) and never enters the CSRF
  * or elevation recoveries: a different administrator, or a new session of the same one,
@@ -232,7 +234,16 @@ export const errorClassifierInterceptor: HttpInterceptorFn = (req, next) => {
     return throwError(() => new CommandOutcomeUnknownError(requestId));
   };
 
-  /** Re-checked before EVERY send: the first, the CSRF retry and the elevation replay. */
+  /**
+   * Re-checked before EVERY send: the first, the CSRF retry and the elevation replay.
+   *
+   * A guarded write needs more than its lifecycle. A newer read can WITHDRAW the
+   * capability — stop naming a usable owner — without ending the lifecycle, so the
+   * owner the command captured at issuance must still be the one this lifecycle holds,
+   * under a supported binding, at the moment of each send. It is COMPARED, never
+   * replaced: the header, method, URL and body stay exactly as issued, and a command
+   * that fails the comparison is not sent and is told it did not run.
+   */
   const dispatch = (request: HttpRequest<unknown>): Observable<HttpEvent<unknown>> =>
     defer(() => {
       if (!current(request)) {
@@ -241,6 +252,14 @@ export const errorClassifierInterceptor: HttpInterceptorFn = (req, next) => {
             ? new SessionEndedReadError()
             : new CommandNotRunError('session-ended', false),
         );
+      }
+      if (isGuardedWrite(request)) {
+        const admitted = admitOwner(
+          store,
+          request.context.get(LIFECYCLE) ?? store.lifecycle(),
+          request.context.get(COMMAND_OWNER),
+        );
+        if (admitted instanceof CommandNotRunError) return throwError(() => admitted);
       }
       return next(request).pipe(
         mergeMap((event) =>
@@ -337,6 +356,13 @@ export const errorClassifierInterceptor: HttpInterceptorFn = (req, next) => {
       }
 
       const retried = request.clone({ context: request.context.set(CSRF_RETRIED, true) });
+      // A STALE CSRF TOKEN IS ITSELF A REASON TO DOUBT CONTINUITY — the usual cause is a
+      // sign-in in another tab. So this document stops vouching for its session NOW,
+      // synchronously and before the read is issued: sensitive content (a claim code)
+      // is hidden at once and comes back only if a read issued AFTER this moment names
+      // the same owner. The epoch is taken AFTER that, so the recovery read below can
+      // confirm — and an older read, issued before this refusal, cannot.
+      continuity.markUnconfirmed();
       const ticket = store.issueTicket();
       const epoch = continuity.epoch();
       // THE COMMAND WAS REFUSED BY CSRF, BEFORE ANY HANDLER, and is not retried unless

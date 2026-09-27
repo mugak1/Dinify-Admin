@@ -11,7 +11,7 @@ import {
 } from '../api/transport-failure';
 import { NoticeService } from '../notices/notice.service';
 import { ADMIN_AUTH } from './admin-auth.api';
-import { CommandNotRunError, IssuedUnder, readOwnerRefusal } from './command-owner';
+import { CommandNotRunError, compareOwners, IssuedUnder, readOwnerRefusal } from './command-owner';
 import { boundaryKindFor, SessionBoundary } from './session-boundary.service';
 import { SecondFactorMethod } from './session.model';
 import { SessionStore } from './session.store';
@@ -175,9 +175,14 @@ export class ElevationService {
     if (!trimmed) return;
     const attempt = this.attempt;
     if (!attempt) return;
-    // RECHECKED BEFORE THE SEND. The prompt may have outlived its lifecycle.
+    // RECHECKED BEFORE THE SEND. The prompt may have outlived its lifecycle — or the
+    // owner it was opened under, which a newer read can withdraw without ending it.
     if (!this.store.isCurrent(attempt.issued.lifecycle)) {
       this.abandon(attempt, new CommandNotRunError('session-ended', true));
+      return;
+    }
+    if (this.ownerWithdrawn(attempt)) {
+      this.abandon(attempt, new CommandNotRunError('binding-unsupported', true));
       return;
     }
 
@@ -187,6 +192,16 @@ export class ElevationService {
     this.api.elevate(this.method(), trimmed, attempt.issued).subscribe({
       next: (response) => {
         if (!this.isCurrent(attempt)) return;
+        // D10: THE OWNER WAS WITHDRAWN WHILE THE FACTOR WAS CHECKED. The lifecycle goes
+        // on, but nothing in it can be tied to the owner this prompt was opened under
+        // any more, so this success is not applied as that owner's: no elevation is
+        // recorded, no notice published, and — above all — no waiter is released to
+        // replay as if ownership were still confirmed. Each is told it did not run: its
+        // only send was refused for stale elevation, before any handler.
+        if (this.ownerWithdrawn(attempt)) {
+          this.abandon(attempt, new CommandNotRunError('binding-unsupported', true));
+          return;
+        }
         this.store.markElevated(response.elevated_at, attempt.issued.lifecycle);
         // `elevate/` reports the recovery-code count exactly as `verify/` does, and it
         // was being dropped here. A re-elevation SPENDS a recovery code just as a
@@ -293,6 +308,20 @@ export class ElevationService {
   /** Still the open prompt, in the lifecycle it was opened under. */
   private isCurrent(attempt: Attempt): boolean {
     return this.attempt === attempt && this.store.isCurrent(attempt.issued.lifecycle);
+  }
+
+  /**
+   * Opened under an owner that this lifecycle no longer holds under a supported binding.
+   * Compared, never replaced. An attempt opened with no owner never had one to lose —
+   * its own `elevate/` is not sent without one (the classifier refuses it).
+   */
+  private ownerWithdrawn(attempt: Attempt): boolean {
+    const opened = attempt.issued.owner;
+    if (opened === null) return false;
+    const held = this.store.owner();
+    return (
+      this.store.binding() !== 'supported' || held === null || compareOwners(opened, held) !== 'same'
+    );
   }
 
   private reset(): void {

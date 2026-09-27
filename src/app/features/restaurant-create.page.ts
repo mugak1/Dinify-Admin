@@ -12,6 +12,7 @@ import { MAX_REASON_LENGTH, MIN_REASON_LENGTH } from '../core/api/api.constants'
 import { extractErrorMessage, extractNestedFieldErrors } from '../core/api/error-message';
 import { AdminServiceStatus } from '../core/api/service-status';
 import { classifyTransportFailure, extractRequestId } from '../core/api/transport-failure';
+import { CommandNotRunError } from '../core/auth/command-owner';
 import { ElevationAbandonedError, ElevationCancelledError } from '../core/auth/elevation.service';
 import { RESTAURANT_API } from '../core/restaurants/restaurant.api';
 import {
@@ -820,6 +821,18 @@ export class RestaurantCreatePage {
    */
   private onFailed(error: unknown): void {
     this.pending.set(false);
+
+    // NOT RUN, AND THIS TAB COULD NOT CONFIRM ITS SESSION (D10). Refused by CSRF before
+    // any handler, and never retried because the read that would have proved continuity
+    // got no usable answer (or was overtaken by a newer read). Nothing was created — that
+    // is KNOWN, so this is not the "outcome unknown" state, and any outage the read
+    // reported is left standing. The whole draft stays for a deliberate retry.
+    if (error instanceof CommandNotRunError && error.reason === 'continuity-unconfirmed') {
+      this.formError.set(
+        'This tab could not confirm that its admin session is still current, so the restaurant was not created. Try again once the admin service is reachable.',
+      );
+      return;
+    }
 
     // Re-authentication dismissed. NOTHING was sent, so the whole draft is kept.
     if (error instanceof ElevationCancelledError) {

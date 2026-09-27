@@ -198,6 +198,18 @@ export class AdminAuthService {
    * that is not a retry problem, and the service-unavailable view offers a MANUAL
    * retry that keeps the operator in charge of when to try again. The retry is
    * immediate — a timer would mean a spinner that hides the fact.
+   *
+   * ── D10: THE READ AND ITS RETRY ARE ONE OPERATION, OWNED BY ONE LIFECYCLE ─────
+   *
+   * The lifecycle `verify/` begins is captured ONCE, and the whole recovery answers to
+   * it: the retry, each read, the adoption, and every effect of a failure — the outage
+   * report included — happen only while it is still current. Once something else has
+   * ended it (a sign-out, a denial, a boundary, a successor), whatever the recovery
+   * holds is a late answer about a lifecycle that is over: nothing more is read,
+   * adopted, reported or published, and the caller is told the sign-in was not
+   * completed here. A read never takes its authority from whatever lifecycle holds when
+   * an earlier answer lands — that is how an old verification adopted its session after
+   * the operator had signed out.
    */
   async verify(method: SecondFactorMethod, code: string): Promise<AdminVerifyResponse> {
     const before = this.store.lifecycle();
@@ -211,22 +223,29 @@ export class AdminAuthService {
     const expected = readCommandOwner(result);
     this.store.end();
     const lifecycle = this.store.lifecycle();
+    const owned = (): boolean => this.store.isCurrent(lifecycle);
 
     try {
-      await this.adoptVerified(result, expected);
+      await this.adoptVerified(lifecycle, result, expected);
     } catch (first) {
+      // A mismatch is not a transient read failure, and is never retried.
       if (first instanceof PostVerifyCorrelationError) throw first;
       try {
-        await this.adoptVerified(result, expected);
+        // The one retry. It refuses before reading if the lifecycle is already over.
+        await this.adoptVerified(lifecycle, result, expected);
       } catch (error) {
-        if (error instanceof PostVerifyCorrelationError) throw error;
+        // No effect of a failure for a lifecycle that has ended: an outage reported, or
+        // a read failure the caller routes on, would be acting on its behalf.
+        if (error instanceof PostVerifyCorrelationError || !owned()) {
+          throw new PostVerifyCorrelationError();
+        }
         const failure = classifyTransportFailure(error);
         const requestId = extractRequestId(error);
         if (failure === 'unavailable') this.status.reportUnavailable(requestId);
         throw new PostVerifyReadError(failure, requestId);
       }
     }
-    if (!this.store.isCurrent(lifecycle)) throw new PostVerifyCorrelationError();
+    if (!owned()) throw new PostVerifyCorrelationError();
 
     this.status.markReachable();
     // A new session: whatever the last sign-out's server half was is no longer news.
@@ -293,11 +312,21 @@ export class AdminAuthService {
    * none (or one this client cannot read) is held to the username, which is all it
    * states, and the lifecycle is then unsupported whatever the read says: nothing ties
    * that read's owner to this sign-in.
+   *
+   * `lifecycle` is the one `verify()` began. It is checked BEFORE the read is issued —
+   * which is what stops the retry once the lifecycle is over — and again when it
+   * answers, so no read, and no ticket, is ever taken under a lifecycle this sign-in did
+   * not begin.
    */
-  private async adoptVerified(result: AdminVerifyResponse, expected: OwnerReading): Promise<void> {
+  private async adoptVerified(
+    lifecycle: number,
+    result: AdminVerifyResponse,
+    expected: OwnerReading,
+  ): Promise<void> {
+    if (!this.store.isCurrent(lifecycle)) throw new PostVerifyCorrelationError();
     const ticket = this.store.issueTicket();
     const session = await firstValueFrom(this.api.readSession());
-    if (!this.store.isCurrent(ticket.lifecycle)) throw new PostVerifyCorrelationError();
+    if (!this.store.isCurrent(lifecycle)) throw new PostVerifyCorrelationError();
     if (!isAdminSessionResponse(session)) throw new IncoherentResponseError();
     if (session.username !== result.username) throw new PostVerifyCorrelationError();
 

@@ -4,6 +4,7 @@ import { RouterLink } from '@angular/router';
 import { AdminServiceStatus } from '../core/api/service-status';
 import { extractErrorMessage, extractFieldErrors } from '../core/api/error-message';
 import { classifyTransportFailure, extractRequestId } from '../core/api/transport-failure';
+import { CommandNotRunError } from '../core/auth/command-owner';
 import { ElevationAbandonedError, ElevationCancelledError } from '../core/auth/elevation.service';
 import { formatEat } from '../core/formatting/time';
 import {
@@ -266,6 +267,13 @@ const TERMS_COPY: Record<'record' | 'replace' | 'end', CommercialWriteCopy> = {
       extractErrorMessage(error, 'Subscription terms changed since they were loaded.'),
   },
 };
+
+/**
+ * A commercial write refused by CSRF whose recovery read could not confirm continuity
+ * (D10). Fixed copy, never the server's: nothing ran, and that is all this tab knows.
+ */
+const COMMERCIAL_CONTINUITY_UNCONFIRMED =
+  'This tab could not confirm that its admin session is still current, so this change was not run. Nothing was changed. Try again once the admin service is reachable.';
 
 export function readStatus(error: unknown): number | null {
   if (typeof error !== 'object' || error === null) return null;
@@ -1463,6 +1471,16 @@ export class RestaurantOverviewTab {
    */
   private onWriteFailed(error: unknown, copy: CommercialWriteCopy): void {
     this.workspace.endMutation();
+
+    // NOT RUN, AND THIS TAB COULD NOT CONFIRM ITS SESSION (D10). Refused by CSRF before
+    // any handler, and never retried because the read that would have proved continuity
+    // got no usable answer (or was overtaken by a newer read). That is KNOWN, not
+    // indeterminate: the draft and its token stay, nothing is re-read or resent, and any
+    // outage the read reported is left standing for the shell's recovery.
+    if (error instanceof CommandNotRunError && error.reason === 'continuity-unconfirmed') {
+      this.writeError.set(COMMERCIAL_CONTINUITY_UNCONFIRMED);
+      return;
+    }
 
     // Re-authentication dismissed. NOTHING was sent, so the draft and the reason are
     // kept and the editor stays open — wiping an operator's typed reason because they

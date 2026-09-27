@@ -187,10 +187,10 @@ checkout of the target.
 
 ## The fresh assessment
 
-`lib/assessment.mjs` runs over `dependency-audit/lib/retained.mjs`, which was copied
-byte-for-byte from Dinify-Frontend at `4ce0183` (`5453f5f2…7ab5`; a test pins the digest).
-The two have since diverged: Frontend #709 (merged at `a198090`) extended its copy with
-scanner diagnostics, and Admin's is still the pre-extension file.
+`lib/assessment.mjs` runs over `dependency-audit/lib/retained.mjs`, the module
+Dinify-Frontend uses for its own fresh assessment. It was first copied at Frontend's
+`4ce0183`, and now also carries the scanner diagnostics Frontend #709 added (below, "Scanner
+diagnostics"); a test pins the file's digest.
 
 - **Scan-only replay.** The scanner runs in a directory holding exactly the retained
   `package.json` and `package-lock.json`. `npm audit` reads the lock graph. No
@@ -219,6 +219,85 @@ scanner diagnostics, and Admin's is still the pre-extension file.
   `release/` or `dependency-audit/` on `main` differ from the verifier this run used.
 - **A new advisory can refuse unchanged bytes.** A scanner failure, an error body,
   truncated output, a timeout or a failed scanner install is **incomplete**, never a pass.
+
+### Scanner diagnostics: the last observed npm events
+
+When a scan of the fresh assessment runs out its `timeoutSeconds`, npm is killed and leaves an
+empty stdout, an empty stderr and a SIGTERM. What npm was doing went to its debug log, and
+nothing kept that. This section keeps a bounded, sanitized part of it. **It changes no
+timeout, retry, cache, registry, policy or verdict, and it cannot explain a past timeout.**
+
+**How it is captured.** `assess()` creates a scratch root with `mkdtemp` in the OS temporary
+directory and removes it however it returns. For each graph, `collect()`
+(`dependency-audit/lib/retained.mjs`) makes a fresh directory under that root and passes npm
+ONE extra flag, `--logs-dir=<that directory>`. Nothing else about the invocation changes. The
+directory is ABSOLUTE because npm resolves `--logs-dir` against the scan's own cwd. It must
+not be inside or around the trusted checkout, the replay, the scanner, the assessment
+directory or the downloaded candidate. If it is, npm gets no flag and the graph records why.
+
+**What is kept.** After the scan, exactly one regular file named as npm names its logs is
+read, and only its last 2 MiB. It is re-rendered through an allowlist of npm's event shapes
+into `<graph>.npm-diagnostics.txt` beside the raw output, at most 1 MiB, with the oldest
+events dropped first. It is not the raw log, and its first line says so. Argv, config, cwd,
+paths, stack traces, credentials in URLs, query strings, markup and control characters do not
+survive. `~/.npm/_logs` is never read.
+
+**What the assessment records.** Each graph gains a `diagnostics` key:
+
+- `{state: 'retained', file, sha256, bytes, truncated}`;
+- `{state: 'unavailable', reason}`, where the reason is one of `unsafe_location`,
+  `setup_failed`, `no_log`, `multiple_logs`, `unsafe_entry`, `unreadable`, `write_failed` or
+  `capture_failed`.
+
+**It never changes a verdict.** A scan killed at the limit is still `scanner_timeout`, so the
+assessment is `incomplete` and no promotion is admitted, whether or not the diagnostic was
+kept. An unavailable diagnostic adds no problem and removes none.
+
+**The receiving side.** `verifyAssessment` runs in `prepare` and again in the privileged job.
+An assessment WITHOUT the key was made before this change and stays valid. With the key,
+`validateAssessment` holds the descriptor to its exact shape (`assessment_invalid`). A
+declared file must be present (`assessment_diagnostics_missing`), must match its length and
+digest (`assessment_diagnostics_mismatch`), and must pass the format's line-by-line grammar
+(`assessment_diagnostics_unsafe`). A file nobody declared is still `assessment_unexpected_file`.
+
+**Where it is read.** The admission artifact (`admin-admission-<run>-<attempt>`) already
+keeps `admission/assessment/` whether the candidate was admitted or refused, so the
+diagnostics ride in it. For each graph whose scan did not finish cleanly, the evaluate step
+also prints two things to the job log. The first is the **last observed npm events**. The
+second is the requests the log shows STARTED with no logged completion. Every line is
+prefixed `release:` and reduced to printable ASCII. npm logs most requests when they
+COMPLETE, and several can be outstanding at once. So the last line is not evidence of which
+request, if any, stalled, and the output never says it is.
+
+**The same file as Frontend.** Dinify-Frontend #709 introduced this capture; Admin carries
+the same `lib/retained.mjs`, whose comments were made repository-neutral in this change, and
+`dependency-audit/tests/retained.test.mjs` (30 tests) byte for byte. Admin's own tests are in
+`release/tests/assessment.test.mjs` ("the scanner's own record"). Four source mutations
+each fail a named subset of that file:
+
+| mutation | fails |
+|---|---|
+| capture disabled | 8 |
+| receiving checks bypassed | 5 |
+| descriptor shape unchecked | 5 |
+| grammar check replaced by printable-only | 1 |
+
+**Measured with the real pinned scanner, locally.** This used npm 11.19.1, installed from the
+scanner lock Admin pins (the same bytes as Frontend's), on Node v24.21.0. It ran against a
+stub registry on `127.0.0.1` with the policy's minimum timeout of 30 seconds, and drove THIS
+repository's `collect()`:
+
+| stub behaviour | run | kept | read back |
+|---|---|---|---|
+| everything answered | exit 1 (synthetic advisories) | retained, 1,071 B | nothing started without a completion |
+| `GET /beta` never answered | SIGTERM, `scanner_timeout` | retained, 981 B | `GET …/beta` started, no completion |
+| bulk POST never answered | SIGTERM, `scanner_timeout` | retained, 679 B | the bulk POST started, no completion |
+
+In all three the replay was unchanged, the owned log directory was gone afterwards, npm wrote
+nothing under `HOME/.npm/_logs`, and the kept bytes matched their descriptor. This is a
+loopback stub, not `registry.npmjs.org`: there was no TLS, proxy or DNS, the graph had two
+packages, and there was one run per mode. It shows that capture works at these two stall
+points. It does not show what happened in any real run.
 
 ## The host procedure
 

@@ -31,7 +31,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { spawnRunner, loadPolicy } from '../dependency-audit/lib/audit.mjs';
-import { assess } from './lib/assessment.mjs';
+import { assess, diagnosticNotes } from './lib/assessment.mjs';
 import { ADMISSION_DOC, commitFacts, decideAdmission, selectCertification, trustedTrees, verifyAdmission } from './lib/admission.mjs';
 import { certify, freeze, inspectCandidate, prebuild } from './lib/certification.mjs';
 import { ID_RE, SHA_RE, admissionArtifactName, isObject, loadReleasePolicy, parseJson, recordBytes, reason } from './lib/common.mjs';
@@ -210,10 +210,11 @@ function main(argv) {
               trustedRoot: ROOT, inspection,
               candidate: { commit: a.target, runId: sel.selection.runId, runAttempt: sel.selection.runAttempt, artifactId: sel.selection.artifact.id, artifactDigest: sel.selection.artifact.digest },
               assessor: { workflowPath: state.policy.evaluation.workflowPath, runId: a['run-id'], runAttempt: a['run-attempt'], revision: a.revision },
-              outDir: assessDir, replayDir: a.replay, runner: spawnRunner, clock,
+              outDir: assessDir, replayDir: a.replay, runner: spawnRunner, clock, forbidden: [resolve(a.candidate)],
             });
             console.log(`fresh assessment: ${r.doc.headline}`);
             console.log(`  collected ${r.doc.startedAt} → ${r.doc.finishedAt}`);
+            for (const line of diagnosticNotes({ outDir: assessDir, doc: r.doc, unfinished: r.unfinished })) console.log(line);
           }
         }
       }

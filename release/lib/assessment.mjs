@@ -22,19 +22,30 @@
  * the audit policy the candidate carries: that one only reproduces what certification
  * decided. Exceptions and triage records therefore come from the trusted policy alone.
  *
+ * THE SCANNER'S OWN RECORD. Each scan is also given a fresh, ABSOLUTE `--logs-dir` under a
+ * scratch root this function creates in the OS temporary directory and removes however it
+ * returns, and the sanitized projection of npm's debug log is kept beside the raw output as
+ * `<graph>.npm-diagnostics.txt` (dependency-audit/lib/retained.mjs). It is DIAGNOSTIC ONLY:
+ * whether it could be kept never changes the outcome, and a timed-out scan stays
+ * incomplete. The receiving side (`verifyAssessment`) holds a declared diagnostic to its
+ * length, digest and grammar, and still refuses any file nobody declared.
+ *
  * The window is measured from the actual start of advisory collection, and an applied
  * exception's lapse is part of the same deadline. `assessmentDeadline` is shared by the
  * admission, the privileged verification and — as an epoch second — the host, so the three
  * cannot disagree about when this assessment stops authorising a promotion.
  */
 
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { defaultInstallScanner, loadPolicy, POLICY_SCHEMA } from '../../dependency-audit/lib/audit.mjs';
 import { evaluate, headline } from '../../dependency-audit/lib/core.mjs';
 import { inventory, readReport, sha256, toolingScope } from '../../dependency-audit/lib/npm.mjs';
-import { collect, retainedInventory, writeReplay, RETAINED_OBSERVATION } from '../../dependency-audit/lib/retained.mjs';
+import {
+  DIAGNOSTIC_MAX_BYTES, DIAGNOSTIC_REASONS, RETAINED_OBSERVATION, checkDiagnosticProjection, collect, diagnosticFileName, readDiagnosticEvents, retainedInventory, writeReplay,
+} from '../../dependency-audit/lib/retained.mjs';
 import { HEX_RE, DIGEST_RE, ID_RE, SHA_RE, isInstant, isObject, parseJson, reason, recordBytes, same } from './common.mjs';
 import { lockOnlyInventory, PASSING } from './certification.mjs';
 import { digestOf, sha256Hex } from './tree.mjs';
@@ -66,13 +77,16 @@ function appliedRecords(result, records) {
  * @param {Function} input.runner      the process runner (dependency-audit/lib/audit.mjs)
  * @param {Function} input.clock       () => ISO instant
  * @param {Function} [input.installScanner]
+ * @param {string[]} [input.forbidden]  more directories the scanner-log root must not be
+ *                                      inside or around (the CLI passes the candidate)
  */
-export function assess({ trustedRoot, inspection, candidate, assessor, outDir, replayDir, runner, clock, installScanner = defaultInstallScanner }) {
+export function assess({ trustedRoot, inspection, candidate, assessor, outDir, replayDir, runner, clock, installScanner = defaultInstallScanner, forbidden = [] }) {
   mkdirSync(outDir, { recursive: true });
   mkdirSync(replayDir, { recursive: true });
   const incomplete = [];
   const findings = [];
   const graphs = {};
+  const unfinished = [];
   const startedAt = clock();
   const { policy, problems: policyProblems } = loadPolicy(trustedRoot);
   incomplete.push(...policyProblems);
@@ -89,17 +103,29 @@ export function assess({ trustedRoot, inspection, candidate, assessor, outDir, r
       incomplete.push(...writeReplay(replayDir, { manifestBytes, lockBytes }));
       replay = { names: ['package-lock.json', 'package.json'], manifestSha256: sha256(manifestBytes), lockfileSha256: sha256(lockBytes) };
       if (!incomplete.length) {
-        const appInv = retainedInventory({ graph: 'application', manifestBytes, lockBytes, snapshot });
-        const app = collect({ graph: 'application', dir: replayDir, inv: appInv, kind: 'retained', npmCli, policy, runner, clock, evidenceDir: outDir });
-        incomplete.push(...app.problems);
-        findings.push(...app.findings);
-        graphs.application = app.record;
-        const scannerInv = inventory(scannerRoot, { graph: 'scanner', scopeOf: toolingScope });
-        const scn = collect({ graph: 'scanner', dir: scannerRoot, inv: scannerInv, kind: 'installed', scopeOf: toolingScope, npmCli, policy, runner, clock, evidenceDir: outDir });
-        incomplete.push(...scn.problems);
-        findings.push(...scn.findings);
-        graphs.scanner = scn.record;
-        scanner = { package: policy.scanner.package, version: policy.scanner.version, manifestSha256: scannerInv.digests.manifestSha256 ?? null, lockfileSha256: scannerInv.digests.lockfileSha256 ?? null };
+        // The scanner-log root: THIS call's own absolute scratch directory, outside the
+        // trusted checkout, the replay, the scanner and the output, removed whatever happens.
+        // If it cannot be made, each graph records `setup_failed` and the scan runs as before.
+        let diagnosticsRoot = null;
+        try { diagnosticsRoot = mkdtempSync(join(tmpdir(), 'dinify-admin-assess-npm-logs-')); } catch { /* each graph records setup_failed */ }
+        const diagnostics = { root: diagnosticsRoot, forbidden: [trustedRoot, replayDir, scannerRoot, outDir, ...forbidden] };
+        try {
+          const appInv = retainedInventory({ graph: 'application', manifestBytes, lockBytes, snapshot });
+          const app = collect({ graph: 'application', dir: replayDir, inv: appInv, kind: 'retained', npmCli, policy, runner, clock, evidenceDir: outDir, diagnostics });
+          incomplete.push(...app.problems);
+          findings.push(...app.findings);
+          graphs.application = app.record;
+          if (app.problems.length) unfinished.push('application');
+          const scannerInv = inventory(scannerRoot, { graph: 'scanner', scopeOf: toolingScope });
+          const scn = collect({ graph: 'scanner', dir: scannerRoot, inv: scannerInv, kind: 'installed', scopeOf: toolingScope, npmCli, policy, runner, clock, evidenceDir: outDir, diagnostics });
+          incomplete.push(...scn.problems);
+          findings.push(...scn.findings);
+          graphs.scanner = scn.record;
+          if (scn.problems.length) unfinished.push('scanner');
+          scanner = { package: policy.scanner.package, version: policy.scanner.version, manifestSha256: scannerInv.digests.manifestSha256 ?? null, lockfileSha256: scannerInv.digests.lockfileSha256 ?? null };
+        } finally {
+          if (diagnosticsRoot) rmSync(diagnosticsRoot, { recursive: true, force: true });
+        }
       }
     }
   }
@@ -136,7 +162,43 @@ export function assess({ trustedRoot, inspection, candidate, assessor, outDir, r
     recordsApplied: appliedRecords(result, records),
   };
   writeFileSync(join(outDir, ASSESSMENT_DOC), recordBytes(doc));
-  return { doc, result };
+  return { doc, result, unfinished };
+}
+
+/**
+ * For each graph whose scan did not complete cleanly: the LAST OBSERVED npm EVENTS, read
+ * back from its FINALIZED diagnostic (the very bytes the document hashes, re-checked
+ * against the descriptor before use), as job-log lines. Every line is prefixed and reduced
+ * to printable ASCII, so none can be read as a workflow command. Worded as what the log
+ * records — never as the cause, and never naming the last completed request as the one
+ * that stalled.
+ */
+export function diagnosticNotes({ outDir, doc, unfinished }) {
+  const lines = [];
+  const flat = (x) => String(x).replace(/[^\x20-\x7e]/g, '?').slice(0, 300);
+  for (const graph of unfinished) {
+    const d = doc.graphs?.[graph]?.diagnostics;
+    let events = null;
+    if (d?.state === 'retained' && d.bytes <= DIAGNOSTIC_MAX_BYTES) {
+      try {
+        const bytes = readFileSync(join(outDir, d.file));
+        if (bytes.length === d.bytes && sha256Hex(bytes) === d.sha256) events = readDiagnosticEvents(bytes.toString('latin1'));
+      } catch { events = null; }
+    }
+    if (!events) {
+      lines.push(`release: ${graph}: last observed npm events UNAVAILABLE (${flat(d?.state === 'unavailable' ? d.reason : 'not retained')}); nothing is known about what the scanner was doing`);
+      continue;
+    }
+    lines.push(`release: ${graph}: last observed npm events (sanitized, ${events.count} kept${d.truncated ? ', truncated' : ''}; these are what npm had logged when the scan ended,`
+      + ' not a finding: npm logs a request when its response ends, several requests can be outstanding at once, and the last line is not evidence of which request, if any, stalled):');
+    for (const e of events.last) lines.push(`release:   ${flat(e)}`);
+    if (events.unfinished.length) {
+      lines.push(`release:   logged as started with no logged completion: ${events.unfinished.map(flat).join('; ')}${events.moreUnfinished ? ` (and ${events.moreUnfinished} more)` : ''}`);
+    } else {
+      lines.push('release:   no request is logged as started without a logged completion; the log does not show what the scanner was waiting on');
+    }
+  }
+  return lines;
 }
 
 /** The audit policy's identity: the sha256 of the committed file's bytes. */
@@ -180,10 +242,42 @@ export function validateAssessment(doc) {
           || !RAW_RE.test(String(r.run.stderrFile)) || !HEX_RE.test(String(r.run.stdoutSha256)) || !HEX_RE.test(String(r.run.stderrSha256))) p(`graph ${g}`);
     }
     for (const g of Object.keys(doc.graphs)) if (!GRAPHS.includes(g)) p(`unexpected graph ${g}`);
+    for (const g of GRAPHS) {
+      const r = doc.graphs[g];
+      if (isObject(r) && Object.hasOwn(r, 'diagnostics')) { const bad = diagnosticShapeProblem(g, r.diagnostics); if (bad) p(bad); }
+    }
   }
   if (typeof doc.outcome !== 'string' || !Number.isInteger(doc.exitCode) || !isObject(doc.counts)) p('result');
   if (!Array.isArray(doc.recordsApplied) || !doc.recordsApplied.every((r) => isObject(r) && typeof r.id === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(String(r.expires)))) p('recordsApplied');
   return out;
+}
+
+/**
+ * A graph's OPTIONAL scanner diagnostic descriptor (dependency-audit/lib/retained.mjs).
+ * Absent is an assessment made before it existed and stays valid; PRESENT is held to its
+ * exact shape — optional is not the same as unchecked. Returns a detail, or null.
+ *   retained     {state, file, sha256, bytes, truncated}: the canonical graph-bound name,
+ *                a SHA-256, 1..DIAGNOSTIC_MAX_BYTES bytes, and a boolean truncation state
+ *   unavailable  {state, reason}: one of the closed reasons, and nothing else
+ */
+function diagnosticShapeProblem(graph, d) {
+  const bad = (detail) => `graph ${graph} diagnostics: ${detail}`;
+  if (!isObject(d)) return bad('not an object');
+  const keys = Object.keys(d).sort().join(',');
+  if (d.state === 'retained') {
+    if (keys !== 'bytes,file,sha256,state,truncated') return bad(`retained with keys ${keys}`);
+    if (d.file !== diagnosticFileName(graph)) return bad(`file ${JSON.stringify(d.file)} is not ${diagnosticFileName(graph)}`);
+    if (!HEX_RE.test(String(d.sha256))) return bad('sha256 is not a SHA-256');
+    if (!Number.isInteger(d.bytes) || d.bytes < 1 || d.bytes > DIAGNOSTIC_MAX_BYTES) return bad(`bytes ${JSON.stringify(d.bytes)} outside 1..${DIAGNOSTIC_MAX_BYTES}`);
+    if (typeof d.truncated !== 'boolean') return bad('truncated is not a boolean');
+    return null;
+  }
+  if (d.state === 'unavailable') {
+    if (keys !== 'reason,state') return bad(`unavailable with keys ${keys}`);
+    if (!DIAGNOSTIC_REASONS.includes(d.reason)) return bad(`reason ${JSON.stringify(d.reason)} is not a known reason`);
+    return null;
+  }
+  return bad(`state ${JSON.stringify(d.state)}`);
 }
 
 /**
@@ -226,6 +320,20 @@ export function verifyAssessment(files, { inspection, auditPolicy, auditPolicyBy
       else if (sha256Hex(bytes) !== digest) problem('assessment_raw_mismatch', `${g}: ${file} is not the bytes the assessment recorded`);
     }
     raw[g] = files.get(run.stdoutFile)?.toString('utf8');
+    // A DECLARED scanner diagnostic is checked the same way, plus the format's own grammar
+    // (printable is not sanitized). An undeclared one is refused below like any other file.
+    const d = doc.graphs[g].diagnostics;
+    if (d?.state === 'retained') {
+      expected.add(d.file);
+      const bytes = files.get(d.file);
+      if (!bytes) problem('assessment_diagnostics_missing', `${g}: ${d.file}`);
+      else if (bytes.length !== d.bytes || sha256Hex(bytes) !== d.sha256) problem('assessment_diagnostics_mismatch', `${g}: ${d.file} is not the bytes the assessment recorded`);
+      else {
+        const check = checkDiagnosticProjection(bytes, { graph: g });
+        if (!check.ok) problem('assessment_diagnostics_unsafe', `${g}: ${d.file} is not a diagnostic in the sanitized format`);
+        else if (check.truncated !== d.truncated) problem('assessment_diagnostics_mismatch', `${g}: ${d.file} truncation is not what the descriptor states`);
+      }
+    }
   }
   for (const path of files.keys()) if (!expected.has(path)) problem('assessment_unexpected_file', path);
   if (out.problems.length) return out;

@@ -203,8 +203,11 @@ describe('STATIC: the verifier imports only what the privileged job has', () => 
     for (const [, cmd, rest] of calls) for (const [, opt] of rest.matchAll(/--([a-z-]+)/g)) assert.ok(accepted(cmd).includes(opt), `${cmd} --${opt}`);
   });
 
-  it('CONTRACT: dependency-audit/lib/retained.mjs is Dinify-Frontend\'s file as of 4ce0183, byte for byte (not its current one)', () => {
-    assert.equal(sha256Hex(readFileSync(join(REPO_ROOT, 'dependency-audit', 'lib', 'retained.mjs'))), '5453f5f289f5740ce82356a8fcfd310162bfdbf868b9f9efe527d81a976a7ab5');
+  // The shared module, WITH the scanner-diagnostics section Dinify-Frontend added in #709
+  // (its comments made repository-neutral). Frontend's copy is brought to the same bytes by
+  // its own change; until then the two differ in three comment lines and nothing else.
+  it('CONTRACT: dependency-audit/lib/retained.mjs is the shared module with scanner diagnostics, byte for byte', () => {
+    assert.equal(sha256Hex(readFileSync(join(REPO_ROOT, 'dependency-audit', 'lib', 'retained.mjs'))), '83df67e2637f3b9f705141c4a78ca4e6220877c3076dd7d84619c97c0988be37');
   });
 });
 

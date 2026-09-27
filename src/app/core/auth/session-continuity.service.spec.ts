@@ -24,9 +24,10 @@ const BOUND: AdminSessionResponse = {
   server_time: '2026-08-19T12:00:00+00:00',
   command_owner: OWNER,
 };
+const RENEWED_SESSION = '0d0d0d0d-0000-4000-8000-0000000000dd';
 const RENEWED: AdminSessionResponse = {
   ...BOUND,
-  command_owner: { ...OWNER, session: '0d0d0d0d-0000-4000-8000-0000000000dd' },
+  command_owner: { ...OWNER, session: RENEWED_SESSION },
 };
 const SOMEONE_ELSE: AdminSessionResponse = {
   ...BOUND,
@@ -185,6 +186,76 @@ describe('SessionContinuityService', () => {
 
     store.adopt(BOUND);
     expect(continuity.state()).toBe('confirmed');
+  });
+
+  // ── AN OLDER READ NEVER OVERTURNS A NEWER ONE (Codex review of #37) ───────────────
+  // Reads are sent in issue order and each carries the cookie the browser held when it
+  // was SENT, so one that settles after a newer read was applied describes an earlier
+  // moment. It may agree with what is held; it may not report a change or withdraw the
+  // capability on the strength of that moment.
+  describe('reads that settle out of order', () => {
+    const LEGACY: AdminSessionResponse = (() => {
+      const legacy: Record<string, unknown> = { ...BOUND };
+      delete legacy['command_owner'];
+      return legacy as unknown as AdminSessionResponse;
+    })();
+
+    it('an older read naming another SESSION after a newer one was adopted is superseded — no boundary', () => {
+      store.end();
+      const older = store.issueTicket();
+      const newer = store.issueTicket();
+      expect(continuity.apply(newer, continuity.epoch(), RENEWED)).toBe('adopted');
+      expect(continuity.apply(older, continuity.epoch(), BOUND)).toBe('superseded');
+      expect(replaced).toEqual([]);
+      expect(store.owner()?.session).toBe(RENEWED_SESSION);
+    });
+
+    it('an older read naming another ADMINISTRATOR after a newer confirmation is superseded — no boundary', () => {
+      const older = store.issueTicket();
+      const newer = store.issueTicket();
+      expect(continuity.apply(newer, continuity.epoch(), BOUND)).toBe('same');
+      expect(continuity.apply(older, continuity.epoch(), SOMEONE_ELSE)).toBe('superseded');
+      expect(replaced).toEqual([]);
+      expect(store.username()).toBe('operator');
+    });
+
+    it('an older read publishing NO owner cannot withdraw the capability a newer one established', () => {
+      store.end();
+      const older = store.issueTicket();
+      const newer = store.issueTicket();
+      expect(continuity.apply(newer, continuity.epoch(), BOUND)).toBe('adopted');
+      expect(continuity.apply(older, continuity.epoch(), LEGACY)).toBe('superseded');
+      expect(store.binding()).toBe('supported');
+      expect(store.owner()).toEqual(OWNER);
+    });
+
+    it('a NEWER read that stops publishing the owner still withdraws it — and an older one cannot cross afterwards', () => {
+      const older = store.issueTicket();
+      const newer = store.issueTicket();
+      expect(continuity.apply(newer, continuity.epoch(), LEGACY)).toBe('unbound');
+      expect(store.binding()).toBe('unsupported');
+      expect(continuity.apply(older, continuity.epoch(), SOMEONE_ELSE)).toBe('superseded');
+      expect(replaced).toEqual([]);
+    });
+
+    it('CONTROL — an older read that AGREES is still the same owner, and changes no newer field', () => {
+      const older = store.issueTicket();
+      const newer = store.issueTicket();
+      const later = { ...BOUND, server_time: '2026-08-19T12:05:00+00:00' };
+      expect(continuity.apply(newer, continuity.epoch(), later)).toBe('same');
+      const anchored = store.serverNowMs();
+      expect(continuity.apply(older, continuity.epoch(), BOUND)).toBe('same');
+      // Re-anchored on the older read, the server clock would fall back five minutes.
+      expect(anchored! - store.serverNowMs()!).withContext('the older read re-anchored nothing').toBeLessThan(1000);
+    });
+
+    it('CONTROL — a NEWER read naming another session still crosses the boundary', () => {
+      const older = store.issueTicket();
+      const newer = store.issueTicket();
+      expect(continuity.apply(older, continuity.epoch(), BOUND)).toBe('same');
+      expect(continuity.apply(newer, continuity.epoch(), RENEWED)).toBe('session-changed');
+      expect(replaced).toEqual(['/login?session=renewed']);
+    });
   });
 
   it('a signed-out document asks nothing', () => {

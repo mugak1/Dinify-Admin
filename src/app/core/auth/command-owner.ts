@@ -154,6 +154,7 @@ export type NotRunReason =
   | 'binding-unsupported'
   | 'no-session'
   | 'session-ended'
+  | 'continuity-unconfirmed'
   | 'owner-unknown';
 
 const NOT_RUN_COPY: Readonly<Record<NotRunReason, string>> = {
@@ -168,6 +169,8 @@ const NOT_RUN_COPY: Readonly<Record<NotRunReason, string>> = {
   'no-session': 'There is no admin session in this tab. This command was not run.',
   'session-ended':
     'The admin session this command belonged to has ended in this tab. This command was not run.',
+  'continuity-unconfirmed':
+    'This tab could not confirm that its admin session is still current, so this command was not run.',
   'owner-unknown':
     'This tab could not name the admin session to end, so no sign-out request was sent.',
 };

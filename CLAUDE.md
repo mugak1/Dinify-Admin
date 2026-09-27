@@ -621,19 +621,27 @@ a later backend contraction, and old bundles stay exposed until they reload or r
   each send.
 - **A guarded write with no owner is NOT SENT** (`CommandNotRunError`, `sent: false`):
   no session, or a server that published no owner. `login/` and `verify/` stay open to a
-  document with none. A LATER read that stops publishing the owner withdraws it for the
+  document with none. A NEWER read that stops publishing the owner withdraws it for the
   rest of the lifecycle — a cached capability is not perpetual proof. A document holding
   no session sends no admin read but `session/`.
 - **Every session read goes through ONE rule** (`SessionStore.observe`, with a ticket
-  taken before the read): stale / adopted / same / unbound / actor-changed /
-  session-changed. The last two are a **SESSION BOUNDARY** (`SessionBoundary.cross`):
+  taken before the read): stale / superseded / adopted / same / unbound / actor-changed /
+  session-changed. **An older read never overturns a newer one**: reads go out in issue
+  order carrying the cookie held at SEND time, so one that settles after a newer read was
+  applied may agree with it but is otherwise `superseded` — no boundary, no withdrawal,
+  no field overwritten. The last two are a **SESSION BOUNDARY** (`SessionBoundary.cross`):
   the lifecycle ends, notices clear, and the document is REPLACED with
   `/login?session=changed|renewed`, which renders fixed copy and never the query text.
   **A new session of the SAME administrator is a boundary too, never a CSRF renewal.**
   The post-verify read must match the verified owner on actor AND session, and a
   mismatch is never retried (`PostVerifyCorrelationError`).
 - **Recovery is bounded AND gated on continuity.** A CSRF 403 re-reads `session/` once
-  and retries once ONLY when the read names the command's owner; an elevation prompt is
+  and retries once ONLY when the read names the command's owner. **The command was
+  refused before any handler, so a recovery read that fails, is not a session or is
+  superseded ends it as not run** (`continuity-unconfirmed`, or `session-ended` once a
+  401 has ended the lifecycle) — never as the read's own failure, which would send every
+  consumer to its indeterminate branch; the read's own outage or sign-out handling
+  stands. An elevation prompt is
   bound to the owner and lifecycle it opened under (`ElevationService` attempts, each
   with its own Subject), drains its waiters as not run when that lifecycle ends, and
   ignores an answer for a cancelled or replaced attempt. The owner refusal itself never
@@ -655,9 +663,13 @@ a later backend contraction, and old bundles stay exposed until they reload or r
   erasure.** It protects what is SHOWN; the server's precondition protects commands.
 - **Not closed here, and recorded rather than implied:** the development RESTAURANT mock
   runs no interceptor, so in `npm start` the owner contract is visible on the auth
-  routes, resume and the boundary but not on restaurant writes; and a consumer's
+  routes, resume and the boundary but not on restaurant writes; a consumer's
   indeterminate branch can still raise the outage banner in the brief window between a
-  lifecycle ending and the document leaving.
+  lifecycle ending and the document leaving; and a command reported not run because its
+  CSRF recovery read got no usable answer reaches each write screen's GENERAL branch,
+  which still marks the service reachable (hiding the outage the read reported) and, on
+  Readiness, discards a displayed claim code. Handling `CommandNotRunError` explicitly
+  there is a consumer change outside this contract, recorded as a separate reservation.
 
 ### TRANSPORT vs RESPONSE — `core/api/transport-failure.ts`
 **"Did we get a usable response at all" is PRIOR to "what did the server say."**
@@ -1615,9 +1627,9 @@ of "an error happened".
    bootstrap `session/` read is expected to 401 for a signed-out operator.
 2. **403 carrying the CSRF message** — the token is stale or missing. Re-read
    `GET /auth/session/` **once** and retry **once** — and since D10 ONLY when that read
-   names the owner the command was issued under; any other answer ends the command as
-   not run, and a different owner crosses the session boundary. Then hard-fail as a
-   defect. Not an infinite retry.
+   names the owner the command was issued under; any other answer — the read failing
+   included — ends the command as not run, and a different owner crosses the session
+   boundary. Then hard-fail as a defect. Not an infinite retry.
 3. **403 carrying the ELEVATION message** — an EXPECTED SECURITY STATE, not an error.
    Open one re-elevation modal, `POST /auth/elevate/`, and **replay the original
    request** on success. The failure mode being designed out is: click Suspend, get a

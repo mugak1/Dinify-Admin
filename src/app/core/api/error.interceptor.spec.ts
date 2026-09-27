@@ -8,7 +8,7 @@ import {
 import { HttpTestingController, provideHttpClientTesting } from '@angular/common/http/testing';
 import { TestBed } from '@angular/core/testing';
 import { Router } from '@angular/router';
-import { Observable, Subject, of } from 'rxjs';
+import { Observable, Subject, of, throwError } from 'rxjs';
 
 import { AdminAuthApi, ADMIN_AUTH } from '../auth/admin-auth.api';
 import {
@@ -58,6 +58,8 @@ class StubAuthApi implements AdminAuthApi {
   sessionReads = 0;
   /** What the next `readSession` answers. */
   body: object = SESSION_BODY;
+  /** When set, the NEXT `readSession` answers this instead, once — a spec controls it. */
+  next: Observable<unknown> | null = null;
 
   login(): Observable<never> {
     throw new Error('not used');
@@ -70,7 +72,9 @@ class StubAuthApi implements AdminAuthApi {
   }
   readSession() {
     this.sessionReads += 1;
-    return of(this.body as typeof SESSION_BODY);
+    const once = this.next;
+    this.next = null;
+    return (once ?? of(this.body)) as Observable<typeof SESSION_BODY>;
   }
   elevate(): Observable<never> {
     throw new Error('not used');
@@ -906,6 +910,87 @@ describe('errorClassifierInterceptor', () => {
       expect(notRun(error).reason).toBe('binding-unsupported');
       expect(store.binding()).toBe('unsupported');
       expect(replaced).toEqual([]);
+    });
+
+    // ── THE CSRF RECOVERY READ ITSELF FAILS OR IS OVERTAKEN (Codex review of #37) ──────
+    // The command was refused by CSRF, before any handler, and has not been retried: it
+    // did not run, whatever happens to the read. The read's own side effects belong to
+    // the read's own classification; the COMMAND is told only what is true of it.
+    const csrfRefuse = () =>
+      backend
+        .expectOne(PROTECTED)
+        .flush({ detail: 'CSRF Failed: CSRF token incorrect.' }, { status: 403, statusText: 'Forbidden' });
+
+    it('reports the command NOT RUN when its CSRF recovery read gets no usable answer — never as that answer', () => {
+      for (const failure of [
+        new HttpErrorResponse({ status: 0, statusText: 'Unknown Error', url: apiUrl(AUTH_ROUTES.session) }),
+        new HttpErrorResponse({ status: 502, statusText: 'Bad Gateway', url: apiUrl(AUTH_ROUTES.session) }),
+        new HttpErrorResponse({ status: 429, statusText: 'Too Many Requests', url: apiUrl(AUTH_ROUTES.session) }),
+      ]) {
+        auth.next = throwError(() => failure);
+        let error: unknown = null;
+        http.post(PROTECTED, {}).subscribe({ error: (e: unknown) => (error = e) });
+        csrfRefuse();
+
+        backend.expectNone(PROTECTED);
+        expect(error).withContext(String(failure.status)).toEqual(jasmine.any(CommandNotRunError));
+        expect(notRun(error).reason).toBe('continuity-unconfirmed');
+        expect(notRun(error).sent).toBeTrue();
+        expect(notRun(error).error.detail).toContain('command was not run.');
+      }
+      expect(store.isAuthenticated()).toBeTrue();
+      expect(replaced).toEqual([]);
+    });
+
+    it('reports the command NOT RUN when its recovery read is not a session — and keeps the outage report', () => {
+      auth.body = { nonsense: true };
+      let error: unknown = null;
+      http.post(PROTECTED, {}).subscribe({ error: (e: unknown) => (error = e) });
+      csrfRefuse();
+
+      backend.expectNone(PROTECTED);
+      expect(notRun(error).reason).toBe('continuity-unconfirmed');
+      expect(notRun(error).sent).toBeTrue();
+      // A 200 that is not a session is no usable answer: the same state the bootstrap
+      // and the resume check report.
+      expect(status.unavailable()).toBeTrue();
+      expect(store.isAuthenticated()).toBeTrue();
+    });
+
+    it('a recovery read OVERTAKEN by a newer one cannot cross a boundary — the command is not run', () => {
+      const late = new Subject<unknown>();
+      auth.next = late;
+      let error: unknown = null;
+      http.post(PROTECTED, {}).subscribe({ error: (e: unknown) => (error = e) });
+      csrfRefuse();
+
+      // A newer read settles first and names the held owner.
+      expect(store.adopt(SESSION_BODY)).toBe('same');
+      // The older recovery read then lands naming another session: an earlier moment.
+      late.next({ ...SESSION_BODY, command_owner: { ...OWNER, session: OTHER_SESSION } });
+      late.complete();
+
+      backend.expectNone(PROTECTED);
+      expect(notRun(error).reason).toBe('continuity-unconfirmed');
+      expect(replaced).toEqual([]);
+      expect(store.owner()?.session).toBe(OWNER.session);
+    });
+
+    it('CONTROL — a recovery read overtaken by a newer one that AGREES still retries once', () => {
+      const late = new Subject<unknown>();
+      auth.next = late;
+      let result: unknown = null;
+      http.post(PROTECTED, {}).subscribe((r) => (result = r));
+      csrfRefuse();
+
+      expect(store.adopt(SESSION_BODY)).toBe('same');
+      late.next(SESSION_BODY);
+      late.complete();
+
+      const retry = backend.expectOne(PROTECTED);
+      expect(retry.request.headers.get(COMMAND_OWNER_HEADER)).toBe(OWNER_HEADER);
+      retry.flush({ ok: true });
+      expect(result).toEqual({ ok: true });
     });
 
     it('replays after elevation under the SAME owner — and not at all once the lifecycle ended', () => {

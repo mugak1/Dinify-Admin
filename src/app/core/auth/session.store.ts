@@ -30,6 +30,9 @@ export interface ReadTicket {
  * What a session read says about the session this document holds.
  *
  *   'stale'            issued under a lifecycle that has since ended; it answers nothing.
+ *   'superseded'       issued BEFORE a read this lifecycle has already applied, and it
+ *                      disagrees with it. It describes an earlier moment: nothing is
+ *                      adopted, withdrawn, confirmed or crossed on its strength.
  *   'adopted'          the lifecycle's first session.
  *   'same'             still the owner this document holds.
  *   'unbound'          the same account, but no owner to compare. Nothing is confirmed
@@ -42,6 +45,7 @@ export interface ReadTicket {
  */
 export type Observation =
   | 'stale'
+  | 'superseded'
   | 'adopted'
   | 'same'
   | 'unbound'
@@ -178,11 +182,16 @@ export class SessionStore {
    * recovery all come through here, so they cannot disagree about what a read proves.
    *
    * A read answers for the lifecycle it was ISSUED in. Within that lifecycle the first
-   * session is adopted and its owner fixed; every later read must name the same owner.
-   * An older read never overwrites a newer one's fields (`seq`), and a read that names
-   * someone else is reported rather than adopted.
+   * session is adopted and its owner fixed; every later read must name the same owner,
+   * and a read that names someone else is reported rather than adopted.
    *
-   * A CACHED CAPABILITY IS NOT PERPETUAL PROOF. A later read that no longer publishes an
+   * AN OLDER READ NEVER OVERTURNS A NEWER ONE. Reads go out in issue order and each
+   * carries the cookie the browser held when it was SENT, so a read that settles after a
+   * newer one was applied (`seq`) describes an earlier moment. It may agree with what is
+   * held; anything else it says is `superseded` — no change is reported and no capability
+   * withdrawn on the strength of that moment. Nor does it overwrite a newer read's fields.
+   *
+   * A CACHED CAPABILITY IS NOT PERPETUAL PROOF. A NEWER read that no longer publishes an
    * owner withdraws it for the rest of the lifecycle: the server that answers now may
    * not be the one that enforced it before.
    */
@@ -195,7 +204,8 @@ export class SessionStore {
       this.install(ticket, session, reading.kind === 'owner' ? reading.owner : null);
       return 'adopted';
     }
-    if (session.username !== held.username) return 'actor-changed';
+    const superseded = ticket.seq <= this.appliedSeq;
+    if (session.username !== held.username) return superseded ? 'superseded' : 'actor-changed';
 
     const owner = this._owner();
     if (owner === null) {
@@ -205,12 +215,15 @@ export class SessionStore {
       return 'unbound';
     }
     if (reading.kind !== 'owner') {
+      if (superseded) return 'superseded';
       this._owner.set(null);
       this._binding.set('unsupported');
+      // The newest read applied, even though it withdrew rather than confirmed.
+      this.refresh(ticket, session);
       return 'unbound';
     }
     const change = compareOwners(owner, reading.owner);
-    if (change !== 'same') return change;
+    if (change !== 'same') return superseded ? 'superseded' : change;
     this.refresh(ticket, session);
     return 'same';
   }

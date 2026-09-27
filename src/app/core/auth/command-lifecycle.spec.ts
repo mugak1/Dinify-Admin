@@ -607,6 +607,48 @@ describe('D10 command lifecycle — real client over a MODELLED plane', () => {
 
   // ── THE DEFECT: A COMMAND REPLAYED UNDER A NEWLY ADOPTED PRINCIPAL ──────────────────
 
+  // ── THE CSRF RECOVERY READ ITSELF FAILS (Codex review of #37) ──────────────────────
+  describe('a CSRF refusal whose recovery read fails', () => {
+    function csrfRefusedWrite(): { write: Outcome; read: TestRequest } {
+      bootstrapAs('alice.synthetic', true);
+      plane.netCsrf = null;
+      plane.jsCsrf = null;
+      const write = issueWrite();
+      const [read] = drain(once(isRoute(AUTH_ROUTES.session), 'defer'));
+      expect(writes().length).withContext('refused by CSRF, and not yet retried').toBe(1);
+      return { write, read };
+    }
+
+    it('no usable answer: the command is NOT RUN, the outage is reported, nothing is re-sent', fakeAsync(() => {
+      const { write, read } = csrfRefusedWrite();
+      read.error(new ProgressEvent('error'), { status: 0, statusText: 'Unknown Error' });
+      drain();
+
+      expect(write.error).toEqual(jasmine.any(CommandNotRunError));
+      expect(notRun(write.error).reason).toBe('continuity-unconfirmed');
+      expect(notRun(write.error).sent).toBeTrue();
+      expect(status.unavailable()).withContext("the read's own outage report stands").toBeTrue();
+      expect(store.username()).toBe('alice.synthetic');
+      expect(writes().length).toBe(1);
+      expect(plane.executed).toEqual([]);
+      expect(replaced).toEqual([]);
+    }));
+
+    it('refused 401: the session ended, the command is NOT RUN, and sign-in follows', fakeAsync(() => {
+      const { write, read } = csrfRefusedWrite();
+      plane.signOutElsewhere();
+      plane.release(read);
+      drain();
+
+      expect(notRun(write.error).reason).toBe('session-ended');
+      expect(notRun(write.error).sent).toBeTrue();
+      expect(store.isAuthenticated()).toBeFalse();
+      expect(router.url).toContain('/login');
+      expect(writes().length).toBe(1);
+      expect(plane.executed).toEqual([]);
+    }));
+  });
+
   describe('a different principal', () => {
     it('the delayed CSRF echo no longer carries Alice’s write as Bob — refused, nothing runs, one boundary', fakeAsync(() => {
       const sA = bootstrapAs('alice.synthetic', true);
@@ -1156,6 +1198,24 @@ describe('D10 command lifecycle — real client over a MODELLED plane', () => {
         flush();
       }));
 
+      it('a cancel refused by CSRF whose recovery read gets no answer is NOT RUN — no "not known", no indeterminate re-read', fakeAsync(async () => {
+        await withVisibleClaim();
+        const detailReads = plane.detailReads;
+        plane.netCsrf = null;
+        plane.jsCsrf = null;
+        const [read] = act('Cancel invitation', once(isRoute(AUTH_ROUTES.session), 'defer'));
+        read.error(new ProgressEvent('error'), { status: 0, statusText: 'Unknown Error' });
+        drain();
+        harness.detectChanges();
+
+        expect(text()).toContain('could not confirm that its admin session is still current');
+        expect(text()).not.toContain('it is not known whether');
+        expect(plane.detailReads).withContext('no indeterminate re-read').toBe(detailReads);
+        expect(writes().length).withContext('the reissue, and this cancel sent once').toBe(2);
+        expect(plane.executed.length).withContext('only the reissue ran').toBe(1);
+        flush();
+      }));
+
       it('a clipboard write that completes after the code was hidden publishes nothing', fakeAsync(async () => {
         await withVisibleClaim();
         let resolveWrite: () => void = () => undefined;
@@ -1323,6 +1383,22 @@ describe('D10 command lifecycle — real client over a MODELLED plane', () => {
         expect(panel().textContent).toContain('reported this command as completed');
         expect(panel().textContent).not.toContain('Nothing was changed');
         expect(writes().length).toBe(1);
+        flush();
+      }));
+
+      it('a save refused by CSRF whose recovery read gets no answer is NOT RUN — never "not known"', fakeAsync(async () => {
+        bootstrapAs('alice.synthetic', true);
+        plane.netCsrf = null;
+        plane.jsCsrf = null;
+        const [read] = await saveTiming(once(isRoute(AUTH_ROUTES.session), 'defer'));
+        read.error(new ProgressEvent('error'), { status: 0, statusText: 'Unknown Error' });
+        drain();
+        harness.detectChanges();
+
+        expect(panel().textContent).toContain('could not confirm that its admin session is still current');
+        expect(panel().textContent).not.toContain('it is not known whether');
+        expect(writes().length).toBe(1);
+        expect(plane.executed).toEqual([]);
         flush();
       }));
 

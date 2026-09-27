@@ -57,11 +57,7 @@ import {
   SUPPRESS_DEFECT_REPORT,
 } from './http-context';
 import { AdminServiceStatus } from './service-status';
-import {
-  classifyTransportFailure,
-  extractRequestId,
-  IncoherentResponseError,
-} from './transport-failure';
+import { classifyTransportFailure, extractRequestId } from './transport-failure';
 
 /**
  * Statuses that are an application OUTCOME rather than a defect. The screen that made
@@ -343,22 +339,24 @@ export const errorClassifierInterceptor: HttpInterceptorFn = (req, next) => {
       const retried = request.clone({ context: request.context.set(CSRF_RETRIED, true) });
       const ticket = store.issueTicket();
       const epoch = continuity.epoch();
+      // THE COMMAND WAS REFUSED BY CSRF, BEFORE ANY HANDLER, and is not retried unless
+      // the read below proves continuity — so whatever happens to that read, this command
+      // did not run, and that is the only thing it is told. The READ is its own request,
+      // issued in this command's lifecycle and classified by its own dispatch: a 401
+      // there has already ended the lifecycle and routed to sign-in, no usable answer has
+      // already raised the outage state, and an answer for an ended lifecycle has already
+      // been discarded. None of those is this command's outcome. (With a successor held,
+      // the read reaches nobody and neither does this command.)
+      const notRun = (): CommandNotRunError =>
+        new CommandNotRunError(current(request) ? 'continuity-unconfirmed' : 'session-ended', true);
       return auth.readSession().pipe(
-        // The read is its own request, issued in this command's lifecycle and fenced by
-        // its own dispatch — so no second lifecycle check is needed here. If the
-        // lifecycle ended while it was in flight, what the COMMAND gets told is that it
-        // was not run: CSRF refused it. (With a successor held, the read reaches nobody
-        // and neither does this command.)
-        catchError((readError: unknown) =>
-          throwError(() =>
-            readError instanceof SessionEndedReadError
-              ? new CommandNotRunError('session-ended', true)
-              : readError,
-          ),
-        ),
+        catchError(() => throwError(notRun)),
         switchMap((session) => {
           if (!isAdminSessionResponse(session)) {
-            return throwError(() => new IncoherentResponseError());
+            // A 200 that is not a session is no usable answer — the state the bootstrap
+            // and the resume check report for it — and still no proof of continuity.
+            if (current(request)) status.reportUnavailable(null);
+            return throwError(notRun);
           }
           // ONE bounded retry, and only across PROVEN continuity: the read must name the
           // owner the command was issued under. The command was refused by CSRF, before
@@ -372,6 +370,10 @@ export const errorClassifierInterceptor: HttpInterceptorFn = (req, next) => {
               return throwError(() => new CommandNotRunError(observed, true));
             case 'unbound':
               return throwError(() => new CommandNotRunError('binding-unsupported', true));
+            case 'superseded':
+              // A newer read already settled: this one describes an earlier moment and
+              // proves nothing about now. Not a boundary, and not a retry.
+              return throwError(() => new CommandNotRunError('continuity-unconfirmed', true));
             default:
               return throwError(() => new CommandNotRunError('session-ended', true));
           }

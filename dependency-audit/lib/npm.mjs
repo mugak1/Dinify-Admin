@@ -41,8 +41,14 @@ export function environmentFacts() {
   return { node: process.version, platform: process.platform, arch: process.arch, libc: currentLibc() };
 }
 
-function allowed(list, value) {
+function allowed(constraint, value) {
+  // npm-install-checks reads a STRING as the one-element list it means (`libc: "musl"`,
+  // as sass-embedded writes it, is `["musl"]`), and `["any"]` as no constraint at all.
+  // Reading a string as "unconstrained" instead made a musl-only binary look installable
+  // on glibc, so its correct absence refused the whole inventory.
+  const list = typeof constraint === 'string' ? [constraint] : constraint;
   if (!Array.isArray(list) || list.length === 0) return true;
+  if (list.length === 1 && list[0] === 'any') return true;
   if (value === null) return true;
   if (list.includes(`!${value}`)) return false;
   const positive = list.filter((x) => !String(x).startsWith('!'));

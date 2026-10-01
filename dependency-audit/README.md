@@ -97,8 +97,24 @@ outranks every npmrc, so the invocation and the check cannot disagree.
 
 ## Exceptions and triage records
 
-`policy.json → records` is empty, and **nothing in this change approves anything.** A record
-is refused — and the audit is `blocking` — unless it names the advisory (and aliases),
+**Three records are approved (2026-10-01), and all three are exceptions on the SCANNER
+graph**: the `undici` 6.28.0 (GHSA-rfgv-xxqx-mfg5) and `brace-expansion` 5.0.9
+(GHSA-qhr7-859c-m2p7, GHSA-6j4f-fj2g-mc7p) that npm 11.19.1 BUNDLES. They are the same
+three Dinify-Frontend approved on 2026-09-30, because both repositories pin the same
+scanner. No npm release (11.19.1, 11.20.0, 11.21.0, 12.1.0, 12.2.0) bundles a fixed copy of
+either, and a bundled dependency cannot be replaced through the scanner lockfile or
+`overrides`, so without them every `validate` run was blocked. Each record's
+`applicability` states why the scanner cannot reach the vulnerable code with outside
+input, and each expires on 2026-10-31. **They come out in the same change that moves the
+scanner pin to an npm release bundling fixed copies**: from then on they match nothing, and
+the audit refuses a stale record rather than ignoring it. No application-graph finding is
+excepted, and nothing is triaged. The application-graph advisories that arrived with them
+(`@angular/router` GHSA-ff3f-86qr-9cv3, `brace-expansion`, `engine.io` GHSA-2gc4-cqfq-p2gv,
+`undici` GHSA-rfgv-xxqx-mfg5 and GHSA-w293-vg96-wgc3) were fixed in the lock instead:
+Angular 21.2.24 (whose `@angular/build` pins `undici` 7.29.1) and in-range updates, with no
+release under a day old.
+
+A record is refused — and the audit is `blocking` — unless it names the advisory (and aliases),
 the exact package, the exact version, the exact graph paths and the scope; carries
 applicability evidence and a reason; names an owner; links the mugak1 pull request or issue
 that approved it, with who and when; and expires within 90 days of that approval. Wildcards,

@@ -95,6 +95,24 @@ describe('the inventory: the lock graph the scanner reads, proved to be the tree
     assert.equal(why24.has('node_modules/lzma-gnu'), false, 'on a Node that satisfies its engines, its absence is NOT explained');
   });
 
+  it('REGRESSION: a platform constraint written as a STRING is the one-element list npm reads it as', () => {
+    // sass-embedded 1.104 writes `libc: "musl"` where every other binding writes `["musl"]`.
+    const packages = {
+      '': { dependencies: { 'sass-embedded': '1' } },
+      'node_modules/sass-embedded': { version: '1.0.0', dev: true, optionalDependencies: { 'bin-musl': '1', 'bin-glibc': '1', 'bin-any': '1', 'bin-darwin': '1' } },
+      'node_modules/bin-musl': { version: '1.0.0', dev: true, optional: true, os: ['linux'], cpu: ['x64'], libc: 'musl' },
+      'node_modules/bin-glibc': { version: '1.0.0', dev: true, optional: true, os: ['linux'], cpu: ['x64'], libc: 'glibc' },
+      'node_modules/bin-any': { version: '1.0.0', dev: true, optional: true, os: ['any'], cpu: 'x64' },
+      'node_modules/bin-darwin': { version: '1.0.0', dev: true, optional: true, os: 'darwin', cpu: 'arm64' },
+    };
+    const why = explainAbsences(packages, new Map([['node_modules/sass-embedded', '1.0.0']]), LINUX);
+    assert.equal(why.get('node_modules/bin-musl'), 'platform', 'a musl-only string libc is excluded on glibc');
+    assert.equal(why.get('node_modules/bin-darwin'), 'platform', 'string os and cpu are read the same way');
+    // CONTROLS: a constraint this machine satisfies never explains an absence.
+    assert.equal(why.has('node_modules/bin-glibc'), false, 'a string libc this machine satisfies is not an excuse');
+    assert.equal(why.has('node_modules/bin-any'), false, '"any" is no constraint, so its absence stays a problem');
+  });
+
   it('CONTRACT: lock-path resolution walks up the tree as Node does', () => {
     const packages = { 'node_modules/a': {}, 'node_modules/b': {}, 'node_modules/a/node_modules/b': {}, 'node_modules/@s/c': {} };
     assert.equal(resolveEdge(packages, 'node_modules/a', 'b'), 'node_modules/a/node_modules/b');

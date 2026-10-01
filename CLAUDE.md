@@ -2256,8 +2256,15 @@ a successful CI push to main, or on `workflow_dispatch`.
   container npm never writes (a list or `null` where the name map belongs) are INCOMPLETE,
   exit 2 — never zero findings. Reason codes and the pinned-scanner contract are in the
   README; the shared tests pin a captured real report from each npm repo as the control.
-- **Nothing is pre-approved.** `policy.json → records` is empty; an exception or triage
-  record must name the exact advisory/package/version/paths/scope, carry evidence, an
+- **Three exceptions are approved (2026-10-01, expiring 2026-10-31), all on the SCANNER
+  graph**: npm 11.19.1's BUNDLED `undici` 6.28.0 (GHSA-rfgv-xxqx-mfg5) and
+  `brace-expansion` 5.0.9 (GHSA-qhr7-859c-m2p7, GHSA-6j4f-fj2g-mc7p), the same three
+  Frontend approved. No npm release bundles fixed copies and a bundled dependency cannot
+  be reached by the lockfile or `overrides`. Remove them in the same change that bumps
+  the scanner to an npm release that does (a record matching nothing is refused as
+  stale); a CONTRACT test in `dependency-audit/tests/audit.test.mjs` pins the set by id.
+  Nothing else is pre-approved, and no application-graph finding is excepted. Any other
+  exception or triage record must name the exact advisory/package/version/paths/scope, carry evidence, an
   owner, a linked mugak1 review and an expiry ≤ 90 days, and is refused otherwise.
 - **The raw evidence is retained** as the artifact `dependency-audit-<run>-<attempt>`,
   pass or fail.

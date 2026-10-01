@@ -13,6 +13,7 @@ import { join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { audit, reevaluate, renderSummary, snapshot } from '../lib/audit.mjs';
+import { parseDate, validateRecord } from '../lib/core.mjs';
 import {
   auditedProject, CLEAN, CLEAN_SCANNER, cannedRunner, fakeInstall, HIGH_RUNTIME_MISSING_CAUSE, makeProject, npmReport, NOW, SUPPORTED_CHAIN, UNGROUNDED_CYCLE, via,
 } from './project.mjs';
@@ -355,7 +356,20 @@ describe('the committed policy of THIS repository', () => {
     assert.match(lock.packages['node_modules/npm'].integrity, /^sha512-/);
   });
 
-  it('CONTRACT: no exception or triage record is pre-approved by this change', () => {
-    assert.deepEqual(policy.records, []);
+  // The approved set is pinned by id, so a record can only join it through a reviewed change
+  // to this test as well as to the policy. Each one is checked AS OF ITS APPROVAL DATE: whether
+  // it is still in date, still matches a finding and still covers exactly its paths is the
+  // audit's own decision on every run, and an expired or stale record fails CI there.
+  it('CONTRACT: the only approved records are the scanner-bundled undici and brace-expansion exceptions, each well-formed as approved', () => {
+    assert.deepEqual(policy.records.map((r) => r.id), [
+      'scanner-undici-GHSA-rfgv-xxqx-mfg5',
+      'scanner-brace-expansion-GHSA-qhr7-859c-m2p7',
+      'scanner-brace-expansion-GHSA-6j4f-fj2g-mc7p',
+    ]);
+    for (const record of policy.records) {
+      assert.deepEqual(validateRecord(record, parseDate(record.approval.date)), [], record.id);
+      assert.equal(record.kind, 'exception', record.id);
+      assert.ok(record.paths.every((p) => p.startsWith('scanner:')), `${record.id} excepts the scanner graph only`);
+    }
   });
 });

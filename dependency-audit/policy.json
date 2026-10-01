@@ -12,5 +12,75 @@
     "registry": "https://registry.npmjs.org/",
     "timeoutSeconds": 300
   },
-  "records": []
+  "records": [
+    {
+      "id": "scanner-undici-GHSA-rfgv-xxqx-mfg5",
+      "kind": "exception",
+      "advisory": "GHSA-rfgv-xxqx-mfg5",
+      "aliases": [
+        "npm:1240042"
+      ],
+      "package": "undici",
+      "version": "6.28.0",
+      "paths": [
+        "scanner:node_modules/npm/node_modules/undici"
+      ],
+      "scope": "tooling",
+      "applicability": "The only affected copy is the undici 6.28.0 that npm 11.19.1 BUNDLES inside the pinned audit scanner (dependency-audit/scanner); the application graph carries fixed versions (7.29.1, and 6.29.0 under node-gyp). Inside npm 11.19.1 the only module that requires undici is node-gyp/lib/download.js (Agent, EnvHttpProxyAgent, RetryAgent, fetch), which downloads Node headers for native builds. The scanner only runs `npm audit --json`, is installed with scripts disabled, and never invokes node-gyp. The advisory is a denial of service in undici's WebSocket client when a server answers with an unrequested subprotocol; npm opens no WebSocket connection. The scanner never ships to users and never runs in the browser app.",
+      "reason": "No npm release bundles a fixed undici (>=6.28.1): 11.19.1, 11.20.0, 11.21.0, 12.1.0 and 12.2.0 all ship 6.28.0, and a bundled dependency cannot be replaced through the scanner lockfile or overrides (Dependabot's scanner updates fail for that reason). Without this exception every validate and certify run is blocked on a code path the scanner never executes. Remove this record in the same change that moves the scanner pin to an npm release bundling undici >=6.28.1; from then on the record matches nothing and the audit refuses it as stale.",
+      "owner": "mugak1",
+      "approval": {
+        "by": "mugak1",
+        "reference": "https://github.com/mugak1/Dinify-Admin/pull/40",
+        "date": "2026-10-01"
+      },
+      "expires": "2026-10-31"
+    },
+    {
+      "id": "scanner-brace-expansion-GHSA-qhr7-859c-m2p7",
+      "kind": "exception",
+      "advisory": "GHSA-qhr7-859c-m2p7",
+      "aliases": [
+        "npm:1240107"
+      ],
+      "package": "brace-expansion",
+      "version": "5.0.9",
+      "paths": [
+        "scanner:node_modules/npm/node_modules/brace-expansion"
+      ],
+      "scope": "tooling",
+      "applicability": "The only affected copy is the brace-expansion 5.0.9 that npm 11.19.1 BUNDLES inside the pinned audit scanner (dependency-audit/scanner); every application copy is at a fixed version (1.1.21, 5.0.12). Inside npm its only dependent is minimatch, and every pattern npm can expand while running `npm audit --json` comes from the audited project's own package.json and npm configuration or from the manifests of lockfile-pinned, integrity-checked packages already installed. None comes from the registry's audit response or from any user of the app, and `npm audit signatures` (the only path that reads TUF metadata through @tufjs/models) is not run. The scanner runs only in CI and never ships. A denial of service there hangs or crashes the scan, which the audit records as incomplete (exit 2, bounded by the 300-second scanner timeout) and fails the required check: it fails closed and can never produce a pass.",
+      "reason": "No npm release bundles a fixed brace-expansion for GHSA-qhr7-859c-m2p7: 11.19.1, 11.20.0, 11.21.0, 12.1.0 and 12.2.0 all ship 5.0.9, and a bundled dependency cannot be replaced through the scanner lockfile or overrides. Without this exception every validate and certify run is blocked on a scanner-internal DoS that cannot turn into a passing audit. Remove this record in the same change that moves the scanner pin to an npm release bundling a fixed brace-expansion; from then on the record matches nothing and the audit refuses it as stale.",
+      "owner": "mugak1",
+      "approval": {
+        "by": "mugak1",
+        "reference": "https://github.com/mugak1/Dinify-Admin/pull/40",
+        "date": "2026-10-01"
+      },
+      "expires": "2026-10-31"
+    },
+    {
+      "id": "scanner-brace-expansion-GHSA-6j4f-fj2g-mc7p",
+      "kind": "exception",
+      "advisory": "GHSA-6j4f-fj2g-mc7p",
+      "aliases": [
+        "npm:1240111"
+      ],
+      "package": "brace-expansion",
+      "version": "5.0.9",
+      "paths": [
+        "scanner:node_modules/npm/node_modules/brace-expansion"
+      ],
+      "scope": "tooling",
+      "applicability": "The only affected copy is the brace-expansion 5.0.9 that npm 11.19.1 BUNDLES inside the pinned audit scanner (dependency-audit/scanner); every application copy is at a fixed version (1.1.21, 5.0.12). Inside npm its only dependent is minimatch, and every pattern npm can expand while running `npm audit --json` comes from the audited project's own package.json and npm configuration or from the manifests of lockfile-pinned, integrity-checked packages already installed. None comes from the registry's audit response or from any user of the app, and `npm audit signatures` (the only path that reads TUF metadata through @tufjs/models) is not run. The scanner runs only in CI and never ships. A denial of service there hangs or crashes the scan, which the audit records as incomplete (exit 2, bounded by the 300-second scanner timeout) and fails the required check: it fails closed and can never produce a pass.",
+      "reason": "No npm release bundles a fixed brace-expansion for GHSA-6j4f-fj2g-mc7p: 11.19.1, 11.20.0, 11.21.0, 12.1.0 and 12.2.0 all ship 5.0.9, and a bundled dependency cannot be replaced through the scanner lockfile or overrides. Without this exception every validate and certify run is blocked on a scanner-internal DoS that cannot turn into a passing audit. Remove this record in the same change that moves the scanner pin to an npm release bundling a fixed brace-expansion; from then on the record matches nothing and the audit refuses it as stale.",
+      "owner": "mugak1",
+      "approval": {
+        "by": "mugak1",
+        "reference": "https://github.com/mugak1/Dinify-Admin/pull/40",
+        "date": "2026-10-01"
+      },
+      "expires": "2026-10-31"
+    }
+  ]
 }

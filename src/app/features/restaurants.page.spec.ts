@@ -17,7 +17,8 @@ import {
   RestaurantDirectoryPage,
   RestaurantRow,
 } from '../core/restaurants/restaurant.model';
-import { RestaurantsPage, SEARCH_DEBOUNCE_MS } from './restaurants.page';
+import { lifecycleLabel } from '../core/restaurants/restaurant.labels';
+import { LIFECYCLE_FILTERS, RestaurantsPage, SEARCH_DEBOUNCE_MS } from './restaurants.page';
 
 /** Not an `HttpErrorResponse`: everything must classify by duck-typing. */
 class WireError extends Error {
@@ -657,6 +658,100 @@ describe('RestaurantsPage', () => {
     expect(api.queries.at(-1)?.search).toBe('nile');
     const input = el().querySelector<HTMLInputElement>('#restaurant-search');
     expect(input?.value).withContext('the box shows what the URL says').toBe('nile');
+  }));
+
+  // --- the lifecycle control shows what the URL says ------------------------------
+  //
+  // The URL decides the filter, so the control must read back the same value on a
+  // DIRECT load — a pasted link, a bookmark, or the return from sign-in. Binding
+  // `[value]` on the <select> did not: it was applied before the @for had rendered
+  // the options, matched nothing, and the browser fell back to the first option. So
+  // `?status=live` filtered the rows to live restaurants under a control reading
+  // "All". These specs read the DOM, never the signal, because the signal was right
+  // all along and the screen was not.
+
+  /** The `<select>` and the option it is actually showing. */
+  function lifecycleControl(): { value: string; shown: string } {
+    const select = el().querySelector<HTMLSelectElement>('#status-filter')!;
+    return { value: select.value, shown: select.selectedOptions[0]?.textContent?.trim() ?? '' };
+  }
+
+  // Every state, so the first and last options cannot pass by sitting next to "All".
+  for (const state of LIFECYCLE_FILTERS) {
+    it(`REGRESSION: a direct load of ?status=${state} shows ${lifecycleLabel(state)}, not All`, fakeAsync(async () => {
+      await open(`/restaurants?status=${state}`);
+      settle();
+      flush();
+
+      expect(api.queries.at(-1)?.status).withContext('the filter was applied').toBe(state);
+      expect(lifecycleControl()).toEqual({ value: state, shown: lifecycleLabel(state) });
+    }));
+  }
+
+  it('CONTROL: with no status in the URL the control shows All', fakeAsync(async () => {
+    await open();
+    settle();
+    flush();
+
+    expect(lifecycleControl()).toEqual({ value: '', shown: 'All' });
+  }));
+
+  it('CONTROL: a status the vocabulary does not know fails soft to All', fakeAsync(async () => {
+    await open('/restaurants?status=bogus');
+    settle();
+    flush();
+
+    expect(api.queries.at(-1)?.status).toBeNull();
+    expect(lifecycleControl()).toEqual({ value: '', shown: 'All' });
+  }));
+
+  it('follows a URL change it did not make, both ways', fakeAsync(async () => {
+    await open('/restaurants?status=live');
+    settle();
+    flush();
+
+    // Back/forward or a link elsewhere changes the URL without touching the select.
+    await TestBed.inject(Router).navigateByUrl('/restaurants?status=suspended');
+    settle();
+    flush();
+    expect(lifecycleControl()).toEqual({ value: 'suspended', shown: 'Suspended' });
+
+    await TestBed.inject(Router).navigateByUrl('/restaurants');
+    settle();
+    flush();
+    expect(lifecycleControl()).toEqual({ value: '', shown: 'All' });
+  }));
+
+  it('shows All again after Clear filters on a directly loaded status', fakeAsync(async () => {
+    await open('/restaurants?status=offboarded');
+    settle();
+    flush();
+
+    Array.from(el().querySelectorAll<HTMLButtonElement>('button'))
+      .find((button) => button.textContent?.trim() === 'Clear filters')!
+      .click();
+    tick();
+    settle();
+    flush();
+
+    expect(TestBed.inject(Router).url).toBe('/restaurants');
+    expect(lifecycleControl()).toEqual({ value: '', shown: 'All' });
+  }));
+
+  it('a pick in the control survives the URL write it causes', fakeAsync(async () => {
+    await open('/restaurants?status=live');
+    settle();
+    flush();
+
+    const select = el().querySelector<HTMLSelectElement>('#status-filter')!;
+    select.value = 'onboarding';
+    select.dispatchEvent(new Event('change'));
+    tick();
+    settle();
+    flush();
+
+    expect(TestBed.inject(Router).url).toContain('status=onboarding');
+    expect(lifecycleControl()).toEqual({ value: 'onboarding', shown: 'Onboarding' });
   }));
 
   it('round-trips the lifecycle filter into the URL', fakeAsync(async () => {

@@ -81,6 +81,75 @@
         "date": "2026-10-01"
       },
       "expires": "2026-10-31"
+    },
+    {
+      "id": "application-braces-GHSA-vfj7-8cjw-p6xm",
+      "kind": "exception",
+      "advisory": "GHSA-vfj7-8cjw-p6xm",
+      "aliases": [
+        "npm:1240992"
+      ],
+      "package": "braces",
+      "version": "3.0.3",
+      "paths": [
+        "application:node_modules/braces"
+      ],
+      "scope": "tooling",
+      "applicability": "braces 3.0.3 is in the Admin application graph only through development tooling: karma 6.4.4 (direct), chokidar 3.6.0 (via karma and tailwindcss 3.4.19) and micromatch 4.0.8 (via tailwindcss and fast-glob 3.3.3). It is not in the production bundle. Measured with load and call probes in a disposable copy of 89d2cf1 (2026-10-07), whose braces dependents this change does not move: during `npm run build:prod` and `npm run test:ci` braces parsed one pattern, the repository-authored Tailwind content pattern './src/**/*.{html,ts}' in tailwind.config.js; `npm run lint` and `ng version` did not load it. No application-request or browser-runtime input path to it was identified. Watch-mode and operator- or filesystem-derived inputs (ng serve, Karma watch mode) were not exercised. This exception accepts residual tooling denial-of-service risk; it does not establish that every invocation is unreachable.",
+      "reason": "As of 2026-10-07 the reviewed package and version investigation found no supported, compatible fixed route: braces 3.0.3 is the latest published release and inside the advisory's affected range, the advisory lists no patched version, and the latest releases of its dependents (karma 6.4.4, micromatch 4.0.8, and chokidar 3.6.0 as required by tailwindcss 3.4.19) still require braces 3.x. Removing it means replacing the Karma test runner and migrating Tailwind 3 to 4, which is not a dependency fix. Without a disposition the current measured application graph is blocking. The accepted residual risk is a denial of service in development and CI tooling. Remove this record in the same change that fixes or removes the affected braces in the application graph; from then on it matches nothing and the audit refuses it as stale. It expires at 00:00 UTC on 2026-10-31 and is not extended automatically.",
+      "owner": "mugak1",
+      "approval": {
+        "by": "mugak1",
+        "reference": "https://github.com/mugak1/Dinify-Admin/pull/42",
+        "date": "2026-10-07"
+      },
+      "expires": "2026-10-31"
+    },
+    {
+      "id": "application-http-cache-semantics-GHSA-ch52-4w7c-c8xp",
+      "kind": "exception",
+      "advisory": "GHSA-ch52-4w7c-c8xp",
+      "aliases": [
+        "npm:1240991"
+      ],
+      "package": "http-cache-semantics",
+      "version": "4.2.0",
+      "paths": [
+        "application:node_modules/http-cache-semantics"
+      ],
+      "scope": "tooling",
+      "applicability": "http-cache-semantics 4.2.0 is in the Admin application graph only through development tooling: @angular/cli 21.2.26 -> pacote 21.5.1 -> make-fetch-happen 15.0.6 (via npm-registry-fetch, @sigstore/sign and tuf-js). It is not in the production bundle. make-fetch-happen is its only requirer, and that traced consumer constructs every CachePolicy from a module-local `{ shared: false, ignoreCargoCult: true }` (lib/cache/policy.js); the advisory's mechanism needs a shared cache. In the measured runs (load probes, 2026-10-07: build:prod, test:ci, lint and ng version on a disposable copy of 89d2cf1, and build:prod on this change's dependency set) http-cache-semantics, make-fetch-happen and pacote were not loaded. Additional package-operation consumers (pacote under @angular/cli package operations such as ng add and ng update) were source-traced but not exercised. This does not cover a consumer that constructs a shared cache.",
+      "reason": "As of 2026-10-07 no fixed release exists: the advisory (last updated 2026-10-02) lists no patched version. http-cache-semantics 4.3.0 (published 2026-10-04) falls outside the scanner's recorded affected range but leaves the vulnerable max-stale evaluation and shared Set-Cookie handling byte-identical, and a behavioural probe gives the same result on both versions; it is not a fix and is deliberately not installed. Without a disposition the current measured application graph is blocking. The accepted residual risk is that a tooling consumer that was traced but not exercised behaves differently from the measured runs. Remove this record in the same change that installs a release that fixes the mechanism or removes the package from the application graph; from then on it matches nothing and the audit refuses it as stale. It expires at 00:00 UTC on 2026-10-31 and is not extended automatically.",
+      "owner": "mugak1",
+      "approval": {
+        "by": "mugak1",
+        "reference": "https://github.com/mugak1/Dinify-Admin/pull/42",
+        "date": "2026-10-07"
+      },
+      "expires": "2026-10-31"
+    },
+    {
+      "id": "scanner-http-cache-semantics-GHSA-ch52-4w7c-c8xp",
+      "kind": "exception",
+      "advisory": "GHSA-ch52-4w7c-c8xp",
+      "aliases": [
+        "npm:1240991"
+      ],
+      "package": "http-cache-semantics",
+      "version": "4.2.0",
+      "paths": [
+        "scanner:node_modules/npm/node_modules/http-cache-semantics"
+      ],
+      "scope": "tooling",
+      "applicability": "The pinned audit scanner, npm 11.19.1, BUNDLES http-cache-semantics 4.2.0 (inBundle) through make-fetch-happen, whose lib/cache/policy.js is byte-identical to the application copy. A probe of a real `npm audit --json` run of the scanner over this repository (2026-10-07; invoked directly, not through the collector's environment scrub) measured about 100 CachePolicy constructions: every one a GET for a registry packument, every one shared:false, none with a max-stale request directive; the bulk advisory request is a POST. The scanner runs in CI, in the deploy's assessment job and in local invocations (npm run audit:deps, scripts/verify.sh); it never ships in the application. Not established: that npm user or global configuration cannot change what the scanner does, that every invocation is free of credentials, or that the scanner's cache is separate from other npm caches. This exception therefore does not claim that any possible disclosure is confined to a safe scanner cache.",
+      "reason": "As of 2026-10-07 no supported fixed route exists: the advisory lists no patched version, no npm release has been published since 2026-09-30, and a bundled dependency cannot be replaced through the scanner lockfile or overrides (http-cache-semantics 4.3.0 is not a fix; see the application record). Without a disposition the current measured scanner graph is blocking. The accepted residual risk is disclosure or staleness through the scanner's npm cache and configuration, within the limits stated in the applicability. Remove this record in the same change that moves the scanner pin to an npm release bundling a copy that fixes the mechanism; that change must also remove any other scanner exception that no longer matches. It expires at 00:00 UTC on 2026-10-31 and is not extended automatically.",
+      "owner": "mugak1",
+      "approval": {
+        "by": "mugak1",
+        "reference": "https://github.com/mugak1/Dinify-Admin/pull/42",
+        "date": "2026-10-07"
+      },
+      "expires": "2026-10-31"
     }
   ]
 }

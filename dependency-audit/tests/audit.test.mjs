@@ -13,7 +13,7 @@ import { join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { audit, reevaluate, renderSummary, snapshot } from '../lib/audit.mjs';
-import { parseDate, validateRecord } from '../lib/core.mjs';
+import { evaluate, parseDate, validateRecord } from '../lib/core.mjs';
 import {
   auditedProject, CLEAN, CLEAN_SCANNER, cannedRunner, fakeInstall, HIGH_RUNTIME_MISSING_CAUSE, makeProject, npmReport, NOW, SUPPORTED_CHAIN, UNGROUNDED_CYCLE, via,
 } from './project.mjs';
@@ -356,20 +356,196 @@ describe('the committed policy of THIS repository', () => {
     assert.match(lock.packages['node_modules/npm'].integrity, /^sha512-/);
   });
 
-  // The approved set is pinned by id, so a record can only join it through a reviewed change
-  // to this test as well as to the policy. Each one is checked AS OF ITS APPROVAL DATE: whether
-  // it is still in date, still matches a finding and still covers exactly its paths is the
-  // audit's own decision on every run, and an expired or stale record fails CI there.
-  it('CONTRACT: the only approved records are the scanner-bundled undici and brace-expansion exceptions, each well-formed as approved', () => {
-    assert.deepEqual(policy.records.map((r) => r.id), [
-      'scanner-undici-GHSA-rfgv-xxqx-mfg5',
-      'scanner-brace-expansion-GHSA-qhr7-859c-m2p7',
-      'scanner-brace-expansion-GHSA-6j4f-fj2g-mc7p',
-    ]);
+  // The approved set is pinned by id AND by graph, so a record can only join it, or move to
+  // another graph, through a reviewed change to this test as well as to the policy. Each one is
+  // checked AS OF ITS APPROVAL DATE: whether it is still in date, still matches a finding and
+  // still covers exactly its paths is the audit's own decision on every run, and an expired or
+  // stale record fails CI there. Every approved record is a TOOLING exception: excepting a
+  // runtime finding is a different decision and has to change this test to be made.
+  const GRAPH = {
+    'scanner-undici-GHSA-rfgv-xxqx-mfg5': 'scanner',
+    'scanner-brace-expansion-GHSA-qhr7-859c-m2p7': 'scanner',
+    'scanner-brace-expansion-GHSA-6j4f-fj2g-mc7p': 'scanner',
+    'application-braces-GHSA-vfj7-8cjw-p6xm': 'application',
+    'application-http-cache-semantics-GHSA-ch52-4w7c-c8xp': 'application',
+    'scanner-http-cache-semantics-GHSA-ch52-4w7c-c8xp': 'scanner',
+  };
+  it('CONTRACT: the only approved records are the three 2026-10-01 scanner exceptions and the three 2026-10-07 tooling exceptions, each pinned to its graph and well-formed as approved', () => {
+    assert.deepEqual(policy.records.map((r) => r.id), Object.keys(GRAPH));
     for (const record of policy.records) {
       assert.deepEqual(validateRecord(record, parseDate(record.approval.date)), [], record.id);
       assert.equal(record.kind, 'exception', record.id);
-      assert.ok(record.paths.every((p) => p.startsWith('scanner:')), `${record.id} excepts the scanner graph only`);
+      assert.equal(record.scope, 'tooling', `${record.id} excepts tooling only`);
+      assert.equal(record.paths.length, 1, `${record.id} excepts exactly one path`);
+      assert.ok(record.paths.every((p) => p.startsWith(`${GRAPH[record.id]}:`)), `${record.id} excepts the ${GRAPH[record.id]} graph only`);
     }
+  });
+
+  // Who approved each record, where, and until when. The 2026-10-01 records are retained as
+  // they were approved; the 2026-10-07 records are the owner's separate Admin approval and
+  // are not derived from any Frontend record. Neither set is renewed automatically.
+  it('CONTRACT: the provenance and expiry of every approved record', () => {
+    const PROVENANCE = {
+      'scanner-undici-GHSA-rfgv-xxqx-mfg5': ['https://github.com/mugak1/Dinify-Admin/pull/40', '2026-10-01'],
+      'scanner-brace-expansion-GHSA-qhr7-859c-m2p7': ['https://github.com/mugak1/Dinify-Admin/pull/40', '2026-10-01'],
+      'scanner-brace-expansion-GHSA-6j4f-fj2g-mc7p': ['https://github.com/mugak1/Dinify-Admin/pull/40', '2026-10-01'],
+      'application-braces-GHSA-vfj7-8cjw-p6xm': ['https://github.com/mugak1/Dinify-Admin/pull/42', '2026-10-07'],
+      'application-http-cache-semantics-GHSA-ch52-4w7c-c8xp': ['https://github.com/mugak1/Dinify-Admin/pull/42', '2026-10-07'],
+      'scanner-http-cache-semantics-GHSA-ch52-4w7c-c8xp': ['https://github.com/mugak1/Dinify-Admin/pull/42', '2026-10-07'],
+    };
+    assert.deepEqual(Object.keys(PROVENANCE), Object.keys(GRAPH));
+    for (const record of policy.records) {
+      const [reference, date] = PROVENANCE[record.id];
+      assert.deepEqual(record.approval, { by: 'mugak1', reference, date }, record.id);
+      assert.equal(record.owner, 'mugak1', record.id);
+      assert.equal(record.expires, '2026-10-31', record.id);
+    }
+  });
+
+  // Every approved record driven through the real evaluator with findings shaped exactly as
+  // the pinned scanner reports them. These pin what the committed records DO cover and what
+  // they must keep refusing; the generic rules themselves are pinned by the conformance
+  // vectors and the core suite.
+  describe('the approved exceptions against their exact subjects', () => {
+    const BRACES = 'application-braces-GHSA-vfj7-8cjw-p6xm';
+    const APP_HCS = 'application-http-cache-semantics-GHSA-ch52-4w7c-c8xp';
+    const SCANNER_HCS = 'scanner-http-cache-semantics-GHSA-ch52-4w7c-c8xp';
+    const NEW = [BRACES, APP_HCS, SCANNER_HCS];
+    const IN_DATE = '2026-10-30T23:59:59Z';
+    const finding = (advisory, alias, pkg, version, path, severity = 'high', scope = 'tooling') => ({ advisory, aliases: [alias], package: pkg, version, path, scope, severity });
+    const SUBJECTS = {
+      'scanner-undici-GHSA-rfgv-xxqx-mfg5': finding('GHSA-rfgv-xxqx-mfg5', 'npm:1240042', 'undici', '6.28.0', 'scanner:node_modules/npm/node_modules/undici'),
+      'scanner-brace-expansion-GHSA-qhr7-859c-m2p7': finding('GHSA-qhr7-859c-m2p7', 'npm:1240107', 'brace-expansion', '5.0.9', 'scanner:node_modules/npm/node_modules/brace-expansion'),
+      'scanner-brace-expansion-GHSA-6j4f-fj2g-mc7p': finding('GHSA-6j4f-fj2g-mc7p', 'npm:1240111', 'brace-expansion', '5.0.9', 'scanner:node_modules/npm/node_modules/brace-expansion'),
+      [BRACES]: finding('GHSA-vfj7-8cjw-p6xm', 'npm:1240992', 'braces', '3.0.3', 'application:node_modules/braces'),
+      [APP_HCS]: finding('GHSA-ch52-4w7c-c8xp', 'npm:1240991', 'http-cache-semantics', '4.2.0', 'application:node_modules/http-cache-semantics'),
+      [SCANNER_HCS]: finding('GHSA-ch52-4w7c-c8xp', 'npm:1240991', 'http-cache-semantics', '4.2.0', 'scanner:node_modules/npm/node_modules/http-cache-semantics'),
+    };
+    const subjects = () => Object.values(SUBJECTS).map((f) => ({ ...f, aliases: [...f.aliases] }));
+    // Two records share an advisory, so a subject is replaced by its PATH, never by advisory alone.
+    const replace = (id, change) => subjects().map((f) => (f.path === SUBJECTS[id].path && f.advisory === SUBJECTS[id].advisory ? { ...f, ...change } : f));
+    const without = (...ids) => policy.records.filter((r) => !ids.includes(r.id));
+    const decide = (findings, { now = IN_DATE, records = policy.records, incomplete = [] } = {}) => evaluate({ incomplete, findings, records, now });
+    const status = (result, id) => result.records.find((r) => r.id === id);
+    const at = (result, path, advisory) => result.findings.find((x) => x.path === path && x.advisory === advisory);
+
+    it('CONTROL: each record excepts exactly its own subject, and the result says it passes only with exceptions', () => {
+      const r = decide(subjects());
+      assert.equal(r.outcome, 'exceptions_only', JSON.stringify(r.reasons));
+      assert.equal(r.exitCode, 0);
+      assert.equal(r.counts.excepted, 6);
+      assert.equal(r.counts.blocking, 0);
+      assert.equal(r.counts.refusedRecords, 0);
+      for (const [id, f] of Object.entries(SUBJECTS)) {
+        assert.equal(at(r, f.path, f.advisory).coveredBy, id);
+        assert.equal(status(r, id).covers, 1, id);
+      }
+    });
+
+    it('CONTRACT: the application and scanner http-cache-semantics records do not cover each other', () => {
+      for (const [kept, removed] of [[APP_HCS, SCANNER_HCS], [SCANNER_HCS, APP_HCS]]) {
+        const r = decide(subjects(), { records: without(removed) });
+        assert.equal(r.outcome, 'blocking', `without ${removed}`);
+        assert.equal(status(r, kept).status, 'applied', `${kept} still covers its own subject`);
+        const open = at(r, SUBJECTS[removed].path, SUBJECTS[removed].advisory);
+        assert.equal(open.disposition, 'open', `${removed}'s subject stays open`);
+        assert.equal(open.coveredBy, null);
+      }
+      // Each record's subject alone, the other subject absent: the record that lost its subject
+      // is refused rather than borrowing the other graph's finding.
+      for (const [present, absent] of [[APP_HCS, SCANNER_HCS], [SCANNER_HCS, APP_HCS]]) {
+        const r = decide(subjects().filter((f) => f.path !== SUBJECTS[absent].path));
+        assert.equal(r.outcome, 'blocking', `only ${present}'s subject`);
+        assert.equal(status(r, present).status, 'applied', present);
+        assert.equal(status(r, absent).status, 'refused', absent);
+        assert.ok(status(r, absent).problems.some((p) => p.includes(`path ${SUBJECTS[absent].path} matches no current finding`)), absent);
+      }
+    });
+
+    it('CONTRACT: http-cache-semantics 4.3.0 is matched by neither 4.2.0 record', () => {
+      for (const id of [APP_HCS, SCANNER_HCS]) {
+        const r = decide(replace(id, { version: '4.3.0' }));
+        assert.equal(r.outcome, 'blocking', id);
+        assert.equal(status(r, id).status, 'refused', id);
+        assert.ok(status(r, id).problems.some((p) => p.includes('version 4.2.0 does not match 4.3.0')), id);
+        assert.equal(at(r, SUBJECTS[id].path, SUBJECTS[id].advisory).disposition, 'open', id);
+      }
+      // Both copies at 4.3.0: neither record covers either one.
+      const both = subjects().map((f) => (f.package === 'http-cache-semantics' ? { ...f, version: '4.3.0' } : f));
+      const r = decide(both);
+      assert.equal(r.outcome, 'blocking');
+      assert.equal(r.counts.blocking, 2);
+      for (const id of [APP_HCS, SCANNER_HCS]) assert.equal(status(r, id).status, 'refused', id);
+    });
+
+    it('CONTRACT: a braces finding in the scanner graph is not covered by the application braces record', () => {
+      const scannerBraces = finding('GHSA-vfj7-8cjw-p6xm', 'npm:1240992', 'braces', '3.0.3', 'scanner:node_modules/npm/node_modules/braces');
+      const r = decide([...subjects(), scannerBraces]);
+      assert.equal(r.outcome, 'blocking');
+      const open = at(r, scannerBraces.path, scannerBraces.advisory);
+      assert.equal(open.disposition, 'open');
+      assert.equal(open.coveredBy, null);
+      assert.equal(status(r, BRACES).status, 'applied', 'the record still covers its own subject');
+      // Moved, not added: the application subject gone and only the scanner copy reported.
+      const moved = decide([...subjects().filter((f) => f.path !== SUBJECTS[BRACES].path), scannerBraces]);
+      assert.equal(moved.outcome, 'blocking');
+      assert.equal(status(moved, BRACES).status, 'refused');
+      assert.equal(at(moved, scannerBraces.path, scannerBraces.advisory).disposition, 'open');
+    });
+
+    it('CONTRACT: all six expire at 00:00 UTC on 2026-10-31 — valid through the second before, refused from it', () => {
+      const before = decide(subjects(), { now: '2026-10-30T23:59:59Z' });
+      assert.equal(before.outcome, 'exceptions_only');
+      assert.equal(before.counts.excepted, 6);
+      const lapsed = decide(subjects(), { now: '2026-10-31T00:00:00Z' });
+      assert.equal(lapsed.outcome, 'blocking');
+      assert.equal(lapsed.counts.excepted, 0);
+      for (const id of Object.keys(SUBJECTS)) assert.deepEqual(status(lapsed, id).problems, ['expired on 2026-10-31'], id);
+    });
+
+    it('CONTRACT: a vanished subject refuses its record as stale', () => {
+      for (const id of NEW) {
+        const r = decide(subjects().filter((f) => f.path !== SUBJECTS[id].path || f.advisory !== SUBJECTS[id].advisory));
+        assert.equal(r.outcome, 'blocking', id);
+        assert.equal(status(r, id).status, 'refused', id);
+        assert.ok(status(r, id).problems.some((p) => /stale/.test(p)), id);
+      }
+    });
+
+    it('CONTRACT: an alias the scanner does not report refuses the record', () => {
+      for (const id of NEW) {
+        // The scanner reports the advisory without the alias the record claims.
+        const unreported = decide(replace(id, { aliases: [] }));
+        assert.equal(unreported.outcome, 'blocking', `${id} / unreported`);
+        assert.equal(status(unreported, id).status, 'refused', `${id} / unreported`);
+        assert.ok(status(unreported, id).problems.some((p) => p.includes(`aliases ${SUBJECTS[id].aliases[0]} are not reported by the scanner`)), id);
+        // The record claims a second alias the scanner never reported.
+        const records = policy.records.map((x) => (x.id === id ? { ...x, aliases: [...x.aliases, 'npm:1'] } : x));
+        const claimed = decide(subjects(), { records });
+        assert.equal(claimed.outcome, 'blocking', `${id} / claimed`);
+        assert.equal(status(claimed, id).status, 'refused', `${id} / claimed`);
+      }
+    });
+
+    it('CONTRACT: a runtime finding, a moved path or malformed approval metadata refuses the record', () => {
+      for (const id of NEW) {
+        const cases = {
+          runtime: [replace(id, { scope: 'runtime' })],
+          path: [replace(id, { path: `${SUBJECTS[id].path.split(':')[0]}:node_modules/elsewhere/node_modules/${SUBJECTS[id].package}` })],
+          approval: [subjects(), policy.records.map((x) => (x.id === id ? { ...x, approval: { ...x.approval, reference: 'not-a-review-link' } } : x))],
+        };
+        for (const [label, [findings, records]] of Object.entries(cases)) {
+          const r = decide(findings, records ? { records } : {});
+          assert.equal(r.outcome, 'blocking', `${id} / ${label}`);
+          assert.equal(status(r, id).status, 'refused', `${id} / ${label}`);
+        }
+      }
+    });
+
+    it('CONTRACT: an incomplete scan fails closed whatever is excepted', () => {
+      const r = decide(subjects(), { incomplete: [{ code: 'scanner_timeout', detail: 'the scanner did not finish' }] });
+      assert.equal(r.outcome, 'incomplete');
+      assert.equal(r.exitCode, 2);
+    });
   });
 });

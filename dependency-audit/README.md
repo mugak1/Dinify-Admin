@@ -97,22 +97,65 @@ outranks every npmrc, so the invocation and the check cannot disagree.
 
 ## Exceptions and triage records
 
-**Three records are approved (2026-10-01), and all three are exceptions on the SCANNER
-graph**: the `undici` 6.28.0 (GHSA-rfgv-xxqx-mfg5) and `brace-expansion` 5.0.9
-(GHSA-qhr7-859c-m2p7, GHSA-6j4f-fj2g-mc7p) that npm 11.19.1 BUNDLES. They are the same
-three Dinify-Frontend approved on 2026-09-30, because both repositories pin the same
-scanner. No npm release (11.19.1, 11.20.0, 11.21.0, 12.1.0, 12.2.0) bundles a fixed copy of
-either, and a bundled dependency cannot be replaced through the scanner lockfile or
-`overrides`, so without them every `validate` run was blocked. Each record's
-`applicability` states why the scanner cannot reach the vulnerable code with outside
-input, and each expires on 2026-10-31. **They come out in the same change that moves the
-scanner pin to an npm release bundling fixed copies**: from then on they match nothing, and
-the audit refuses a stale record rather than ignoring it. No application-graph finding is
-excepted, and nothing is triaged. The application-graph advisories that arrived with them
-(`@angular/router` GHSA-ff3f-86qr-9cv3, `brace-expansion`, `engine.io` GHSA-2gc4-cqfq-p2gv,
-`undici` GHSA-rfgv-xxqx-mfg5 and GHSA-w293-vg96-wgc3) were fixed in the lock instead:
-Angular 21.2.24 (whose `@angular/build` pins `undici` 7.29.1) and in-range updates, with no
-release under a day old.
+**Six records are approved. All six are `kind: "exception"` with `scope: "tooling"`, and all
+six lapse at 00:00 UTC on 2026-10-31 with no automatic extension.**
+
+- **Three on the SCANNER graph, approved 2026-10-01 (#40):** the `undici` 6.28.0
+  (GHSA-rfgv-xxqx-mfg5) and `brace-expansion` 5.0.9 (GHSA-qhr7-859c-m2p7, GHSA-6j4f-fj2g-mc7p)
+  that npm 11.19.1 BUNDLES. They are the same three Dinify-Frontend approved on 2026-09-30,
+  because both repositories pin the same scanner. No npm release (11.19.1, 11.20.0, 11.21.0,
+  12.1.0, 12.2.0) bundles a fixed copy of either, and a bundled dependency cannot be replaced
+  through the scanner lockfile or `overrides`. Each record's `applicability` states why the
+  scanner cannot reach the vulnerable code with outside input.
+- **Three approved 2026-10-07 (#42).** This is the owner's own Admin approval of these exact
+  subjects and expiry; it is not derived from Dinify-Frontend's records for the same advisories.
+  - `braces` 3.0.3 in the APPLICATION graph (GHSA-vfj7-8cjw-p6xm). It is development tooling
+    only: karma, chokidar, and micromatch via tailwindcss and fast-glob. The measured build
+    and test parsing used only the repository-authored Tailwind content pattern. Watch-mode
+    and operator-derived inputs were not exercised. Residual tooling denial-of-service risk is
+    accepted, and the record does not claim that every invocation is unreachable.
+  - `http-cache-semantics` 4.2.0 in the APPLICATION graph (GHSA-ch52-4w7c-c8xp). It arrives
+    through `@angular/cli` → `pacote` → `make-fetch-happen`, and that traced consumer
+    constructs its cache policy with `shared: false`. Build, test, lint and `ng version` did
+    not load it in the measured runs. Further package-operation consumers were traced in the
+    source, not exercised.
+  - `http-cache-semantics` 4.2.0 BUNDLED in the scanner (the same advisory). The measured
+    constructions use `shared: false`, but the scanner also runs in local invocations, not
+    only in CI. Three things were not established: that npm user or global configuration
+    cannot change what it does, that every invocation is free of credentials, and that its
+    cache is separate. So the record does not claim that a disclosure would be confined to a
+    safe scanner cache.
+
+  None of the three has a fixed release. braces 3.0.3 is the latest release, and its
+  dependents still require 3.x. The http-cache-semantics advisory lists no patched version.
+  **http-cache-semantics 4.3.0 is not a fix**: it falls outside the scanner's recorded range,
+  but the vulnerable max-stale and shared `Set-Cookie` handling is byte-identical. Taking it
+  would hide the finding without remediating it, so it is deliberately not installed.
+
+With these records the audit is **`exceptions_only`**, and the headline says so. It is never
+"clean" or "no vulnerabilities". Each record comes out in the same change that fixes or
+removes the copy it covers. For the scanner records, that means moving the scanner pin to an
+npm release bundling a fixed copy. From then on the record matches nothing, and the audit
+refuses a stale record rather than ignoring it.
+
+Nothing is triaged. The lower-severity tooling findings stay visible as TRIAGE REQUIRED:
+`ip-address` (both graphs), `postcss-selector-parser` (both graphs), and the scanner's
+`brace-expansion` GHSA-q2hr-2g5m-vwhr and `undici` GHSA-3wwx-pv8p-q78v / GHSA-r53p-7pc4-xj5r.
+
+The CONTRACT in `tests/audit.test.mjs` pins the set by id, graph, kind, scope, provenance and
+expiry. It drives each record through the real evaluator against its exact subject, and
+asserts what each record must keep refusing.
+
+Several advisories with a supported fixed release were fixed in the lock instead of being
+excepted:
+- With the 2026-10-01 records: `@angular/router` GHSA-ff3f-86qr-9cv3, `brace-expansion`,
+  `engine.io` GHSA-2gc4-cqfq-p2gv, and `undici` GHSA-rfgv-xxqx-mfg5 and GHSA-w293-vg96-wgc3.
+  The fix was Angular 21.2.24 (whose `@angular/build` pins `undici` 7.29.1) and in-range
+  updates.
+- With the 2026-10-07 records: `piscina` GHSA-67c8-pqhq-4rmx, `@modelcontextprotocol/sdk`
+  GHSA-6qxp-vccf-f47h, `proxy-addr` GHSA-jqcg-44mw-7w3h and `source-map-js` GHSA-68fv-2mgg-jv7q.
+  The fix was `@angular/build` / `@angular/cli` 21.2.26, framework 21.2.25, and in-range
+  updates.
 
 A record is refused — and the audit is `blocking` — unless it names the advisory (and aliases),
 the exact package, the exact version, the exact graph paths and the scope; carries
@@ -141,6 +184,13 @@ provenance is *stated*, not that the linked review exists — that is the review
 triage. The lock-only repair in this change (in-range `npm update`, no same-day release)
 removes all ten: the delivered head audits **within policy with no advisories reported**,
 and the production `dist/` is byte-identical to main's.
+
+That was the state when B2.1 was delivered, and it has not held since.
+
+On 2026-10-07, `main` (89d2cf1) audited **blocking** with seven blocking findings. Four had
+a fixed release and were fixed in the lock, as listed above. Three had none and are covered
+by the 2026-10-07 exceptions. After that change the measured graphs audit **`exceptions_only`**
+and are not within policy. The only shipped-byte change is `@angular/router` 21.2.25.
 
 ## How it runs
 

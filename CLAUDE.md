@@ -2256,16 +2256,40 @@ a successful CI push to main, or on `workflow_dispatch`.
   container npm never writes (a list or `null` where the name map belongs) are INCOMPLETE,
   exit 2 — never zero findings. Reason codes and the pinned-scanner contract are in the
   README; the shared tests pin a captured real report from each npm repo as the control.
-- **Three exceptions are approved (2026-10-01, expiring 2026-10-31), all on the SCANNER
-  graph**: npm 11.19.1's BUNDLED `undici` 6.28.0 (GHSA-rfgv-xxqx-mfg5) and
-  `brace-expansion` 5.0.9 (GHSA-qhr7-859c-m2p7, GHSA-6j4f-fj2g-mc7p), the same three
-  Frontend approved. No npm release bundles fixed copies and a bundled dependency cannot
-  be reached by the lockfile or `overrides`. Remove them in the same change that bumps
-  the scanner to an npm release that does (a record matching nothing is refused as
-  stale); a CONTRACT test in `dependency-audit/tests/audit.test.mjs` pins the set by id.
-  Nothing else is pre-approved, and no application-graph finding is excepted. Any other
-  exception or triage record must name the exact advisory/package/version/paths/scope, carry evidence, an
-  owner, a linked mugak1 review and an expiry ≤ 90 days, and is refused otherwise.
+- **Six exceptions are approved, all `kind: exception` with `scope: tooling`, and all lapse
+  at 00:00 UTC on 2026-10-31 with no automatic extension.**
+  - **Three on the SCANNER graph (approved 2026-10-01, #40):** npm 11.19.1's BUNDLED
+    `undici` 6.28.0 (GHSA-rfgv-xxqx-mfg5) and `brace-expansion` 5.0.9 (GHSA-qhr7-859c-m2p7,
+    GHSA-6j4f-fj2g-mc7p), the same three Frontend approved. No npm release bundles fixed
+    copies, and a bundled dependency cannot be reached by the lockfile or `overrides`.
+  - **Three approved 2026-10-07 (#42).** This is the owner's own Admin approval, not derived
+    from Frontend's records:
+    - application `braces` 3.0.3 (GHSA-vfj7-8cjw-p6xm);
+    - application `http-cache-semantics` 4.2.0 (GHSA-ch52-4w7c-c8xp);
+    - the scanner-bundled copy of that same `http-cache-semantics`.
+
+    None has a fixed release. **http-cache-semantics 4.3.0 is NOT a fix.** It only falls
+    outside the scanner's recorded range; the vulnerable mechanism is byte-identical, so it
+    is deliberately not installed. Each record's applicability states its limits and claims
+    no more:
+    - braces: residual tooling DoS risk is accepted, and watch-mode inputs were not exercised;
+    - application HCS: package-operation consumers were traced in the source, not exercised;
+    - scanner HCS: npm user/global configuration, credential absence and cache separation
+      were not established.
+  - **With these records the audit is `exceptions_only`, never "clean".** The lower-severity
+    tooling findings (`ip-address`, `postcss-selector-parser`, the scanner's
+    `brace-expansion` GHSA-q2hr and `undici` GHSA-3wwx / GHSA-r53p) stay visible as TRIAGE
+    REQUIRED.
+  - **Removal.** Each record comes out in the same change that fixes or removes the copy it
+    covers. For the scanner records, that means bumping the scanner to an npm release that
+    bundles fixed copies. A record that matches nothing is refused as stale.
+  - **The contract.** A CONTRACT test in `dependency-audit/tests/audit.test.mjs` pins the set
+    by id, graph, kind, scope, provenance and expiry. It drives each record through the real
+    evaluator against its exact subject, including the refusals: no cross-graph cover, 4.3.0
+    unmatched, the expiry boundary, a stale subject, and an uncorroborated alias.
+  - **Nothing else is pre-approved.** Any other exception or triage record must name the
+    exact advisory, package, version, paths and scope, and must carry evidence, an owner, a
+    linked mugak1 review and an expiry of at most 90 days. Otherwise it is refused.
 - **The raw evidence is retained** as the artifact `dependency-audit-<run>-<attempt>`,
   pass or fail.
 - **The deploy now re-assesses (B2.4).** It promotes the certified candidate rather than

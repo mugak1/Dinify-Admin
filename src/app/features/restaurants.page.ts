@@ -180,16 +180,23 @@ type DirectoryState = 'loading' | 'rows' | 'empty' | 'beyond-end' | 'error';
 
       <label class="flex flex-col gap-1 text-admin-label text-ink-muted" for="status-filter">
         Lifecycle
+        <!-- The selected option is marked ON THE OPTION, never by binding [value] on
+             the <select>. A [value] binding is applied before the @for has rendered
+             the options, matches nothing, and the browser falls back to "All" — so a
+             direct load of ?status=live filtered the rows under a control reading
+             "All", and Angular never re-applied the unchanged binding. The URL is
+             still the only source of truth: each option reads status.value(). -->
         <select
           id="status-filter"
           class="h-control rounded bg-surface px-2 text-admin-body text-ink
                  ring-1 ring-inset ring-line-strong"
-          [value]="status.value() ?? ''"
           (change)="onStatus($event)"
         >
-          <option value="">All</option>
+          <option value="" [selected]="status.value() === null">All</option>
           @for (option of lifecycleOptions; track option) {
-            <option [value]="option">{{ lifecycleLabel(option) }}</option>
+            <option [value]="option" [selected]="option === status.value()">
+              {{ lifecycleLabel(option) }}
+            </option>
           }
         </select>
       </label>

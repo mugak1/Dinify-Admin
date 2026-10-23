@@ -137,7 +137,7 @@ If either stale advisory is reinstated or widened, or the scanner is rolled back
 finding blocks again with no record. The CONTRACT in `tests/audit.test.mjs` pins that.
 
 Nothing is triaged. The lower-severity tooling findings stay visible as TRIAGE REQUIRED:
-`ip-address` (both graphs) and `postcss-selector-parser` (application graph).
+`postcss-selector-parser` 6.1.5 (application graph) and `ip-address` 10.7.2 (scanner graph).
 
 The CONTRACT in `tests/audit.test.mjs` pins the set by id, graph, kind, scope, provenance and
 expiry. It drives the record through the real evaluator against its exact subject, asserts
@@ -204,6 +204,25 @@ credential-free, with install scripts disabled and against the live advisory dat
   - in the scanner graph: `ip-address` 10.7.2.
 
 No application dependency moved.
+
+Later on 2026-10-23, a lock-only update (AD-1 from the reviewed lower-severity triage) moved
+two application tooling entries: `ip-address` 10.5.0 → 10.7.4 and `postcss-selector-parser`
+6.1.4 → 6.1.5. No `package.json` edit, no override, and no exception or triage record was
+added or changed. It was measured at about 22:09 UTC under the same conditions as the
+previous measurement (local, Node 20.20.0, credential-free, install scripts disabled, live
+advisory data). Against that, `main` (ed6430d) still audited as described above.
+- **The audit is still `exceptions_only`**, now with 3 findings across both graphs: 1 under the
+  2026-10-23 record and 2 lower-severity tooling findings requiring triage. Nothing blocks and
+  no record is refused.
+- The five application `ip-address` advisories are gone: the scan reports none against
+  `ip-address` 10.7.4.
+- The 2 are:
+  - in the application graph: `postcss-selector-parser` 6.1.5 (GHSA-rj75-hqrm-r3gf). 6.1.5 is
+    the upstream 6.x backport of the fix, inside Tailwind 3's `^6.1.2`. The advisory data
+    still lists it as affected, so the finding stays visible;
+  - in the scanner graph: `ip-address` 10.7.2 (GHSA-rxp7-6hxx-x8q5), which this update does
+    not touch.
+- The production `dist/` is byte-identical to main's.
 
 ## How it runs
 

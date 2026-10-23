@@ -2280,8 +2280,10 @@ a successful CI push to main, or on `workflow_dispatch`.
     If either stale advisory is reinstated or widened, or the scanner is rolled back, the
     finding blocks again with no record.
   - **With this record the audit is `exceptions_only`, never "clean".** The lower-severity
-    tooling findings (`ip-address` in both graphs, `postcss-selector-parser`) stay visible as
-    TRIAGE REQUIRED.
+    tooling findings stay visible as TRIAGE REQUIRED. As measured on 2026-10-23 after the
+    AD-1 lock-only update (`ip-address` 10.5.0 → 10.7.4 and `postcss-selector-parser`
+    6.1.4 → 6.1.5), they are `postcss-selector-parser` 6.1.5 in the application graph and
+    `ip-address` 10.7.2 in the scanner graph.
   - **Removal.** Each record comes out in the same change that fixes or removes the copy it
     covers. A record that matches nothing is refused as stale.
   - **The contract.** A CONTRACT test in `dependency-audit/tests/audit.test.mjs` pins the set

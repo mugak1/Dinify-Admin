@@ -3,8 +3,9 @@
 A required dependency audit (D08 B2.1): what was inspected, what the advisory data says
 about it, and one policy decision — enforced inside the existing `validate` check. The
 same policy runs in Dinify-Frontend (this directory, byte-identical except `policy.json`,
-this README and `tests/workflow.test.mjs`; `lib/retained.mjs` carries the same scanner
-diagnostics in both, see below) and in Dinify-Backend (`dependency_audit/`, the Python port). `conformance.json` is identical in all three, and each suite pins its
+this README, `tests/workflow.test.mjs` and the committed-policy section at the end of
+`tests/audit.test.mjs`, which pins each repository's own records; `lib/retained.mjs` carries
+the same scanner diagnostics in both, see below) and in Dinify-Backend (`dependency_audit/`, the Python port). `conformance.json` is identical in all three, and each suite pins its
 digest.
 
 **A clean application test suite is not a dependency audit, and a scheduled audit that no
@@ -59,7 +60,11 @@ failed", so the status is only accepted when the body agrees with it.
 
 **Every vulnerability the report declares is accounted for, or the audit is incomplete.**
 Being unable to interpret a reported vulnerability is not evidence that there is none.
-The contract is the pinned scanner's own (npm 11.19.1, Arborist 9.9.1): `vulnerabilities`
+The contract is the pinned scanner's own. It was read from npm 11.19.1 and Arborist 9.9.1;
+the pinned npm 11.21.1 bundles Arborist 9.9.3, and the files that write the report (npm's
+`lib/commands/audit.js`, Arborist's `audit-report.js`, `vuln.js` and `load-virtual.js`,
+`@npmcli/metavuln-calculator` 9.0.3 and `npm-audit-report` 7.0.0) are byte-identical between
+the two releases. `vulnerabilities`
 is an object keyed by package name, and each entry's `via` holds either an advisory
 object (whose `name` and `dependency` are that package) or a STRING naming another entry
 the package is vulnerable through. Arborist links every such name before it writes the
@@ -97,54 +102,47 @@ outranks every npmrc, so the invocation and the check cannot disagree.
 
 ## Exceptions and triage records
 
-**Six records are approved. All six are `kind: "exception"` with `scope: "tooling"`, and all
-six lapse at 00:00 UTC on 2026-10-31 with no automatic extension.**
+**One record is approved: `application-http-cache-semantics-GHSA-ch52-4w7c-c8xp`, a
+`kind: "exception"` with `scope: "tooling"`, approved by the owner on 2026-10-23 (#46). It
+expires on 2026-12-31: valid through 2026-12-30, and it lapses at 00:00 UTC on 2026-12-31 with
+no automatic extension.** It replaces the record for the same subject approved on 2026-10-07
+(#42), which would have lapsed at 00:00 UTC on 2026-10-31. It covers `http-cache-semantics`
+4.2.0 in the APPLICATION graph (GHSA-ch52-4w7c-c8xp). It arrives through `@angular/cli`
+21.2.28 → `pacote` 21.5.1 → `make-fetch-happen` 15.0.6, and that traced consumer constructs
+its cache policy with `shared: false`. In the runs measured on 2026-10-23, build, test, lint and
+`ng version` did not load it. Package operations (`ng add`, `ng update`) were traced in the
+source, not exercised. The advisory lists no patched version and 4.3.0 is the latest release.
+**http-cache-semantics 4.3.0 is not a fix**: it falls outside the scanner's recorded range, but
+the vulnerable max-stale and shared `Set-Cookie` handling is byte-identical. Taking it in the
+application graph would hide the finding without remediating it, so it is deliberately not
+installed there.
 
-- **Three on the SCANNER graph, approved 2026-10-01 (#40):** the `undici` 6.28.0
-  (GHSA-rfgv-xxqx-mfg5) and `brace-expansion` 5.0.9 (GHSA-qhr7-859c-m2p7, GHSA-6j4f-fj2g-mc7p)
-  that npm 11.19.1 BUNDLES. They are the same three Dinify-Frontend approved on 2026-09-30,
-  because both repositories pin the same scanner. No npm release (11.19.1, 11.20.0, 11.21.0,
-  12.1.0, 12.2.0) bundles a fixed copy of either, and a bundled dependency cannot be replaced
-  through the scanner lockfile or `overrides`. Each record's `applicability` states why the
-  scanner cannot reach the vulnerable code with outside input.
-- **Three approved 2026-10-07 (#42).** This is the owner's own Admin approval of these exact
-  subjects and expiry; it is not derived from Dinify-Frontend's records for the same advisories.
-  - `braces` 3.0.3 in the APPLICATION graph (GHSA-vfj7-8cjw-p6xm). It is development tooling
-    only: karma, chokidar, and micromatch via tailwindcss and fast-glob. The measured build
-    and test parsing used only the repository-authored Tailwind content pattern. Watch-mode
-    and operator-derived inputs were not exercised. Residual tooling denial-of-service risk is
-    accepted, and the record does not claim that every invocation is unreachable.
-  - `http-cache-semantics` 4.2.0 in the APPLICATION graph (GHSA-ch52-4w7c-c8xp). It arrives
-    through `@angular/cli` → `pacote` → `make-fetch-happen`, and that traced consumer
-    constructs its cache policy with `shared: false`. Build, test, lint and `ng version` did
-    not load it in the measured runs. Further package-operation consumers were traced in the
-    source, not exercised.
-  - `http-cache-semantics` 4.2.0 BUNDLED in the scanner (the same advisory). The measured
-    constructions use `shared: false`, but the scanner also runs in local invocations, not
-    only in CI. Three things were not established: that npm user or global configuration
-    cannot change what it does, that every invocation is free of credentials, and that its
-    cache is separate. So the record does not claim that a disclosure would be confined to a
-    safe scanner cache.
+With this record the audit is **`exceptions_only`**, and the headline says so. It is never
+"clean" or "no vulnerabilities". From 00:00 UTC on 2026-12-31 the record is refused as
+expired and its finding blocks, unless a new, separately approved record replaces it.
 
-  None of the three has a fixed release. braces 3.0.3 is the latest release, and its
-  dependents still require 3.x. The http-cache-semantics advisory lists no patched version.
-  **http-cache-semantics 4.3.0 is not a fix**: it falls outside the scanner's recorded range,
-  but the vulnerable max-stale and shared `Set-Cookie` handling is byte-identical. Taking it
-  would hide the finding without remediating it, so it is deliberately not installed.
+**Five records were removed when the scanner moved to npm 11.21.1, and only three of the
+removals are remediations.** npm 11.21.1 is the first npm whose distributed tarball bundles
+fixed copies; 11.19.1, 11.20.0 and 11.21.0 do not, and 12.x requires Node 22.22.2 or later.
 
-With these records the audit is **`exceptions_only`**, and the headline says so. It is never
-"clean" or "no vulnerabilities". Each record comes out in the same change that fixes or
-removes the copy it covers. For the scanner records, that means moving the scanner pin to an
-npm release bundling a fixed copy. From then on the record matches nothing, and the audit
-refuses a stale record rather than ignoring it.
+| removed record | disposition |
+|---|---|
+| `scanner-undici-GHSA-rfgv-xxqx-mfg5` | REMEDIATED: npm 11.21.1 bundles `undici` 6.29.0 (patched 6.28.1); the WebSocket handshake now refuses a subprotocol when none was requested |
+| `scanner-brace-expansion-GHSA-qhr7-859c-m2p7` | REMEDIATED: `brace-expansion` 5.0.12 (patched 5.0.11); nesting depth is bounded (`EXPANSION_MAX_DEPTH`) |
+| `scanner-brace-expansion-GHSA-6j4f-fj2g-mc7p` | REMEDIATED: `brace-expansion` 5.0.12 (patched 5.0.10); `parseCommaParts` is iterative |
+| `scanner-http-cache-semantics-GHSA-ch52-4w7c-c8xp` | STALE, **NOT a remediation**: npm 11.21.1 bundles `http-cache-semantics` 4.3.0, outside the recorded range `<=4.2.0`, with the vulnerable mechanism unchanged. npm's own cache policies are still built with `shared: false` |
+| `application-braces-GHSA-vfj7-8cjw-p6xm` | STALE, **NOT a remediation**: GitHub WITHDREW GHSA-vfj7-8cjw-p6xm on 2026-10-23 ("not a practically exploitable vulnerability") and npm's advisory feed stopped reporting it. `braces` 3.0.3 is unchanged and still the latest release |
+
+If either stale advisory is reinstated or widened, or the scanner is rolled back, the
+finding blocks again with no record. The CONTRACT in `tests/audit.test.mjs` pins that.
 
 Nothing is triaged. The lower-severity tooling findings stay visible as TRIAGE REQUIRED:
-`ip-address` (both graphs), `postcss-selector-parser` (both graphs), and the scanner's
-`brace-expansion` GHSA-q2hr-2g5m-vwhr and `undici` GHSA-3wwx-pv8p-q78v / GHSA-r53p-7pc4-xj5r.
+`ip-address` (both graphs) and `postcss-selector-parser` (application graph).
 
 The CONTRACT in `tests/audit.test.mjs` pins the set by id, graph, kind, scope, provenance and
-expiry. It drives each record through the real evaluator against its exact subject, and
-asserts what each record must keep refusing.
+expiry. It drives the record through the real evaluator against its exact subject, asserts
+what it must keep refusing, and drives the five former subjects through the evaluator, each
+of which must block with nothing covering it.
 
 Several advisories with a supported fixed release were fixed in the lock instead of being
 excepted:
@@ -191,6 +189,21 @@ On 2026-10-07, `main` (89d2cf1) audited **blocking** with seven blocking finding
 a fixed release and were fixed in the lock, as listed above. Three had none and are covered
 by the 2026-10-07 exceptions. After that change the measured graphs audit **`exceptions_only`**
 and are not within policy. The only shipped-byte change is `@angular/router` 21.2.25.
+
+Measured for this change on 2026-10-23 at about 18:35 UTC. The runs were local on Node 20.20.0,
+credential-free, with install scripts disabled and against the live advisory data.
+- **`main` (e864c826) audited blocking.** The braces record matched no finding and was refused
+  as stale. The other five records still applied: 20 findings, 5 excepted and 15
+  lower-severity tooling findings requiring triage.
+- **With this change, the same application graph audits `exceptions_only`.** The scanner is
+  npm 11.21.1 and the policy holds the one 2026-10-23 record. There are 8 findings: 1 under
+  that record and 7 lower-severity tooling findings requiring triage. Nothing blocks and no
+  record is refused. The 7 are:
+  - in the application graph: `ip-address` 10.5.0 (five advisories) and
+    `postcss-selector-parser` 6.1.4;
+  - in the scanner graph: `ip-address` 10.7.2.
+
+No application dependency moved.
 
 ## How it runs
 

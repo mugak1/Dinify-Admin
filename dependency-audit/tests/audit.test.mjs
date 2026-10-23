@@ -372,7 +372,7 @@ describe('the committed policy of THIS repository', () => {
   const GRAPH = {
     'application-http-cache-semantics-GHSA-ch52-4w7c-c8xp': 'application',
   };
-  it('CONTRACT: the only approved record is the 2026-10-07 application http-cache-semantics tooling exception, pinned to its graph and well-formed as approved', () => {
+  it('CONTRACT: the only approved record is the 2026-10-23 application http-cache-semantics tooling exception, pinned to its graph and well-formed as approved', () => {
     assert.deepEqual(policy.records.map((r) => r.id), Object.keys(GRAPH));
     for (const record of policy.records) {
       assert.deepEqual(validateRecord(record, parseDate(record.approval.date)), [], record.id);
@@ -383,18 +383,18 @@ describe('the committed policy of THIS repository', () => {
     }
   });
 
-  // Who approved the remaining record, where, and until when. It is retained exactly as the
-  // owner approved it on 2026-10-07 and is not renewed automatically.
+  // Who approved the remaining record, where, and until when. It is the owner's 2026-10-23
+  // decision, referenced by the pull request that added it, and is not renewed automatically.
   it('CONTRACT: the provenance and expiry of every approved record', () => {
     const PROVENANCE = {
-      'application-http-cache-semantics-GHSA-ch52-4w7c-c8xp': ['https://github.com/mugak1/Dinify-Admin/pull/42', '2026-10-07'],
+      'application-http-cache-semantics-GHSA-ch52-4w7c-c8xp': ['https://github.com/mugak1/Dinify-Admin/pull/46', '2026-10-23'],
     };
     assert.deepEqual(Object.keys(PROVENANCE), Object.keys(GRAPH));
     for (const record of policy.records) {
       const [reference, date] = PROVENANCE[record.id];
       assert.deepEqual(record.approval, { by: 'mugak1', reference, date }, record.id);
       assert.equal(record.owner, 'mugak1', record.id);
-      assert.equal(record.expires, '2026-10-31', record.id);
+      assert.equal(record.expires, '2026-12-31', record.id);
     }
   });
 
@@ -406,7 +406,7 @@ describe('the committed policy of THIS repository', () => {
   // by the conformance vectors and the core suite.
   describe('the approved exception against its exact subject, and the five former subjects', () => {
     const APP_HCS = 'application-http-cache-semantics-GHSA-ch52-4w7c-c8xp';
-    const IN_DATE = '2026-10-30T23:59:59Z';
+    const IN_DATE = '2026-12-30T23:59:59Z';
     const finding = (advisory, alias, pkg, version, path, severity = 'high', scope = 'tooling') => ({ advisory, aliases: [alias], package: pkg, version, path, scope, severity });
     const SUBJECTS = {
       [APP_HCS]: finding('GHSA-ch52-4w7c-c8xp', 'npm:1240991', 'http-cache-semantics', '4.2.0', 'application:node_modules/http-cache-semantics'),
@@ -476,14 +476,14 @@ describe('the committed policy of THIS repository', () => {
       assert.equal(at(r, SUBJECTS[APP_HCS].path, SUBJECTS[APP_HCS].advisory).disposition, 'open');
     });
 
-    it('CONTRACT: it expires at 00:00 UTC on 2026-10-31 — valid through the second before, refused from it', () => {
-      const before = decide(subjects(), { now: '2026-10-30T23:59:59Z' });
+    it('CONTRACT: it expires at 00:00 UTC on 2026-12-31 — valid through the second before, refused from it', () => {
+      const before = decide(subjects(), { now: '2026-12-30T23:59:59Z' });
       assert.equal(before.outcome, 'exceptions_only');
       assert.equal(before.counts.excepted, 1);
-      const lapsed = decide(subjects(), { now: '2026-10-31T00:00:00Z' });
+      const lapsed = decide(subjects(), { now: '2026-12-31T00:00:00Z' });
       assert.equal(lapsed.outcome, 'blocking');
       assert.equal(lapsed.counts.excepted, 0);
-      assert.deepEqual(status(lapsed, APP_HCS).problems, ['expired on 2026-10-31']);
+      assert.deepEqual(status(lapsed, APP_HCS).problems, ['expired on 2026-12-31']);
     });
 
     it('CONTRACT: a vanished subject refuses its record as stale', () => {

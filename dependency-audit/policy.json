@@ -26,15 +26,15 @@
         "application:node_modules/http-cache-semantics"
       ],
       "scope": "tooling",
-      "applicability": "http-cache-semantics 4.2.0 is in the Admin application graph only through development tooling: @angular/cli 21.2.26 -> pacote 21.5.1 -> make-fetch-happen 15.0.6 (via npm-registry-fetch, @sigstore/sign and tuf-js). It is not in the production bundle. make-fetch-happen is its only requirer, and that traced consumer constructs every CachePolicy from a module-local `{ shared: false, ignoreCargoCult: true }` (lib/cache/policy.js); the advisory's mechanism needs a shared cache. In the measured runs (load probes, 2026-10-07: build:prod, test:ci, lint and ng version on a disposable copy of 89d2cf1, and build:prod on this change's dependency set) http-cache-semantics, make-fetch-happen and pacote were not loaded. Additional package-operation consumers (pacote under @angular/cli package operations such as ng add and ng update) were source-traced but not exercised. This does not cover a consumer that constructs a shared cache.",
-      "reason": "As of 2026-10-07 no fixed release exists: the advisory (last updated 2026-10-02) lists no patched version. http-cache-semantics 4.3.0 (published 2026-10-04) falls outside the scanner's recorded affected range but leaves the vulnerable max-stale evaluation and shared Set-Cookie handling byte-identical, and a behavioural probe gives the same result on both versions; it is not a fix and is deliberately not installed. Without a disposition the current measured application graph is blocking. The accepted residual risk is that a tooling consumer that was traced but not exercised behaves differently from the measured runs. Remove this record in the same change that installs a release that fixes the mechanism or removes the package from the application graph; from then on it matches nothing and the audit refuses it as stale. It expires at 00:00 UTC on 2026-10-31 and is not extended automatically.",
+      "applicability": "http-cache-semantics 4.2.0 is in the Admin application graph only through development tooling: @angular/cli 21.2.28 -> pacote 21.5.1 -> make-fetch-happen 15.0.6 (via npm-registry-fetch 19.1.1, sigstore/@sigstore/sign 4.1.1 and tuf-js 4.1.0, all integrity-identical to the 2026-10-07 measurement). It is not in the production bundle. make-fetch-happen/lib/cache/policy.js is its only requirer and builds every CachePolicy with { shared: false, ignoreCargoCult: true }; the advisory's mechanism needs a shared cache. Measured 2026-10-23 on e864c826 (Node 20, offline, preload probe with positive controls): ng version, eslint ., ng build --configuration=production and ng test (842/842) loaded neither http-cache-semantics, make-fetch-happen nor pacote. Package operations (ng add, ng update) were source-traced, not exercised. This does not cover a consumer that constructs a shared cache.",
+      "reason": "As of 2026-10-23 no fixed release exists: the advisory lists no patched version and 4.3.0 is the latest release. 4.3.0 is outside the recorded range but leaves the max-stale and shared Set-Cookie handling byte-identical, so it is not a fix and is not installed. Removing the package means an Angular major (22, Node >=22.22.3), which is not a dependency fix. Without a disposition the measured application graph is blocking. The accepted residual risk is that a traced-but-unexercised tooling consumer behaves differently from the measured runs. Remove this record in the same change that installs a release fixing the mechanism or removes the package; it expires at 00:00 UTC on 2026-12-31 and is not extended automatically.",
       "owner": "mugak1",
       "approval": {
         "by": "mugak1",
-        "reference": "https://github.com/mugak1/Dinify-Admin/pull/42",
-        "date": "2026-10-07"
+        "reference": "https://github.com/mugak1/Dinify-Admin/pull/46",
+        "date": "2026-10-23"
       },
-      "expires": "2026-10-31"
+      "expires": "2026-12-31"
     }
   ]
 }

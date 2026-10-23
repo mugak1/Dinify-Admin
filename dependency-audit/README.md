@@ -103,19 +103,22 @@ outranks every npmrc, so the invocation and the check cannot disagree.
 ## Exceptions and triage records
 
 **One record is approved: `application-http-cache-semantics-GHSA-ch52-4w7c-c8xp`, a
-`kind: "exception"` with `scope: "tooling"`, approved 2026-10-07 (#42). It lapses at 00:00 UTC
-on 2026-10-31 with no automatic extension.** It covers `http-cache-semantics` 4.2.0 in the
-APPLICATION graph (GHSA-ch52-4w7c-c8xp). It arrives through `@angular/cli` → `pacote` →
-`make-fetch-happen`, and that traced consumer constructs its cache policy with
-`shared: false`. Build, test, lint and `ng version` did not load it in the measured runs.
-Further package-operation consumers were traced in the source, not exercised. The advisory
-lists no patched version and 4.3.0 is the latest release. **http-cache-semantics 4.3.0 is not
-a fix**: it falls outside the scanner's recorded range, but the vulnerable max-stale and shared
-`Set-Cookie` handling is byte-identical. Taking it in the application graph would hide the
-finding without remediating it, so it is deliberately not installed there.
+`kind: "exception"` with `scope: "tooling"`, approved by the owner on 2026-10-23 (#46). It
+expires on 2026-12-31: valid through 2026-12-30, and it lapses at 00:00 UTC on 2026-12-31 with
+no automatic extension.** It replaces the record for the same subject approved on 2026-10-07
+(#42), which would have lapsed at 00:00 UTC on 2026-10-31. It covers `http-cache-semantics`
+4.2.0 in the APPLICATION graph (GHSA-ch52-4w7c-c8xp). It arrives through `@angular/cli`
+21.2.28 → `pacote` 21.5.1 → `make-fetch-happen` 15.0.6, and that traced consumer constructs
+its cache policy with `shared: false`. In the runs measured on 2026-10-23, build, test, lint and
+`ng version` did not load it. Package operations (`ng add`, `ng update`) were traced in the
+source, not exercised. The advisory lists no patched version and 4.3.0 is the latest release.
+**http-cache-semantics 4.3.0 is not a fix**: it falls outside the scanner's recorded range, but
+the vulnerable max-stale and shared `Set-Cookie` handling is byte-identical. Taking it in the
+application graph would hide the finding without remediating it, so it is deliberately not
+installed there.
 
 With this record the audit is **`exceptions_only`**, and the headline says so. It is never
-"clean" or "no vulnerabilities". From 00:00 UTC on 2026-10-31 the record is refused as
+"clean" or "no vulnerabilities". From 00:00 UTC on 2026-12-31 the record is refused as
 expired and its finding blocks, unless a new, separately approved record replaces it.
 
 **Five records were removed when the scanner moved to npm 11.21.1, and only three of the
@@ -187,13 +190,20 @@ a fixed release and were fixed in the lock, as listed above. Three had none and 
 by the 2026-10-07 exceptions. After that change the measured graphs audit **`exceptions_only`**
 and are not within policy. The only shipped-byte change is `@angular/router` 21.2.25.
 
-On 2026-10-23, after GitHub withdrew GHSA-vfj7-8cjw-p6xm, `main` (e864c826) audited
-**blocking** (measured locally on Node 20, credential-free): the braces record matched no
-finding and was refused as stale, while the other five records still applied. With the
-scanner at npm 11.21.1 and the five records removed, the same application graph audits
-**`exceptions_only`**: one finding under the remaining record, seven lower-severity tooling
-findings requiring triage, nothing blocking and no record refused. The scanner graph went from
-13 findings to one (`ip-address` 10.7.2, moderate). No application dependency moved.
+Measured for this change on 2026-10-23 at about 18:35 UTC. The runs were local on Node 20.20.0,
+credential-free, with install scripts disabled and against the live advisory data.
+- **`main` (e864c826) audited blocking.** The braces record matched no finding and was refused
+  as stale. The other five records still applied: 20 findings, 5 excepted and 15
+  lower-severity tooling findings requiring triage.
+- **With this change, the same application graph audits `exceptions_only`.** The scanner is
+  npm 11.21.1 and the policy holds the one 2026-10-23 record. There are 8 findings: 1 under
+  that record and 7 lower-severity tooling findings requiring triage. Nothing blocks and no
+  record is refused. The 7 are:
+  - in the application graph: `ip-address` 10.5.0 (five advisories) and
+    `postcss-selector-parser` 6.1.4;
+  - in the scanner graph: `ip-address` 10.7.2.
+
+No application dependency moved.
 
 ## How it runs
 

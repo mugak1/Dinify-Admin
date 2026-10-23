@@ -300,11 +300,20 @@ packages, and there was one run per mode. It shows that capture works at these t
 points. It does not show what happened in any real run.
 
 **The pin has since moved to npm 11.21.1** (`dependency-audit/README.md` → "Exceptions and
-triage records"). The stub runs above were not repeated with it. What was checked instead,
-locally on Node 20 against `registry.npmjs.org`, credential-free: `assess()` over the current
-application lock graph, with the real 11.21.1 scanner and placeholder candidate identifiers,
-kept a diagnostic for both graphs, and `verifyAssessment()` accepted the result with no
-problem. That is a local model, not a deploy. Because `dependency-audit/` is part of the
+triage records"). The record set moved with it:
+- **The new record.** The owner approved an application `http-cache-semantics` 4.2.0
+  exception on 2026-10-23 (#46). It lapses at 00:00 UTC on 2026-12-31.
+- **Five removals.** Three were REMEDIATED: the scanner `undici` record and both scanner
+  `brace-expansion` records. Two were STALE, NOT a remediation: the scanner
+  `http-cache-semantics` record and the application `braces` record.
+- **The promotion deadline.** While that record is applied, a fresh assessment's deadline is
+  the earlier of the 24-hour window and 00:00 UTC on 2026-12-31.
+
+The stub runs above were not repeated with the new scanner. What was checked instead, on
+2026-10-23, locally on Node 20 against `registry.npmjs.org`, credential-free: `assess()` over
+the current application lock graph, with the real 11.21.1 scanner and placeholder candidate
+identifiers, kept a diagnostic for both graphs, and `verifyAssessment()` accepted the result
+with no problem. That is a local model, not a deploy. Because `dependency-audit/` is part of the
 trusted verifier, a deploy run that read the trees before the change and is checked after it
 is refused as `policy_advanced`, and every later fresh assessment runs under the new scanner
 and the new record set.

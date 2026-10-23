@@ -2257,13 +2257,16 @@ a successful CI push to main, or on `workflow_dispatch`.
   exit 2 — never zero findings. Reason codes and the pinned-scanner contract are in the
   README; the shared tests pin a captured real report from each npm repo as the control.
 - **One exception is approved:** application `http-cache-semantics` 4.2.0 (GHSA-ch52-4w7c-c8xp,
-  `kind: exception`, `scope: tooling`, approved 2026-10-07, #42). It lapses at 00:00 UTC on
-  2026-10-31 with no automatic extension, and from then its finding blocks unless a new,
-  separately approved record replaces it. The advisory lists no patched version.
-  **http-cache-semantics 4.3.0 is NOT a fix.** It only falls outside the scanner's recorded
-  range; the vulnerable mechanism is byte-identical, so it is deliberately not installed in
-  the application graph. Its applicability: package-operation consumers were traced in the
-  source, not exercised.
+  `kind: exception`, `scope: tooling`). The owner approved it on 2026-10-23 (#46). It replaces
+  the 2026-10-07 record for the same subject (#42), which would have lapsed on 31 October.
+  - **Expiry.** `expires: 2026-12-31`, so it is valid through 2026-12-30 and lapses at
+    00:00 UTC on 2026-12-31. It is not extended automatically, and from then its finding
+    blocks unless a new, separately approved record replaces it.
+  - **No fix.** The advisory lists no patched version. **http-cache-semantics 4.3.0 is NOT a
+    fix.** It only falls outside the scanner's recorded range; the vulnerable mechanism is
+    byte-identical, so it is deliberately not installed in the application graph.
+  - **Applicability.** In the runs measured on 2026-10-23, build, test, lint and `ng version`
+    did not load it. Package operations were traced in the source, not exercised.
   - **Five records were removed when the scanner moved to npm 11.21.1**, the first npm whose
     tarball bundles fixed copies (11.19.1, 11.20.0 and 11.21.0 do not; 12.x needs Node 22).
     - REMEDIATED, the fix verified in the bundled code: the three scanner records for `undici`

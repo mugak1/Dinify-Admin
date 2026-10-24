@@ -2256,9 +2256,22 @@ a successful CI push to main, or on `workflow_dispatch`.
   container npm never writes (a list or `null` where the name map belongs) are INCOMPLETE,
   exit 2 — never zero findings. Reason codes and the pinned-scanner contract are in the
   README; the shared tests pin a captured real report from each npm repo as the control.
-- **One exception is approved:** application `http-cache-semantics` 4.2.0 (GHSA-ch52-4w7c-c8xp,
-  `kind: exception`, `scope: tooling`). The owner approved it on 2026-10-23 (#46). It replaces
-  the 2026-10-07 record for the same subject (#42), which would have lapsed on 31 October.
+- **Three exceptions are approved**, all `kind: exception`, `scope: tooling`.
+  - Application `http-cache-semantics` 4.2.0 (GHSA-ch52-4w7c-c8xp). The owner approved it on
+    2026-10-23 (#46). It replaces the 2026-10-07 record for the same subject (#42), which would
+    have lapsed on 31 October.
+  - `undici` GHSA-xjj6-f33q-929c (high), one record per graph, approved by the owner on
+    2026-10-24 (#48), both `expires: 2026-11-30`:
+    - application `undici` 7.29.1, pinned exactly by `@angular/build` (latest 21.2.28 included);
+    - scanner `undici` 6.29.0, bundled in npm 11.21.1, the latest 11.x.
+
+    Fixed releases exist (7.30.1, 6.29.1), but neither copy can take one without a
+    `package.json` or scanner change, and there are no overrides. `node-gyp`'s copy took 6.29.1
+    in the lock. In runs measured on 2026-10-24 with a load probe and positive controls, build,
+    test, lint, `ng version` and the scanner's audit argv loaded neither copy; `ng serve`
+    (whose SSR-only SSL plugin is the application copy's sole requirer) was source-traced.
+
+  The bullets below describe the http-cache-semantics record unless they say otherwise.
   - **Expiry.** `expires: 2026-12-31`, so it is valid through 2026-12-30 and lapses at
     00:00 UTC on 2026-12-31. It is not extended automatically, and from then its finding
     blocks unless a new, separately approved record replaces it.
@@ -2279,18 +2292,19 @@ a successful CI push to main, or on `workflow_dispatch`.
 
     If either stale advisory is reinstated or widened, or the scanner is rolled back, the
     finding blocks again with no record.
-  - **With this record the audit is `exceptions_only`, never "clean".** The lower-severity
-    tooling findings stay visible as TRIAGE REQUIRED. As measured on 2026-10-23 after the
-    AD-1 lock-only update (`ip-address` 10.5.0 → 10.7.4 and `postcss-selector-parser`
-    6.1.4 → 6.1.5), they are `postcss-selector-parser` 6.1.5 in the application graph and
-    `ip-address` 10.7.2 in the scanner graph.
+  - **With these records the audit is `exceptions_only`, never "clean".** The lower-severity
+    tooling findings stay visible as TRIAGE REQUIRED. As measured on 2026-10-24 for #48 (which
+    also took karma's `body-parser` 1.20.9 and `fast-uri` 3.1.9 lock-only), they are
+    `postcss-selector-parser` 6.1.5 and `undici` 7.29.1 (two moderate advisories) in the
+    application graph, and `undici` 6.29.0 (one) and `ip-address` 10.7.2 in the scanner graph.
   - **Removal.** Each record comes out in the same change that fixes or removes the copy it
     covers. A record that matches nothing is refused as stale.
   - **The contract.** A CONTRACT test in `dependency-audit/tests/audit.test.mjs` pins the set
-    by id, graph, kind, scope, provenance and expiry. It drives the record through the real
-    evaluator against its exact subject, including the refusals (no cross-graph cover, 4.3.0
-    unmatched, the expiry boundary, a stale subject, an uncorroborated alias), and pins each
-    of the five former subjects as blocking if it is ever reported again.
+    by id, graph, kind, scope, provenance and expiry. It drives each record through the real
+    evaluator against its exact subject, including the refusals (no cross-graph cover, the
+    `node-gyp` copy uncovered, another version unmatched, each expiry boundary, a stale subject,
+    an uncorroborated alias), and pins each of the five former subjects as blocking if it is
+    ever reported again.
   - **Nothing else is pre-approved.** Any other exception or triage record must name the
     exact advisory, package, version, paths and scope, and must carry evidence, an owner, a
     linked mugak1 review and an expiry of at most 90 days. Otherwise it is refused.

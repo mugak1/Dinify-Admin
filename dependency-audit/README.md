@@ -102,7 +102,8 @@ outranks every npmrc, so the invocation and the check cannot disagree.
 
 ## Exceptions and triage records
 
-**One record is approved: `application-http-cache-semantics-GHSA-ch52-4w7c-c8xp`, a
+**Three records are approved.** The first is
+**`application-http-cache-semantics-GHSA-ch52-4w7c-c8xp`, a
 `kind: "exception"` with `scope: "tooling"`, approved by the owner on 2026-10-23 (#46). It
 expires on 2026-12-31: valid through 2026-12-30, and it lapses at 00:00 UTC on 2026-12-31 with
 no automatic extension.** It replaces the record for the same subject approved on 2026-10-07
@@ -117,9 +118,30 @@ the vulnerable max-stale and shared `Set-Cookie` handling is byte-identical. Tak
 application graph would hide the finding without remediating it, so it is deliberately not
 installed there.
 
-With this record the audit is **`exceptions_only`**, and the headline says so. It is never
-"clean" or "no vulnerabilities". From 00:00 UTC on 2026-12-31 the record is refused as
-expired and its finding blocks, unless a new, separately approved record replaces it.
+**The other two cover GHSA-xjj6-f33q-929c (`undici`, high: "Denial of Service via unhandled
+error on excessive content-encodings"), one per graph, approved by the owner on 2026-10-24
+(#48). Both expire on 2026-11-30: valid through 2026-11-29, and they lapse at 00:00 UTC on
+2026-11-30 with no automatic extension.** Fixed releases exist (7.30.1 and 6.29.1, both
+published 2026-10-15), but neither copy can take one in the lock:
+- `application-undici-GHSA-xjj6-f33q-929c` covers `undici` 7.29.1 in the APPLICATION graph.
+  `@angular/build` pins it exactly, including the latest 21.2.28, and this repository uses no
+  overrides. Its only requirer is the dev server's SSR SSL plugin, which is added only when
+  SSR is enabled; `angular.json` configures none. It is not in the production bundle.
+- `scanner-undici-GHSA-xjj6-f33q-929c` covers `undici` 6.29.0 bundled in the pinned scanner,
+  npm 11.21.1. That is the latest npm 11.x, and npm 12.x needs Node 22. Its only requirer in
+  the bundle is `node-gyp`'s download code, which `npm audit` does not run. A scanner crash
+  would leave the audit incomplete, which fails closed.
+
+In runs measured on 2026-10-24 with a load probe and positive controls, `ng version`, lint, the
+production build, the test suite and the scanner's exact audit argv against both graphs
+loaded no file from either copy. `ng serve` was traced in the source, not exercised. The third
+copy, `node-gyp`'s in the application graph, took 6.29.1 in the lock in the same change, so
+no record covers it.
+
+With these records the audit is **`exceptions_only`**, and the headline says so. It is never
+"clean" or "no vulnerabilities". From 00:00 UTC on 2026-11-30 the two `undici` records are
+refused as expired, and from 00:00 UTC on 2026-12-31 the http-cache-semantics one is. A
+lapsed record's finding blocks, unless a new, separately approved record replaces it.
 
 **Five records were removed when the scanner moved to npm 11.21.1, and only three of the
 removals are remediations.** npm 11.21.1 is the first npm whose distributed tarball bundles
@@ -137,12 +159,15 @@ If either stale advisory is reinstated or widened, or the scanner is rolled back
 finding blocks again with no record. The CONTRACT in `tests/audit.test.mjs` pins that.
 
 Nothing is triaged. The lower-severity tooling findings stay visible as TRIAGE REQUIRED:
-`postcss-selector-parser` 6.1.5 (application graph) and `ip-address` 10.7.2 (scanner graph).
+- in the application graph: `postcss-selector-parser` 6.1.5, and `undici` 7.29.1 for
+  GHSA-4qv8-2p9j-2685 and GHSA-f72v-6w45-q472;
+- in the scanner graph: `undici` 6.29.0 for GHSA-4qv8-2p9j-2685, and `ip-address` 10.7.2.
 
 The CONTRACT in `tests/audit.test.mjs` pins the set by id, graph, kind, scope, provenance and
-expiry. It drives the record through the real evaluator against its exact subject, asserts
-what it must keep refusing, and drives the five former subjects through the evaluator, each
-of which must block with nothing covering it.
+expiry. It drives each record through the real evaluator against its exact subject, asserts
+what it must keep refusing (including the other graph's `undici` copy and `node-gyp`'s), and
+drives the five former subjects through the evaluator, each of which must block with nothing
+covering it.
 
 Several advisories with a supported fixed release were fixed in the lock instead of being
 excepted:
@@ -223,6 +248,20 @@ advisory data). Against that, `main` (ed6430d) still audited as described above.
   - in the scanner graph: `ip-address` 10.7.2 (GHSA-rxp7-6hxx-x8q5), which this update does
     not touch.
 - The production `dist/` is byte-identical to main's.
+
+That did not hold through the merge. Advisories published afterwards made `main` (c88a75b)
+audit **blocking** on 2026-10-24, measured at 18:25 UTC: 15 findings, 4 of them blocking.
+`body-parser` GHSA-27r3-jxmh-p828 (high; karma's copy, 1.20.8) was published between #47's PR
+audit and its merge audit. `undici` GHSA-xjj6-f33q-929c (high) appeared at three paths.
+`fast-uri` 3.1.8 and `undici` gained lower-severity advisories. #48 answers it as follows:
+- Lock-only, in range: karma's `body-parser` 1.20.8 → 1.20.9, `node-gyp`'s `undici` 6.29.0 →
+  6.29.1, and `fast-uri` 3.1.8 → 3.1.9. No `package.json` edit and no override.
+- The two `undici` exceptions above, for the copies with no lock-only fix.
+
+Measured at 18:53 UTC under the same conditions, the audit is **`exceptions_only`** with 8
+findings across both graphs: 3 under approved exceptions and 5 lower-severity tooling findings
+requiring triage. Nothing blocks and no record is refused. The production `dist/` is
+byte-identical to main's.
 
 ## How it runs
 

@@ -430,3 +430,175 @@ describe('EXECUTED: the privileged verify step, running the REAL verifier from a
     } finally { ws.cleanup(); git(p.root, 'checkout', '--', 'release/lib/admission.mjs'); }
   }));
 });
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// THE WINDOW JOB (CI-signal C3). The development server runs only inside the owner's AWS
+// schedule. `window` decides PROCEED / DEFER / FAIL before anything else runs, holds only
+// `actions: write`, and a deferred run cancels itself and can never conclude green.
+// ─────────────────────────────────────────────────────────────────────────────────
+const WINDOW = DEPLOY.jobs.window;
+const WSTEPS = WINDOW.steps;
+const SELF_TEST = 'Self-test the window decision';
+const DECIDE = 'Decide PROCEED, DEFER or FAIL';
+const ENFORCE = 'Enforce the decision (a deferred run cancels itself)';
+const REAL_DATE = existsSync('/usr/bin/date') ? '/usr/bin/date' : '/bin/date';
+const WINDOW_ENV = { DEV_SERVER_WINDOW: WINDOW.env.DEV_SERVER_WINDOW, DEV_SERVER_WINDOW_END_MARGIN_MINUTES: WINDOW.env.DEV_SERVER_WINDOW_END_MARGIN_MINUTES, WINDOW_PROBE_URL: WINDOW.env.WINDOW_PROBE_URL, WINDOW_DECISION_SH: WINDOW.env.WINDOW_DECISION_SH };
+const epoch = (iso) => String(Date.parse(iso) / 1000);
+
+/** Run a window step with the job's env, a summary file, and (optionally) a fixed clock. */
+function runWindow(name, { env = {}, stubs = {}, at } = {}) {
+  const cwd = mkdtempSync(join(tmpdir(), 'window-'));
+  try {
+    const summary = join(cwd, 'summary.md');
+    writeFileSync(summary, '');
+    const clock = at ? { date: `if [ "$*" = "-u +%s" ]; then echo ${epoch(at)}; else exec ${REAL_DATE} "$@"; fi` } : {};
+    const r = execStep(step(WSTEPS, name).run, { cwd, env: { ...WINDOW_ENV, GITHUB_STEP_SUMMARY: summary, GITHUB_RUN_ID: '4242', ...env }, stubs: { sleep: 'exit 0', ...clock, ...stubs } });
+    return { ...r, summary: readFileSync(summary, 'utf8') };
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+}
+const curlAnswers = (code = 200) => `printf '${code}'`;
+const curlSilent = `printf '000'; exit 28`;
+
+describe('STATIC: the window job', () => {
+  it('CONTRACT: it holds exactly `actions: write` — no id-token, no secret, no checkout, no action', () => {
+    assert.deepEqual(WINDOW.permissions, { actions: 'write' });
+    for (const s of WSTEPS) {
+      assert.equal(s.uses, undefined, `${s.name}: the window job runs no action, first-party or otherwise`);
+      assert.doesNotMatch(`${s.run ?? ''}`, /\bnpm\b|\bnpx\b|\bpip\b|\bgit\b|\bnode\b|checkout/, s.name);
+      assert.doesNotMatch(`${s.run ?? ''}`, /\$\{\{/, `${s.name} interpolates into run:`);
+    }
+    assert.doesNotMatch(JSON.stringify(WINDOW), /secrets\.|id-token/);
+    for (const [name, job] of Object.entries(DEPLOY.jobs)) if (name !== 'window') assert.ok(!('actions' in (job.permissions ?? {})) || job.permissions.actions === 'read', `${name} gained actions: write`);
+  });
+
+  it('CONTRACT: it is the first job, gated exactly as prepare is, and every deploying job needs it', () => {
+    assert.equal(WINDOW.needs, undefined);
+    assert.equal(WINDOW.if, DEPLOY.jobs.prepare.if);
+    assert.equal(DEPLOY.jobs.prepare.needs, 'window');
+    assert.deepEqual(DEPLOY.jobs.deploy.needs, ['window', 'prepare']);
+    assert.deepEqual(Object.keys(DEPLOY.jobs), ['window', 'prepare', 'deploy']);
+  });
+
+  it('CONTRACT: the existing ordering guard is unchanged in place — before the role check and before OIDC', () => {
+    const guard = index(PRIV, 'Forward-only ordering guard (automatic runs only)');
+    assert.ok(guard > 0 && guard < index(PRIV, 'Validate deploy role ARN') && guard < index(PRIV, OIDC));
+    assert.match(step(PRIV, 'Forward-only ordering guard (automatic runs only)').run, /Failing closed rather than deploying blind/);
+  });
+
+  it('CONTRACT: the window is written once, as London wall time with a 20-minute end margin', () => {
+    assert.equal(WINDOW.env.DEV_SERVER_WINDOW, '11:00–23:00 Europe/London');
+    assert.equal(WINDOW.env.DEV_SERVER_WINDOW_END_MARGIN_MINUTES, '20');
+    assert.equal(DEPLOY_TEXT.split('11:00–23:00 Europe/London').length - 1, 1);
+    assert.match(WINDOW.env.WINDOW_DECISION_SH, /TZ="\$zone" date -d/);
+    assert.doesNotMatch(WINDOW.env.WINDOW_DECISION_SH, /\+0[0-9]:?00|UTC[+-]|TZ=UTC/, 'never a fixed offset');
+  });
+
+  it('CONTRACT: the DEFER path cannot reach a zero exit — no step condition, no continue-on-error, and the only `exit 0` is PROCEED', () => {
+    assert.deepEqual(WSTEPS.map((s) => s.name), [SELF_TEST, DECIDE, ENFORCE]);
+    for (const s of [WINDOW, ...WSTEPS]) {
+      assert.equal(s['continue-on-error'], undefined, s.name ?? 'window');
+      if (s !== WINDOW) assert.equal(s.if, undefined, s.name);
+    }
+    const enforce = step(WSTEPS, ENFORCE).run;
+    assert.deepEqual(enforce.split('\n').filter((l) => /\bexit 0\b/.test(l)).map((l) => l.trim()), ['PROCEED) exit 0 ;;']);
+    assert.match(enforce.trimEnd(), /\n\s*exit 1$/, 'falling out of the wait is red');
+    const decide = step(WSTEPS, DECIDE).run;
+    assert.doesNotMatch(decide, /\bexit 0\b/);
+    // GitHub's sequencing over the real steps: a decide that succeeded with DEFER and an
+    // enforce that did not exit 0 is a job that is not green.
+    for (const out of ['failure', 'cancelled']) assert.notEqual(simulateJob(WSTEPS, (s) => (s.name === ENFORCE ? out : 'success')).conclusion, 'success');
+  });
+});
+
+describe('EXECUTED: the window self-test, under the real tz database', () => {
+  it('CONTROL: every case passes, including both 2026 daylight-saving change days', () => {
+    const r = runWindow(SELF_TEST);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /window self-test: all cases passed/);
+    for (const stamp of ['2026-03-29 02:30 BST', '2026-03-29 11:30 BST', '2026-10-25 01:30 BST', '2026-10-25 01:30 GMT', '2026-10-25 22:30 GMT', '2026-10-26 22:45 GMT']) assert.ok(r.stdout.includes(`at ${stamp}:`), stamp);
+    assert.equal(r.stdout.split('\n').filter((l) => l.startsWith('ok ')).length, 22);
+  });
+
+  for (const [label, from, to] of [
+    ['a fixed UTC offset instead of the tz database', 'TZ="$zone" date -d', 'TZ=UTC date -d'],
+    ['an inclusive end', '[ "$minute" -lt "$end" ]', '[ "$minute" -le "$end" ]'],
+    ['no end margin', 'end=$((end - 10#${margin}))', 'end=$((end - 0))'],
+    ['evidence ignored off-hours', 'WINDOW_DECISION=PROCEED', 'WINDOW_DECISION=DEFER'],
+  ]) {
+    it(`NEGATIVE CONTROL: ${label} fails the self-test`, () => {
+      assert.ok(WINDOW.env.WINDOW_DECISION_SH.includes(from), from);
+      const r = runWindow(SELF_TEST, { env: { WINDOW_DECISION_SH: WINDOW.env.WINDOW_DECISION_SH.replace(from, to) } });
+      assert.equal(r.status, 1, r.stdout);
+    });
+  }
+});
+
+describe('EXECUTED: the window decision, with the probe and the clock stubbed', () => {
+  const TARGET = 'c3'.repeat(20);
+  const auto = { EVENT_NAME: 'workflow_run', RUN_SHA: TARGET, INPUT_SHA: '' };
+
+  it('CONTROL: the origin answers off-hours → PROCEED, whatever the time', () => {
+    const r = runWindow(DECIDE, { env: auto, at: '2026-10-27T03:00:00Z', stubs: { curl: curlAnswers(503) } });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.outputs.decision, 'PROCEED');
+    assert.equal(r.summary, '');
+  });
+
+  it('REGRESSION: no answer inside the window → FAIL red, after three attempts', () => {
+    const r = runWindow(DECIDE, { env: auto, at: '2026-10-26T14:00:00Z', stubs: { curl: curlSilent } });
+    assert.equal(r.status, 1);
+    assert.equal(r.outputs.decision, 'FAIL');
+    assert.equal(r.calls.split('\n').filter((l) => l.startsWith('curl ')).length, 3);
+    assert.match(r.stderr, /a real outage/);
+  });
+
+  it('CONTRACT: no answer off-hours → DEFER, with the target, the London time and the recovery in the summary', () => {
+    const r = runWindow(DECIDE, { env: auto, at: '2026-10-26T23:30:00Z', stubs: { curl: curlSilent } });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.outputs.decision, 'DEFER');
+    assert.ok(r.summary.includes(`- Target SHA: \`${TARGET}\``));
+    assert.ok(r.summary.includes('- London time: 2026-10-26 23:30 GMT'));
+    assert.ok(r.summary.includes(`The development server is scheduled off (11:00–23:00 Europe/London). Re-run all jobs at or after 11:00 London, or dispatch Deploy Admin with sha=${TARGET}.`));
+  });
+
+  it('CONTRACT: a manual run is deferred the same way, naming the dispatched SHA', () => {
+    const r = runWindow(DECIDE, { env: { EVENT_NAME: 'workflow_dispatch', RUN_SHA: '', INPUT_SHA: TARGET }, at: '2026-10-26T10:00:00Z', stubs: { curl: curlSilent } });
+    assert.equal(r.outputs.decision, 'DEFER');
+    assert.ok(r.summary.includes(`sha=${TARGET}.`));
+  });
+});
+
+describe('EXECUTED: enforcing the decision', () => {
+  const ghBody = ({ cancel = 0, view = 'in_progress/' } = {}) => `case "$1 $2" in "run cancel") exit ${cancel} ;; "run view") echo '${view}' ;; *) echo "unexpected gh $*" >&2; exit 99 ;; esac`;
+  const enforce = (decision, gh) => runWindow(ENFORCE, { env: { DECISION: decision, GH_TOKEN: 'x', GITHUB_REPOSITORY: 'mugak1/Dinify-Admin' }, stubs: { gh: gh ?? ghBody() } });
+
+  it('CONTROL: PROCEED continues, and nothing is cancelled', () => {
+    const r = enforce('PROCEED');
+    assert.equal(r.status, 0);
+    assert.equal(r.calls.split('\n').filter((l) => l.startsWith('gh ')).length, 0);
+  });
+
+  it('CONTRACT: DEFER cancels its own run, waits about two minutes, and fails red if the cancellation never lands', () => {
+    const r = enforce('DEFER');
+    assert.equal(r.status, 1);
+    const gh = r.calls.split('\n').filter((l) => l.startsWith('gh '));
+    assert.equal(gh[0], 'gh run cancel 4242 --repo mugak1/Dinify-Admin');
+    assert.equal(gh.filter((l) => l.startsWith('gh run view 4242')).length, 24);
+    assert.equal(r.calls.split('\n').filter((l) => l === 'sleep 5').length, 24);
+  });
+
+  for (const [label, gh] of [
+    ['a refused cancellation request', ghBody({ cancel: 1 })],
+    ['a run that already reads cancelled while this step still runs', ghBody({ view: 'completed/cancelled' })],
+    ['an unreadable run', ghBody({ view: '' }).replace("echo ''", 'exit 1')],
+  ]) {
+    it(`REGRESSION MATRIX: DEFER with ${label} → non-zero, never green`, () => assert.equal(enforce('DEFER', gh).status, 1));
+  }
+
+  for (const decision of ['FAIL', '', 'proceed', 'PROCEED ', 'DEFER\nPROCEED']) {
+    it(`REGRESSION MATRIX: decision ${JSON.stringify(decision)} → non-zero, nothing cancelled`, () => {
+      const r = enforce(decision);
+      assert.notEqual(r.status, 0);
+    });
+  }
+});

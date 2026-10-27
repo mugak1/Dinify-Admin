@@ -28,6 +28,7 @@ import { decideAdmission } from '../lib/admission.mjs';
 import { recordBytes } from '../lib/common.mjs';
 import { sha256Hex } from '../lib/tree.mjs';
 import { EVAL_RUN_ID, REPO_ROOT, evaluatedProject, git } from './fixtures.mjs';
+import { advisoryBody, cannedAdvisories, npmReport, via } from '../../dependency-audit/tests/project.mjs';
 import { remoteScriptOf } from './host-model.mjs';
 
 const DEPLOY_TEXT = readFileSync(join(REPO_ROOT, '.github/workflows/deploy.yml'), 'utf8');
@@ -143,7 +144,8 @@ describe('STATIC: certification in ci.yml', () => {
     const at = (cmd) => VALIDATE.findIndex((s) => s.run === cmd);
     assert.ok(at('npm run release:prebuild') < at('npm run build:prod'));
     assert.ok(at('npm run check:mock-isolation') < at('npm run release:freeze'));
-    assert.ok(at('npm run audit:deps') < at('npm run release:certify'));
+    // The scan step deepens the checkout and passes its base first (CI-signal A-2).
+    assert.ok(VALIDATE.findIndex((s) => /^npm run audit:deps\b/m.test(String(s.run))) < at('npm run release:certify'));
   });
 
   it('CONTRACT: the candidate is uploaded ONLY when every gate passed, named by run and attempt', () => {
@@ -417,6 +419,42 @@ describe('EXECUTED: the privileged verify step, running the REAL verifier from a
       const r = execStep(verifyStep.run, { cwd: ws.cwd, env: envFor(p, ws, { GITHUB_SHA: 'f'.repeat(40) }) });
       assert.equal(r.status, 1);
       assert.match(r.stderr, /trusted_unreadable/);
+    } finally { ws.cleanup(); }
+  }));
+
+  // CI-signal A-2: an assessment carrying a DATED OBLIGATION and its retained
+  // advisories.json, through the REAL step. SYNTHETIC: the scanner's answer (a high on the
+  // tooling package `tool`) and GitHub's record of it, reviewed two days ago.
+  const withObligation = (fn) => {
+    const reviewed = new Date(Date.now() - 2 * 86_400_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    const p = evaluatedProject({
+      withVerifier: true, at: new Date(Date.now() - 10 * 60_000).toISOString(),
+      assessAnswers: { application: { status: 1, stdout: npmReport({ tool: { via: [via('tool', 'high', '>=0.0.0', 'GHSA-aaaa-bbbb-cccc')], nodes: ['node_modules/tool'] } }) } },
+      advisories: cannedAdvisories((id) => ({ status: 200, body: advisoryBody(id, { reviewed, published: reviewed }) }), { authenticated: false }),
+    });
+    try { return fn(p); } finally { p.cleanup(); }
+  };
+
+  it('CONTRACT (CI-signal A-2): an assessment carrying a dated obligation verifies — the step re-reads advisories.json from the admission and asks nothing', () => withObligation((p) => {
+    assert.equal(p.assessment.outcome, 'obligations_pending');
+    const ws = workspace(p);
+    try {
+      assert.ok(existsSync(join(ws.cwd, 'admission', 'assessment', 'advisories.json')));
+      const r = execStep(verifyStep.run, { cwd: ws.cwd, env: envFor(p, ws) });
+      assert.equal(r.status, 0, r.stderr);
+      assert.equal(r.outputs.kind, 'certified');
+    } finally { ws.cleanup(); }
+  }));
+
+  it('REGRESSION (CI-signal A-2): the retained advisories.json altered after prepare → the step refuses, no outputs', () => withObligation((p) => {
+    const ws = workspace(p);
+    try {
+      const path = join(ws.cwd, 'admission', 'assessment', 'advisories.json');
+      writeFileSync(path, readFileSync(path, 'utf8').replace('"authenticated": false', '"authenticated": true'));
+      const r = execStep(verifyStep.run, { cwd: ws.cwd, env: envFor(p, ws) });
+      assert.equal(r.status, 1);
+      assert.match(r.stderr, /assessment_advisories_invalid/);
+      assert.deepEqual(r.outputs, {});
     } finally { ws.cleanup(); }
   }));
 

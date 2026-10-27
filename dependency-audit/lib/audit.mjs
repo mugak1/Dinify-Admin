@@ -16,6 +16,17 @@
  *               decides again. Evidence for another revision, lockfile or environment is
  *               refused, not reused.
  *
+ * THE BASE AND THE CLOCK (CI-signal A-2). `audit` may be given a BASE: the commit the change
+ * under audit was made on (a pull request's base, a push's `before`). Both lock graphs are
+ * read from it with `git show`, every finding is given its provenance against them
+ * (npm.mjs), and for the advisories of those findings the date each became reportable is
+ * asked of GitHub (advisories.mjs) — after the scanner has run, in this code. The base
+ * commit, both base lock digests and the advisory record's digest go into the collection,
+ * so `evaluate` re-derives the base from git and re-reads the dates from the retained
+ * record, and never fetches. There is no flag that supplies a date or a provenance; a
+ * base that is absent, all zeros, not in this clone or not an ancestor of HEAD is no base,
+ * and the audit then decides exactly as it did before A-2.
+ *
  * The scanner runner is a parameter so the regression matrix can drive every failure
  * mode deterministically. The CLI passes the real one; there is no flag, environment
  * variable or policy field that substitutes another scanner.
@@ -25,8 +36,9 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 
+import { ADVISORIES_FILE, advisoryIds, applyDates, buildAdvisoryEvidence, fetchAdvisories, readAdvisoryEvidence } from './advisories.mjs';
 import { evaluate, headline } from './core.mjs';
-import { environmentFacts, inventory, readReport, scannerArgs, scannerEnvironment, sha256, toolingScope } from './npm.mjs';
+import { environmentFacts, inventory, lockEntries, readReport, scannerArgs, scannerEnvironment, sha256, toolingScope } from './npm.mjs';
 
 export const SNAPSHOT_SCHEMA = 'dinify.dependency-audit.snapshot/v1';
 export const COLLECTION_SCHEMA = 'dinify.dependency-audit.collection/v1';
@@ -123,6 +135,61 @@ export function gitRevision(root, runner = spawnRunner) {
   return { commit: commit.stdout.trim(), tree: tree.stdout.trim() };
 }
 
+const SHA_RE = /^[0-9a-f]{40}$/;
+
+/**
+ * A requested base, normalised: the commit, or null for NO base. Empty and all zeros (a
+ * push that created a branch) are no base. Anything else that is not a full lower-case
+ * commit id is not a base either — the caller refuses it as a usage error rather than
+ * guessing what was meant.
+ */
+export function requestedBase(value) {
+  if (value === undefined || value === null || value === '' || /^0{40}$/.test(String(value))) return { commit: null, valid: true };
+  return SHA_RE.test(String(value)) ? { commit: String(value), valid: true } : { commit: null, valid: false };
+}
+
+/** Where each graph's lockfile lives in a commit. */
+const baseLockPaths = (policy) => ({ application: 'package-lock.json', scanner: `${policy.scanner.root}/package-lock.json` });
+
+/**
+ * The base, read from git: the record the collection keeps, and per graph the lock entries
+ * provenance is decided against. Always the real git, like gitRevision.
+ *
+ *   state 'applied'      the commit is in this clone and an ancestor of HEAD; per graph
+ *                        `present` (its lockfile, digest recorded), `absent` (the commit
+ *                        has no lockfile there: everything in the graph is introduced) or
+ *                        `unreadable` (no provenance for that graph);
+ *   state 'unavailable'  not in this clone, or not an ancestor (a force push): NO base.
+ */
+export function resolveBase(root, commit, policy, runner = spawnRunner) {
+  const git = (args) => runner({ command: 'git', args, cwd: root, env: process.env, timeoutMs: 60000 });
+  const unavailable = (reason) => ({ record: { commit, state: 'unavailable', reason }, bases: {} });
+  if (git(['cat-file', '-e', `${commit}^{commit}`]).status !== 0) return unavailable('the base commit is not in this clone');
+  if (git(['merge-base', '--is-ancestor', commit, 'HEAD']).status !== 0) return unavailable('the base commit is not an ancestor of HEAD');
+  const record = { commit, state: 'applied', graphs: {} };
+  const bases = {};
+  for (const [graph, path] of Object.entries(baseLockPaths(policy))) {
+    if (git(['cat-file', '-e', `${commit}:${path}`]).status !== 0) {
+      record.graphs[graph] = { path, state: 'absent', lockfileSha256: null };
+      bases[graph] = new Map();
+      continue;
+    }
+    const shown = git(['show', `${commit}:${path}`]);
+    const entries = shown.status === 0 ? lockEntries(shown.stdout) : null;
+    record.graphs[graph] = { path, state: entries ? 'present' : 'unreadable', lockfileSha256: shown.status === 0 ? sha256(shown.stdout) : null };
+    if (entries) bases[graph] = entries;
+  }
+  return { record, bases };
+}
+
+/** Two base records name the same base, read the same way. */
+function baseDifferences(recorded, again) {
+  const out = [];
+  const fields = (r) => JSON.stringify([r?.commit, r?.state, ...['application', 'scanner'].map((g) => [r?.graphs?.[g]?.path, r?.graphs?.[g]?.state, r?.graphs?.[g]?.lockfileSha256])]);
+  if (fields(recorded) !== fields(again)) out.push(`recorded ${fields(recorded)}, re-derived ${fields(again)}`);
+  return out;
+}
+
 /** Everything a scan is bound to. Two captures are the same inventory iff these are equal. */
 export function capture(root, { policy, env = environmentFacts(), revision }) {
   const inv = inventory(root, { graph: 'application', env });
@@ -187,14 +254,14 @@ function recordRun(evidenceDir, graph, run) {
  * Scan and decide. Returns the result document; the caller maps result.exitCode.
  * @param {object} deps  runner, installScanner (tests replace the network-facing parts)
  */
-export function audit(root, { evidenceDir, now, runner = spawnRunner, env, installScanner = defaultInstallScanner } = {}) {
+export function audit(root, { evidenceDir, now, runner = spawnRunner, env, installScanner = defaultInstallScanner, base = null, advisories = fetchAdvisories } = {}) {
   mkdirSync(evidenceDir, { recursive: true });
   const incomplete = [];
   const { policy, problems: policyProblems } = loadPolicy(root);
   incomplete.push(...policyProblems);
   const revision = gitRevision(root);
   const collection = { schema: COLLECTION_SCHEMA, startedAt: now, graphs: {}, scanner: null, binding: null, removedEnvironment: [] };
-  const graphFindings = [];
+  let graphFindings = [];
 
   let snap = null;
   const snapPath = join(evidenceDir, 'snapshot.json');
@@ -222,6 +289,13 @@ export function audit(root, { evidenceDir, now, runner = spawnRunner, env, insta
       incomplete.push(...install.problems);
     }
 
+    let bases = {};
+    if (incomplete.length === 0 && base) {
+      const resolved = resolveBase(root, base, policy);
+      collection.base = resolved.record;
+      bases = resolved.bases;
+    }
+
     if (incomplete.length === 0) {
       const { env: scanEnv, removed } = scannerEnvironment(process.env);
       collection.removedEnvironment = removed;
@@ -238,13 +312,27 @@ export function audit(root, { evidenceDir, now, runner = spawnRunner, env, insta
         if (canonical(pre.digests) !== canonical(post.digests)) {
           incomplete.push({ code: 'inventory_changed_during_audit', detail: `${g.graph}: the installed inventory changed while it was being scanned — the result describes nothing that still exists` });
         }
-        const report = readReport({ graph: g.graph, run, inv: pre });
+        const report = readReport({ graph: g.graph, run, inv: pre, base: bases[g.graph] });
         incomplete.push(...report.problems);
         graphFindings.push(...report.findings);
         collection.graphs[g.graph] = { run: recordRun(evidenceDir, g.graph, run), digests: pre.digests, counts: pre.counts };
       }
       const after = capture(root, { policy, env, revision: gitRevision(root) });
       for (const d of bindingDifferences(snap?.binding, after.binding)) incomplete.push({ code: 'binding_mismatch', detail: `after the scan: ${d}` });
+
+      // THE CLOCK, after the scanner, for the findings whose provenance was established.
+      // The dates are read back from the very bytes retained, by the reader `evaluate` uses.
+      const ids = advisoryIds(graphFindings);
+      if (ids.length > 0) {
+        let asked;
+        try { asked = advisories(ids); } catch { asked = { answers: ids.map((id) => ({ id, status: 0, retrievedAt: null, error: 'fetch_failed', body: null })), authenticated: false }; }
+        const record = buildAdvisoryEvidence(asked);
+        writeFileSync(join(evidenceDir, ADVISORIES_FILE), record.bytes);
+        collection.advisories = { file: ADVISORIES_FILE, sha256: record.sha256, requested: ids.length, authenticated: record.doc.authenticated };
+        const read = readAdvisoryEvidence(record.bytes, record.sha256);
+        incomplete.push(...read.problems);
+        graphFindings = applyDates(graphFindings, read.dates);
+      }
     }
   }
 
@@ -296,6 +384,7 @@ export function verifyScannerPin(scannerRoot, policy) {
 export function reevaluate(root, { evidenceDir, now, env } = {}) {
   const incomplete = [];
   const findings = [];
+  let dated = null;
   const { policy, problems } = loadPolicy(root);
   incomplete.push(...problems);
   const readDoc = (name, schema) => {
@@ -312,6 +401,19 @@ export function reevaluate(root, { evidenceDir, now, env } = {}) {
     incomplete.push(...current.problems);
     for (const d of bindingDifferences(collection.binding, current.binding)) incomplete.push({ code: 'evidence_foreign', detail: `the evidence is not for this checkout: ${d}` });
     for (const d of bindingDifferences(snap.binding, collection.binding)) incomplete.push({ code: 'evidence_foreign', detail: `the evidence's scan is not bound to its snapshot: ${d}` });
+    // THE BASE, re-derived from git — never taken from the record. A scan that had none, or
+    // whose base was unavailable, is re-decided without provenance, as it was decided.
+    let bases = {};
+    if (collection.base !== undefined) {
+      if (!isMapping(collection.base) || !SHA_RE.test(String(collection.base.commit)) || !['applied', 'unavailable'].includes(collection.base.state)) {
+        incomplete.push({ code: 'evidence_unreadable', detail: 'collection.json: the base is not one this audit records' });
+      } else if (collection.base.state === 'applied') {
+        const again = resolveBase(root, collection.base.commit, policy);
+        const differences = again.record.state === 'applied' ? baseDifferences(collection.base, again.record) : [again.record.reason];
+        if (differences.length) incomplete.push({ code: 'evidence_base_mismatch', detail: `the base the scan was compared against cannot be re-derived from git: ${differences.join('; ')}` });
+        else bases = again.bases;
+      }
+    }
     const expected = ['application', 'scanner'];
     for (const graph of expected) {
       const g = collection.graphs?.[graph];
@@ -322,29 +424,74 @@ export function reevaluate(root, { evidenceDir, now, env } = {}) {
       const dir = graph === 'application' ? root : resolve(root, policy.scanner.root);
       const inv = inventory(dir, { graph, env, scopeOf: graph === 'scanner' ? toolingScope : undefined });
       if (canonical(inv.digests) !== canonical(g.digests)) incomplete.push({ code: 'evidence_foreign', detail: `${graph}: the recorded scan was of a different inventory` });
-      const report = readReport({ graph, run: { ...g.run, stdout }, inv });
+      const report = readReport({ graph, run: { ...g.run, stdout }, inv, base: bases[graph] });
       incomplete.push(...report.problems);
       findings.push(...report.findings);
     }
+    // THE CLOCK, re-read from the retained record, never asked again.
+    if (collection.advisories !== undefined) {
+      const a = collection.advisories;
+      if (!isMapping(a) || a.file !== ADVISORIES_FILE) {
+        incomplete.push({ code: 'evidence_unreadable', detail: 'collection.json: the advisory record is not one this audit writes' });
+      } else {
+        let bytes;
+        try { bytes = readFileSync(join(evidenceDir, ADVISORIES_FILE)); } catch { bytes = undefined; }
+        const read = readAdvisoryEvidence(bytes, a.sha256);
+        for (const p of read.problems) incomplete.push({ code: p.code === 'advisories_tampered' ? 'evidence_tampered' : 'evidence_unreadable', detail: p.detail });
+        dated = read.problems.length === 0 ? read.dates : null;
+      }
+    }
   }
-  const result = evaluate({ incomplete, findings, records: policy?.records ?? [], now });
+  const result = evaluate({ incomplete, findings: dated ? applyDates(findings, dated) : findings, records: policy?.records ?? [], now });
   return { schema: RESULT_SCHEMA, decidedAt: now, headline: headline(result), ...result };
 }
 
+/**
+ * What the collection says about the base and the clock, in one or two lines — so a run
+ * that deferred nothing because it had no base says so, rather than looking like a run
+ * that had nothing to defer.
+ */
+function provenanceLines(collection) {
+  if (!isMapping(collection)) return [];
+  const b = collection.base;
+  const lines = [];
+  if (b === undefined) lines.push('Provenance: no base was given, so no finding carries one and nothing can be deferred.');
+  else if (b?.state === 'applied') {
+    const graphs = Object.entries(b.graphs ?? {}).map(([g, r]) => `${g} ${r?.state}`).join(', ');
+    lines.push(`Provenance: against base ${b.commit} (${graphs}).`);
+  } else lines.push(`Provenance: base ${b?.commit} is unavailable (${b?.reason}); treated as no base, so nothing can be deferred.`);
+  const a = collection.advisories;
+  if (isMapping(a)) lines.push(`Clock: ${a.requested} advisory record(s) asked of GitHub (${a.authenticated ? 'with the job token' : 'unauthenticated'}), retained as ${a.file}; a finding whose advisory has no date is never deferred.`);
+  return lines;
+}
+
+/**
+ * Why a blocking HIGH tooling finding that carries provenance was not deferred — the one
+ * question a pull request's author has about it. Words only; the decision is core.mjs's.
+ */
+function notDeferredBecause(f) {
+  if (f.class !== 'blocking' || f.scope !== 'tooling' || f.severity !== 'high' || typeof f.provenance !== 'string') return '';
+  if (f.provenance === 'introduced') return ' (introduced: not in the base)';
+  if (typeof f.reportableSince !== 'string') return ' (inherited; no reportable date)';
+  return ` (inherited, reportable since ${f.reportableSince}; its window has closed)`;
+}
+
 /** A human summary: the headline, then what decided it. */
-export function renderSummary(result, { markdown = false } = {}) {
+export function renderSummary(result, { markdown = false, collection = null } = {}) {
   const lines = [];
   lines.push(markdown ? `### Dependency audit\n\n**${result.headline}**\n` : result.headline);
+  for (const line of provenanceLines(collection)) lines.push(markdown ? `${line}\n` : line);
   const group = new Map();
   for (const f of result.findings) {
-    const key = `${f.advisory}|${f.package}|${f.severity}|${f.scope}|${f.class}|${f.disposition}`;
+    const key = `${f.advisory}|${f.package}|${f.severity}|${f.scope}|${f.class}|${f.disposition}|${notDeferredBecause(f)}`;
     if (!group.has(key)) group.set(key, { ...f, paths: [] });
     group.get(key).paths.push(`${f.path}@${f.version}`);
   }
   if (group.size) {
     if (markdown) lines.push('| advisory | package | severity | scope | decision | where |', '|---|---|---|---|---|---|');
     for (const g of group.values()) {
-      const decision = g.disposition === 'open' ? (g.class === 'triage' ? 'triage required' : g.class) : `${g.disposition} (${g.coveredBy})`;
+      const open = g.class === 'triage' ? 'triage required' : g.class === 'deferred' ? `deferred: inherited, blocks from ${g.deadline}` : g.class;
+      const decision = g.disposition === 'open' ? `${open}${notDeferredBecause(g)}` : `${g.disposition} (${g.coveredBy})`;
       lines.push(markdown
         ? `| ${g.advisory} | ${g.package} | ${g.severity} | ${g.scope} | ${decision} | ${g.paths.join('<br>')} |`
         : `  ${g.advisory}  ${g.package}  ${g.severity}  ${g.scope}  → ${decision}\n      ${g.paths.join('\n      ')}`);
@@ -358,7 +505,7 @@ export function renderSummary(result, { markdown = false } = {}) {
   return lines.join('\n');
 }
 
-export function publishSummary(result) {
+export function publishSummary(result, { collection = null } = {}) {
   const target = process.env.GITHUB_STEP_SUMMARY;
-  if (target) appendFileSync(target, `${renderSummary(result, { markdown: true })}\n`);
+  if (target) appendFileSync(target, `${renderSummary(result, { markdown: true, collection })}\n`);
 }

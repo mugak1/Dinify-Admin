@@ -34,6 +34,16 @@
  * exception's lapse is part of the same deadline. `assessmentDeadline` is shared by the
  * admission, the privileged verification and — as an epoch second — the host, so the three
  * cannot disagree about when this assessment stops authorising a promotion.
+ *
+ * PROVENANCE AND THE CLOCK (CI-signal A-2). Both graphs are given provenance against the
+ * CANDIDATE'S OWN retained locks — the application against its retained package-lock.json,
+ * the scanner against its retained scanner lock — because nothing can be introduced into
+ * fixed bytes. When each advisory became reportable is asked of GitHub once, here, after
+ * the scans (dependency-audit/lib/advisories.mjs; this step holds no token, so it asks
+ * unauthenticated, and no answer is no date), and the record is written beside the raw
+ * output as `advisories.json`. An inherited high tooling finding inside its window is then
+ * a DATED OBLIGATION; its deadline is part of `assessmentDeadline`, so a promotion cannot
+ * outrun it. `verifyAssessment` re-reads the record and never fetches.
  */
 
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -41,8 +51,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { defaultInstallScanner, loadPolicy, POLICY_SCHEMA } from '../../dependency-audit/lib/audit.mjs';
+import {
+  ADVISORIES_FILE, advisoryIds, applyDates, buildAdvisoryEvidence, fetchAdvisories, readAdvisoryEvidence,
+} from '../../dependency-audit/lib/advisories.mjs';
 import { evaluate, headline } from '../../dependency-audit/lib/core.mjs';
-import { inventory, readReport, sha256, toolingScope } from '../../dependency-audit/lib/npm.mjs';
+import { annotateProvenance, inventory, lockEntries, readReport, sha256, toolingScope } from '../../dependency-audit/lib/npm.mjs';
 import {
   DIAGNOSTIC_MAX_BYTES, DIAGNOSTIC_REASONS, RETAINED_OBSERVATION, checkDiagnosticProjection, collect, diagnosticFileName, readDiagnosticEvents, retainedInventory, writeReplay,
 } from '../../dependency-audit/lib/retained.mjs';
@@ -54,6 +67,20 @@ export const ASSESSMENT_SCHEMA = 'dinify.admin.assessment/1';
 export const ASSESSMENT_DOC = 'assessment.json';
 export const GRAPHS = Object.freeze(['application', 'scanner']);
 const RAW_RE = /^(application|scanner)\.scanner-(stdout|stderr)\.txt$/;
+
+/**
+ * The dated obligations a decision carries: {advisory, path, deadline}, earliest first.
+ * An assessment states them only when there is one, so one made before A-2 is unchanged.
+ */
+export function obligationsOf(result) {
+  return (result.findings ?? [])
+    .filter((f) => f.class === 'deferred' && typeof f.deadline === 'string')
+    .map((f) => ({ advisory: f.advisory, path: f.path, deadline: f.deadline }))
+    .sort((a, b) => (a.deadline < b.deadline ? -1 : a.deadline > b.deadline ? 1 : a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+}
+
+/** The provenance bases of a promotion: the candidate's own retained locks. */
+const promotionBases = (retained) => ({ application: lockEntries(retained.lockBytes), scanner: lockEntries(retained.scannerLockBytes) });
 
 /** Which records the decision actually applied, with their lapse dates. */
 function appliedRecords(result, records) {
@@ -79,8 +106,9 @@ function appliedRecords(result, records) {
  * @param {Function} [input.installScanner]
  * @param {string[]} [input.forbidden]  more directories the scanner-log root must not be
  *                                      inside or around (the CLI passes the candidate)
+ * @param {Function} [input.advisories]  the clock (dependency-audit/lib/advisories.mjs)
  */
-export function assess({ trustedRoot, inspection, candidate, assessor, outDir, replayDir, runner, clock, installScanner = defaultInstallScanner, forbidden = [] }) {
+export function assess({ trustedRoot, inspection, candidate, assessor, outDir, replayDir, runner, clock, installScanner = defaultInstallScanner, forbidden = [], advisories = fetchAdvisories }) {
   mkdirSync(outDir, { recursive: true });
   mkdirSync(replayDir, { recursive: true });
   const incomplete = [];
@@ -92,6 +120,7 @@ export function assess({ trustedRoot, inspection, candidate, assessor, outDir, r
   incomplete.push(...policyProblems);
   let scanner = null;
   let replay = null;
+  let advisoryRecord = null;
   if (!inspection?.retained || inspection.problems?.length) incomplete.push(reason('candidate_not_inspected', 'no clean candidate inspection to assess'));
   if (policy && !incomplete.length) {
     const scannerRoot = join(trustedRoot, policy.scanner.root);
@@ -109,17 +138,18 @@ export function assess({ trustedRoot, inspection, candidate, assessor, outDir, r
         let diagnosticsRoot = null;
         try { diagnosticsRoot = mkdtempSync(join(tmpdir(), 'dinify-admin-assess-npm-logs-')); } catch { /* each graph records setup_failed */ }
         const diagnostics = { root: diagnosticsRoot, forbidden: [trustedRoot, replayDir, scannerRoot, outDir, ...forbidden] };
+        const bases = promotionBases(inspection.retained);
         try {
           const appInv = retainedInventory({ graph: 'application', manifestBytes, lockBytes, snapshot });
           const app = collect({ graph: 'application', dir: replayDir, inv: appInv, kind: 'retained', npmCli, policy, runner, clock, evidenceDir: outDir, diagnostics });
           incomplete.push(...app.problems);
-          findings.push(...app.findings);
+          findings.push(...annotateProvenance(app.findings, { graph: 'application', inv: appInv, base: bases.application }));
           graphs.application = app.record;
           if (app.problems.length) unfinished.push('application');
           const scannerInv = inventory(scannerRoot, { graph: 'scanner', scopeOf: toolingScope });
           const scn = collect({ graph: 'scanner', dir: scannerRoot, inv: scannerInv, kind: 'installed', scopeOf: toolingScope, npmCli, policy, runner, clock, evidenceDir: outDir, diagnostics });
           incomplete.push(...scn.problems);
-          findings.push(...scn.findings);
+          findings.push(...annotateProvenance(scn.findings, { graph: 'scanner', inv: scannerInv, base: bases.scanner }));
           graphs.scanner = scn.record;
           if (scn.problems.length) unfinished.push('scanner');
           scanner = { package: policy.scanner.package, version: policy.scanner.version, manifestSha256: scannerInv.digests.manifestSha256 ?? null, lockfileSha256: scannerInv.digests.lockfileSha256 ?? null };
@@ -129,10 +159,25 @@ export function assess({ trustedRoot, inspection, candidate, assessor, outDir, r
       }
     }
   }
+  // THE CLOCK, after the scans, for the findings that carry provenance; the dates are read
+  // back from the very bytes retained, by the reader `verifyAssessment` uses.
+  let dated = findings;
+  const ids = advisoryIds(findings);
+  if (ids.length > 0) {
+    let asked;
+    try { asked = advisories(ids); } catch { asked = { answers: ids.map((id) => ({ id, status: 0, retrievedAt: null, error: 'fetch_failed', body: null })), authenticated: false }; }
+    const built = buildAdvisoryEvidence(asked);
+    writeFileSync(join(outDir, ADVISORIES_FILE), built.bytes);
+    advisoryRecord = { file: ADVISORIES_FILE, sha256: built.sha256, requested: ids.length, authenticated: built.doc.authenticated };
+    const read = readAdvisoryEvidence(built.bytes, built.sha256);
+    incomplete.push(...read.problems);
+    dated = applyDates(findings, read.dates);
+  }
   const finishedAt = clock();
   const decidedAt = clock();
   const records = policy?.records ?? [];
-  const result = evaluate({ incomplete, findings, records, now: decidedAt });
+  const result = evaluate({ incomplete, findings: dated, records, now: decidedAt });
+  const obligations = obligationsOf(result);
   const doc = {
     schema: ASSESSMENT_SCHEMA,
     purpose: 'promotion',
@@ -160,6 +205,8 @@ export function assess({ trustedRoot, inspection, candidate, assessor, outDir, r
     headline: headline(result),
     reasons: result.reasons,
     recordsApplied: appliedRecords(result, records),
+    ...(advisoryRecord ? { advisories: advisoryRecord } : {}),
+    ...(obligations.length ? { obligations } : {}),
   };
   writeFileSync(join(outDir, ASSESSMENT_DOC), recordBytes(doc));
   return { doc, result, unfinished };
@@ -207,15 +254,21 @@ export const auditPolicyIdentity = (bytes) => sha256(bytes);
 /** 00:00 UTC on a record's `expires` date: from that instant it has lapsed (core.mjs's rule). */
 export const recordLapsesAt = (expires) => Date.parse(`${expires}T00:00:00Z`);
 
+/** 00:00 UTC on an obligation's deadline: from that instant the finding blocks (core.mjs). */
+export const obligationLapsesAt = (deadline) => Date.parse(`${deadline}T00:00:00Z`);
+
 /**
  * The instant this assessment stops authorising a promotion: the window end measured from
- * the start of collection, or the first applied record's lapse, whichever is earlier.
- * Milliseconds since the epoch; NaN when it cannot be established.
+ * the start of collection, the first applied record's lapse, or the first dated
+ * obligation's deadline, whichever is earliest — one clock, so an obligation that falls
+ * due inside the window cannot be promoted around. Milliseconds since the epoch; NaN when
+ * it cannot be established.
  */
 export function assessmentDeadline(doc, releasePolicy) {
   const windowEnd = Date.parse(doc.startedAt) + releasePolicy.freshness.assessmentWindowHours * 3_600_000;
   const lapses = (doc.recordsApplied ?? []).map((r) => recordLapsesAt(r.expires));
-  return Math.min(windowEnd, ...lapses);
+  const due = (doc.obligations ?? []).map((o) => obligationLapsesAt(o.deadline));
+  return Math.min(windowEnd, ...lapses, ...due);
 }
 
 /** Shape only. Truth is `verifyAssessment`'s question. */
@@ -249,6 +302,10 @@ export function validateAssessment(doc) {
   }
   if (typeof doc.outcome !== 'string' || !Number.isInteger(doc.exitCode) || !isObject(doc.counts)) p('result');
   if (!Array.isArray(doc.recordsApplied) || !doc.recordsApplied.every((r) => isObject(r) && typeof r.id === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(String(r.expires)))) p('recordsApplied');
+  // CI-signal A-2: OPTIONAL, and exact when present. An assessment made before A-2 has neither.
+  if (Object.hasOwn(doc, 'advisories') && (!isObject(doc.advisories) || doc.advisories.file !== ADVISORIES_FILE || !HEX_RE.test(String(doc.advisories.sha256)))) p('advisories');
+  if (Object.hasOwn(doc, 'obligations') && (!Array.isArray(doc.obligations) || doc.obligations.length === 0
+      || !doc.obligations.every((o) => isObject(o) && typeof o.advisory === 'string' && typeof o.path === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(String(o.deadline))))) p('obligations');
   return out;
 }
 
@@ -335,6 +392,7 @@ export function verifyAssessment(files, { inspection, auditPolicy, auditPolicyBy
       }
     }
   }
+  if (doc.advisories) expected.add(ADVISORIES_FILE);
   for (const path of files.keys()) if (!expected.has(path)) problem('assessment_unexpected_file', path);
   if (out.problems.length) return out;
 
@@ -352,24 +410,38 @@ export function verifyAssessment(files, { inspection, auditPolicy, auditPolicyBy
   if (doc.graphs.application.observation !== RETAINED_OBSERVATION) problem('assessment_wrong_graph', 'the application graph was not the retained graph');
   if (out.problems.length) return out;
 
-  // REPRODUCE the decision from the raw output under the trusted policy.
+  // REPRODUCE the decision from the raw output under the trusted policy — with provenance
+  // against the candidate's own retained locks, and dates re-read from the retained
+  // advisory record. Nothing is asked of GitHub here.
   const { manifestBytes, lockBytes, snapshot } = inspection.retained;
   const invs = {
     application: retainedInventory({ graph: 'application', manifestBytes, lockBytes, snapshot }),
     scanner: lockOnlyInventory('scanner', scannerManifest, scannerLock),
   };
+  const bases = promotionBases(inspection.retained);
   const incomplete = [...invs.application.problems, ...invs.scanner.problems];
   const findings = [];
   for (const g of GRAPHS) {
-    const rr = readReport({ graph: g, run: { ...doc.graphs[g].run, stdout: raw[g] }, inv: invs[g] });
+    const rr = readReport({ graph: g, run: { ...doc.graphs[g].run, stdout: raw[g] }, inv: invs[g], base: bases[g] });
     incomplete.push(...rr.problems);
     findings.push(...rr.findings);
   }
-  const reproduced = evaluate({ incomplete, findings, records: auditPolicy.records, now: doc.decidedAt });
+  let dates = new Map();
+  if (doc.advisories) {
+    const read = readAdvisoryEvidence(files.get(ADVISORIES_FILE), doc.advisories.sha256);
+    for (const p of read.problems) problem('assessment_advisories_invalid', `${p.code}: ${p.detail}`);
+    if (out.problems.length) return out;
+    dates = read.dates;
+  }
+  const reproduced = evaluate({ incomplete, findings: applyDates(findings, dates), records: auditPolicy.records, now: doc.decidedAt });
   if (reproduced.outcome !== doc.outcome || !same(reproduced.counts, doc.counts)) {
     problem('assessment_unreproducible', `the raw output reads as ${reproduced.outcome}, the assessment says ${doc.outcome}`);
   }
   if (!same(appliedRecords(reproduced, auditPolicy.records), doc.recordsApplied)) problem('assessment_unreproducible', 'the applied records are not the ones the raw output supports');
+  const due = obligationsOf(reproduced);
+  if (!same(due, doc.obligations ?? []) || (due.length === 0 && Object.hasOwn(doc, 'obligations'))) {
+    problem('assessment_unreproducible', 'the dated obligations are not the ones the raw output and the retained advisory record support');
+  }
   if (!PASSING.includes(reproduced.outcome) || !PASSING.includes(doc.outcome) || doc.exitCode !== 0) {
     problem('assessment_not_passing', `${doc.headline ?? doc.outcome}`);
   }
@@ -383,7 +455,7 @@ export function verifyAssessment(files, { inspection, auditPolicy, auditPolicyBy
   if (!isInstant(now) || ms(a.decidedAt) > ms(now)) problem('assessment_time_invalid', `decided ${a.decidedAt}, after ${now}`);
   out.deadlineMs = assessmentDeadline(doc, releasePolicy);
   if (!Number.isFinite(out.deadlineMs)) problem('assessment_time_invalid', 'no deadline can be established');
-  else if (ms(now) >= out.deadlineMs) problem('assessment_expired', `the assessment (collected ${a.startedAt}) or an applied record stopped authorising promotion at ${new Date(out.deadlineMs).toISOString()}`);
+  else if (ms(now) >= out.deadlineMs) problem('assessment_expired', `the assessment (collected ${a.startedAt}), an applied record or a dated obligation stopped authorising promotion at ${new Date(out.deadlineMs).toISOString()}`);
   return out;
 }
 

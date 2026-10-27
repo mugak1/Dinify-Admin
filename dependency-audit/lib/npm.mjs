@@ -247,12 +247,17 @@ export function defaultScope(entry) {
 /** All scanner packages are tooling, whatever their lock flags say. */
 export const toolingScope = () => 'tooling';
 
-/** Environment variables that can narrow or redirect `npm audit`. Removed, never inherited. */
+/**
+ * Environment variables that can narrow or redirect `npm audit`. Removed, never inherited.
+ * The job's GitHub token is removed too: it is there for the advisory clock (advisories.mjs),
+ * which runs in this repository's own code, and the scanner is third-party code that has
+ * no use for it.
+ */
 export function scannerEnvironment(base = process.env) {
   const env = {};
   const removed = [];
   for (const [key, value] of Object.entries(base)) {
-    if (/^npm_/i.test(key) || key === 'NODE_ENV' || key === 'NODE_OPTIONS') { removed.push(key); continue; }
+    if (/^npm_/i.test(key) || key === 'NODE_ENV' || key === 'NODE_OPTIONS' || key === 'GH_TOKEN' || key === 'GITHUB_TOKEN') { removed.push(key); continue; }
     env[key] = value;
   }
   env.npm_config_update_notifier = 'false';
@@ -275,6 +280,52 @@ export const AUDIT_LEVEL = 'low';
 export function scannerArgs(registry) {
   return ['audit', '--json', '--include=prod', '--include=dev', '--include=optional', '--include=peer',
     '--package-lock=true', `--registry=${registry}`, `--audit-level=${AUDIT_LEVEL}`, '--no-fund', '--no-update-notifier'];
+}
+
+/**
+ * PROVENANCE (CI-signal A-2): did the change under audit bring this finding in, or was it
+ * already there? Answered against a BASE — the lock graph of the commit the change was
+ * made on — and against nothing else:
+ *   - `inherited`  the base lockfile holds the SAME PATH with the same version and the same
+ *                  integrity as the graph being audited;
+ *   - `introduced` anything else: a new path, a moved one, another version, another
+ *                  integrity, or a base that has no lockfile for this graph at all.
+ * With NO base the field is ABSENT. It is never guessed: an absent provenance is not
+ * "inherited", and the evaluator (core.mjs) blocks a finding it cannot establish.
+ *
+ * A base is a Map of lock path → {version, integrity}, from `lockEntries()`.
+ */
+export function lockEntries(lockBytes) {
+  let lock;
+  try { lock = JSON.parse(Buffer.isBuffer(lockBytes) ? lockBytes.toString('utf8') : String(lockBytes)); } catch { return null; }
+  if (lock === null || typeof lock !== 'object' || Array.isArray(lock) || ![2, 3].includes(lock.lockfileVersion)) return null;
+  if (lock.packages === null || typeof lock.packages !== 'object' || Array.isArray(lock.packages)) return null;
+  const entries = new Map();
+  for (const [path, entry] of Object.entries(lock.packages)) {
+    if (path === '' || entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    entries.set(path, { version: entry.version ?? null, integrity: entry.integrity ?? null });
+  }
+  return entries;
+}
+
+/** The provenance of the package at `lockPath`, as the inventory records it, against `base`. */
+export function provenanceOf(pkg, lockPath, base) {
+  const held = base.get(lockPath);
+  return held && held.version === (pkg.version ?? null) && held.integrity === (pkg.integrity ?? null) ? 'inherited' : 'introduced';
+}
+
+/**
+ * The same rule for findings already read (the retained path's `collect()` reads its
+ * report without a base). Findings of other graphs, and every finding when there is no
+ * base, are returned unchanged.
+ */
+export function annotateProvenance(findings, { graph, inv, base }) {
+  if (!(base instanceof Map)) return findings;
+  const byPath = new Map(inv.packages.map((p) => [p.path, p]));
+  return findings.map((f) => {
+    const pkg = typeof f.path === 'string' && f.path.startsWith(`${graph}:`) ? byPath.get(f.path) : undefined;
+    return pkg ? { ...f, provenance: provenanceOf(pkg, f.path.slice(graph.length + 1), base) } : f;
+  });
 }
 
 const GHSA = /\/advisories\/(GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4})/i;
@@ -322,6 +373,9 @@ const listOf = (names) => (names.length > 8 ? `${names.slice(0, 8).join(', ')} a
  * list", or "high, via each other" — and return no finding at all, which the policy would
  * then have called clean.
  *
+ * `base`, when given, is the lock graph of the commit the change was made on, and every
+ * finding then carries its provenance (see lockEntries). Absent, no finding does.
+ *
  * A string cause produces no finding of its own, and that is deliberate. The advisory it
  * is traced to is already a finding on the nodes of the package that carries it, and one
  * advisory is not counted again for every package that depends on it. Findings are
@@ -338,7 +392,7 @@ const listOf = (names) => (names.length > 8 ? `${names.slice(0, 8).join(', ')} a
  *     runtime package's exposure must not quietly become tooling exposure because the
  *     only copies the report attributes are build-time ones.
  */
-export function readReport({ graph, run, inv }) {
+export function readReport({ graph, run, inv, base }) {
   const problems = [];
   const findings = [];
   const note = (code, detail) => problems.push({ code, detail: `${graph}: ${detail}` });
@@ -458,6 +512,7 @@ export function readReport({ graph, run, inv }) {
           severity,
           title: typeof via.title === 'string' ? via.title : '',
           url: typeof via.url === 'string' ? via.url : '',
+          ...(base instanceof Map ? { provenance: provenanceOf(pkg, node, base) } : {}),
         });
         if (pkg.scope === 'runtime') item.own.runtime = true;
       }

@@ -10,7 +10,10 @@
  *     run's own listing states it (never "the first artifact with this name");
  *   - the certification record's digest, the payload tree digest and the payload archive
  *     digest the candidate carries — re-derived from bytes, not read from a claim;
- *   - the fresh assessment's digest, its real collection times and its deadline;
+ *   - the fresh assessment's digest, its real collection times and its deadline — which
+ *     is cut short by any DATED OBLIGATION it carries (CI-signal A-2: an inherited high
+ *     tooling finding deferred until 00:00 UTC on its deadline). The privileged run
+ *     re-derives those from the retained `advisories.json`; it never asks GitHub;
  *   - the TRUSTED verifier revision and the git trees of release/ and dependency-audit/
  *     at that revision, which must still be the trees on main (a policy or verifier that
  *     moved means a new evaluation, never silent acceptance of the old one);
@@ -238,6 +241,10 @@ export function decideAdmission(i) {
       headline: a.headline,
       counts: a.counts,
       recordsApplied: a.recordsApplied,
+      // CI-signal A-2: the dated obligations the assessment carries, re-derived by
+      // verifyAssessment from the retained advisory record (never fetched). Each one's
+      // deadline is already inside `deadline`; it is named so the admission says why.
+      ...(a.obligations ? { obligations: a.obligations } : {}),
       deadline: new Date(verified.deadlineMs).toISOString(),
       assessor: a.assessor,
     },

@@ -1084,6 +1084,12 @@ jobs:
       # policy trees on main now — requires the uploaded admission to bind exactly the
       # same things, and requires the assessment to authorise promotion for at least the
       # dispatch margin beyond now. Only bounded, validated values leave this step.
+      #
+      # CI-signal A-2: when each advisory became reportable is RE-READ from the
+      # advisories.json retained in the downloaded admission (and, for the certification,
+      # in the candidate), checked against its recorded digest — never asked of GitHub.
+      # This step has no token and makes no request. A dated obligation's deadline is part
+      # of the assessment's deadline, so one that falls due within the margin is refused.
       # ------------------------------------------------------------------------------
       - name: Verify the admission (privileged re-decision, before any credential)
         id: verify

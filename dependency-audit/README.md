@@ -39,7 +39,7 @@ artifact.
 | finding | decision |
 |---|---|
 | critical or high, any scope | **blocking** |
-| high on tooling, INHERITED and inside its 7-day window (see "Dated obligations" below) | **deferred** — inert until A-2 supplies the inputs |
+| high on tooling, INHERITED and inside its 7-day window (see "Dated obligations" below) | **deferred** — provenance from the base, the date from GitHub (A-2, below) |
 | any severity on a runtime package | **blocking** |
 | moderate / low / info on tooling | visible, **triage required** — counted, never reported as zero findings |
 | anything the policy cannot evaluate (unknown severity on tooling, unknown scope below high) | **incomplete** |
@@ -57,7 +57,7 @@ Five outcomes, and the process exit status follows them:
 Precedence: `incomplete` > `blocking` > `obligations_pending` > `exceptions_only` >
 `within_policy`.
 
-### Dated obligations (CI-signal A-1): the evaluator half, INERT until A-2
+### Dated obligations (CI-signal A-1): the evaluator half
 
 Disposition records apply first, unchanged. Then a finding the policy would block, and
 that no record covers, is **deferred** (class `deferred`, a `deadline`, counted under
@@ -83,9 +83,9 @@ malformed-finding rule answers — **incomplete**. `null` reads as absent, as th
 rule already treats it for the required fields. Each deferred finding gets a
 `deferred_finding` reason naming its deadline, and the headline names the earliest one.
 
-**Inert, byte for byte.** No adapter emits `provenance` or `reportableSince` yet — step A-2
-does, in Dinify-Frontend and Dinify-Admin — so no result carries the new outcome. A result
-in which nothing was deferred is byte-identical to the one the evaluator produced before
+**Byte for byte when nothing is deferred.** Until A-2 no adapter emitted `provenance` or
+`reportableSince`, so no result carried the new outcome; since A-2 they are emitted only for
+an audit given a base (next section). A result in which nothing was deferred is byte-identical to the one the evaluator produced before
 the rule: `counts.deferred`, a finding's `deadline` and the `deferred_finding` reason
 appear ONLY when a deferral applied. That is load-bearing, because the release consumers
 re-decide retained results and compare `counts` exactly; an always-present `deferred: 0`
@@ -98,6 +98,68 @@ The shared vectors are now 61 (the 41 before, plus 20 deferral vectors appended 
 them), digest `6365e880c55153f5ce50ca144434cb42d5c937be48218445da36cefb8ffb9653`,
 byte-identical in the three repositories. The release consumers' passing set accepts
 `obligations_pending` and nothing else new.
+
+### Provenance and the clock (CI-signal A-2): the adapters supply both inputs
+
+A-1's rule needs two facts per finding. A-2 supplies them from evidence, and nothing else
+can: there is no flag that sets a provenance or a date.
+
+**Provenance is read from a base commit, through git.** `audit --base <commit>` reads
+`package-lock.json` and `dependency-audit/scanner/package-lock.json` as that commit held them
+(`git show`). A finding is `inherited` only when the base lock has an entry at the SAME
+path with the same `version` and the same `integrity`. Anything else is `introduced`: a
+path the base does not hold, a package that moved to another path, a changed version or
+integrity. A base with no lockfile for a graph makes every finding of that graph
+introduced. The base must be in the clone and an ancestor of HEAD; otherwise it is
+recorded as `unavailable`, with the reason, and treated as no base. **With no base** (an
+empty or all-zero `--base`, a push that created a branch, a force push, the scheduled
+re-scan) findings carry no provenance and nothing can be deferred, which is today's rule.
+The collection records the base commit and each base lock's digest, and `evaluate`
+re-derives both from git: a base that no longer reproduces is incomplete
+(`evidence_base_mismatch`).
+
+**The date is GitHub's, asked once and retained.** After the scans `lib/advisories.mjs`
+asks `GET https://api.github.com/advisories/{ghsa_id}` once per distinct GHSA id among the
+findings that carry a provenance, at any severity, from a child process: 15 seconds per
+request, no redirects, and the token only when one is given (`GH_TOKEN`, which the scanner
+never sees). `reportableSince` is the UTC calendar date of `github_reviewed_at`, else of
+`published_at`. Every answer (a record, a failure, a rate limit, a timeout) is retained in
+`advisories.json`, each body with its own digest, and the collection names the file's
+digest. **An answer that is not a record of THAT advisory with a valid date gives no date,
+and the finding blocks**: an outage, a 403 or a 404 never defers anything, and never makes
+the audit incomplete either. A tampered or missing `advisories.json` is incomplete
+(`evidence_tampered`, `evidence_unreadable`).
+
+**Re-deciding never asks.** `evaluate` and every release consumer read `advisories.json`
+back and re-apply its dates. A result re-decided from its retained evidence at the same
+instant is byte-identical; the deadline passing is the same evidence re-decided at a
+later instant. Evidence without `advisories.json` (every result before A-2) carries no
+provenance and re-decides exactly as before.
+
+**What a run costs**: one request per distinct GHSA id on findings with provenance in the
+application and scanner graphs, and none without a base. Unauthenticated, GitHub allows
+60 requests an hour per address; with the job token, 1,000 an hour per repository.
+
+**The summary says why a high was not deferred**: `blocking (introduced: not in the base)`,
+`blocking (inherited, reportable since <date>; its window has closed)`, or
+`blocking (inherited; no reportable date)`. A deferred one reads
+`deferred: inherited, blocks from <date>`.
+
+**Where the base comes from in this repository.** `validate` (`ci.yml`) passes
+`github.event.pull_request.base.sha || github.event.before`: the pull request's base on a
+PR, the previous tip on a push to main. Its checkout is depth 1, so the audit step first
+deepens it (`git fetch --no-tags --quiet --unshallow origin "$GITHUB_SHA"`); under the
+runner's `bash -e` a failed fetch fails the step, never a silent no-base audit. It passes
+`github.token` as `GH_TOKEN`; the workflow's permissions did not change. The weekly
+`audit.yml` re-scan passes no base, so it decides by today's rule. **At promotion**
+(`deploy.yml`, `prepare`) the fresh assessment gives the application and scanner graphs
+provenance against the candidate's OWN retained locks (nothing can be introduced into
+fixed bytes, so an unchanged package is inherited and a trusted scanner that moved since
+certification makes what changed introduced) and asks GitHub WITHOUT a token, so an
+unanswered request blocks. The privileged re-decision re-reads the retained
+`advisories.json` and never asks; an obligation's deadline cuts the assessment deadline
+short. Certification retains the record too (`release/lib/certification.mjs`). See
+`release/README.md` → "CI-signal A-2".
 
 **An incomplete audit fails the required check.** An empty report, truncated JSON, an error
 body, a scanner that timed out or never ran, a count that is not the lock graph, an

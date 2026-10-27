@@ -2245,20 +2245,45 @@ a successful CI push to main, or on `workflow_dispatch`.
   REQUIRED (visible, never "zero findings"), and anything unevaluable is incomplete.
   `conformance.json` is byte-identical in all three repos and its digest is pinned in each
   suite (61 vectors since A-1, digest `6365e880…`).
-- **The fifth outcome is the DATED OBLIGATION (CI-signal A-1), INERT until A-2.** After the
+- **The fifth outcome is the DATED OBLIGATION (CI-signal A-1), switched on by A-2.** After the
   records, an unexcepted TOOLING HIGH finding whose optional `provenance` is exactly
   `"inherited"` and whose optional `reportableSince` is a calendar date no later than the
   decision day is deferred until 00:00 UTC on `reportableSince` + 7 days
   (`HIGH_DEFERRAL_DAYS`, a constant in `lib/core.mjs`, never a policy value); critical is
   never deferred, and anything not established blocks as before (a wrong JSON type is a
-  malformed finding, `null` is absent). No adapter emits either field yet — A-2 does — and
-  a result that deferred nothing is byte-identical to before: `counts.deferred`,
+  malformed finding, `null` is absent). A-2 supplies both fields (next bullet), and a
+  result that deferred nothing is still byte-identical to before: `counts.deferred`,
   `deadline` and `deferred_finding` appear only when a deferral applied, because
   `certification.mjs` and `assessment.mjs` re-decide retained results and compare `counts`
   exactly. `tests/core.test.mjs` pins the full result of the 41 earlier vectors by digest.
-  `PASSING` accepts the new word and nothing else new. **Not done in A-1, and needed before
-  A-2 lets the outcome occur:** the deploy's assessment deadline is cut short by an applied
-  record's expiry but not by a deferred finding's deadline.
+  `PASSING` accepts the new word and nothing else new.
+- **CI-signal A-2 supplies the two inputs, from evidence only — no flag can set either.**
+  - PROVENANCE is read from a base commit through git (`audit --base <sha>`): a finding is
+    `inherited` only when the base's lock holds the SAME path with the same `version` and
+    `integrity`, otherwise `introduced`. A base not in the clone or not an ancestor of HEAD
+    is recorded `unavailable` and treated as none; with no base (empty or all-zero, a new
+    branch, a force push, the weekly `audit.yml`, which is unchanged) nothing is deferred.
+  - `validate` passes `pull_request.base.sha || event.before` with `GH_TOKEN:
+    github.token` (permissions unchanged), and first deepens its depth-1 checkout
+    (`git fetch --no-tags --quiet --unshallow origin "$GITHUB_SHA"`; a failed fetch fails
+    the step).
+  - THE CLOCK is GitHub's: `lib/advisories.mjs` asks `GET api.github.com/advisories/{id}`
+    once per distinct GHSA id on findings with provenance, from a child process (15 s each,
+    no redirects, the token only when given and never to the scanner). `reportableSince` is
+    the UTC date of `github_reviewed_at`, else `published_at`. Every answer is retained in
+    `advisories.json`; an answer that is not a record of that advisory gives NO date, so
+    the finding blocks; a tampered or missing record is incomplete.
+  - Re-decisions never ask: `evaluate`, `inspectCandidate`, `verifyAssessment` and the
+    privileged verify step re-read the retained file, and a re-decision at the same instant
+    is byte-identical. Certification retains `advisories.json` — **a change to
+    `release/lib/certification.mjs`, outside A-2's original file list, made with the
+    owner's approval in its own commit**.
+  - At PROMOTION the fresh assessment gives the application and scanner graphs provenance
+    against the candidate's OWN retained locks (a trusted scanner that moved makes what
+    changed introduced) and asks WITHOUT a token; the assessment and admission name each
+    obligation. The gap A-1 named is CLOSED: an obligation's deadline is part of the
+    assessment deadline, so the host will not promote from 00:00 UTC on it.
+  - See `dependency-audit/README.md` and `release/README.md` → "CI-signal A-2".
 - **The scanner is invoked hardened because narrowing is invisible** — measured on main:
   an inherited `NODE_ENV=production` made `npm audit` report zero vulnerable packages where
   it otherwise reports five, while still counting every package.

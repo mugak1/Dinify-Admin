@@ -71,7 +71,10 @@ audit:deps → release:certify → upload admin-candidate-<run>-<attempt>
   - `evidence/inputs/`: `package.json`, `package-lock.json`, `angular.json`, and the
     scanner's `package.json` and `package-lock.json`;
   - `evidence/audit/`: policy, snapshot, collection, result, and the four raw scanner
-    outputs.
+    outputs, plus `advisories.json` when the audit asked GitHub when an advisory became
+    reportable (CI-signal A-2, below). `inspectCandidate` re-derives the retained result
+    with those dates and refuses a record that does not reproduce
+    (`evidence_advisories_invalid`).
 - **The upload has no `if:`.** A job in which any gate failed produces no candidate.
 - **A pull-request run produces a candidate the same way, and it is never promotable.**
   Retention is 7 days for a pull request and 90 days for a push.
@@ -209,8 +212,9 @@ diagnostics"); a test pins the file's digest.
   attempt, artifact id and digest, certification digest, payload tree and archive, and
   the evaluating workflow, run, attempt and revision.
 - **Freshness.** The window is 24 hours from the **start of collection**. The deadline is
-  the earlier of the window end and the lapse (00:00 UTC on `expires`) of any record the
-  decision applied. The same deadline is enforced three times:
+  the earliest of the window end, the lapse (00:00 UTC on `expires`) of any record the
+  decision applied, and the deadline (00:00 UTC) of any obligation it deferred (A-2,
+  below). The same deadline is enforced three times:
   - by `prepare`;
   - by the privileged verification, with a 30-minute margin;
   - by the host, as an epoch second, at the start and again immediately before the
@@ -219,6 +223,47 @@ diagnostics"); a test pins the file's digest.
   `release/` or `dependency-audit/` on `main` differ from the verifier this run used.
 - **A new advisory can refuse unchanged bytes.** A scanner failure, an error body,
   truncated output, a timeout or a failed scanner install is **incomplete**, never a pass.
+
+### CI-signal A-2: provenance and the clock
+
+A-1 taught the shared evaluator to defer an INHERITED high tooling finding for seven days
+from the day its advisory became reportable; A-2 supplies those two facts
+(`dependency-audit/README.md` → "Provenance and the clock").
+
+- **`validate` audits against its base.** The audit step passes `--base` =
+  `github.event.pull_request.base.sha || github.event.before` and the job token as
+  `GH_TOKEN`; `ci.yml`'s permissions are unchanged and the advisory endpoint is public.
+  The checkout is depth 1, so the step first runs
+  `git fetch --no-tags --quiet --unshallow origin "$GITHUB_SHA"`; a failed fetch fails
+  the step under the runner's `bash -e`, never a silent audit without a base.
+- **Certification retains the clock.** `certify` copies `advisories.json` into
+  `evidence/audit/` and `inspectCandidate` re-derives the retained result with its dates,
+  with provenance against the candidate's OWN retained locks for the graphs the collection
+  gave a base. Inside fixed bytes everything is inherited, so the re-derivation reaches
+  the original outcome and counts. **This touched `release/lib/certification.mjs`, a
+  file outside A-2's original list, with the owner's approval; it is its own commit.**
+- **The fresh assessment** (`prepare`) gives the application graph provenance against the
+  candidate's retained lock and the scanner graph against the candidate's retained
+  scanner lock, so a trusted scanner that moved since certification makes what changed
+  `introduced`, which blocks. It asks GitHub WITHOUT a token (`evaluate` has none), so an
+  unanswered or rate-limited request leaves no date and the inherited high blocks. The
+  answers are retained beside the assessment, and the assessment and the admission
+  record name every obligation (`advisory`, `path`, `deadline`).
+- **The privileged re-decision never asks.** `verifyAssessment` re-reads the retained
+  `advisories.json` and re-derives the result offline: a tampered record is
+  `assessment_advisories_invalid`, and an obligation list or deadline the record does not
+  support is `assessment_unreproducible`. **One clock**: an obligation's deadline is part
+  of the assessment deadline, so the host refuses to promote from 00:00 UTC on it
+  (`assessment_expired` at the privileged re-decision).
+- **Unchanged.** Critical, any runtime finding, an introduced tooling high and an inherited
+  high past its deadline all block. Records apply first. A candidate certified before A-2
+  carries no `advisories.json` and re-derives exactly as before. `audit.yml` passes no
+  base.
+
+Pinned by `release/tests/obligations.test.mjs` and
+`release/tests/certification-obligations.test.mjs`, and by two executed verify-step
+scenarios in `release/tests/workflow.test.mjs` (an obligation admitted; a tampered
+`advisories.json` refused).
 
 ### Scanner diagnostics: the last observed npm events
 

@@ -16,7 +16,7 @@ import { describe, it } from 'node:test';
 import {
   ADVISORIES_FILE, advisoryIds, applyDates, buildAdvisoryEvidence, fetchAdvisories, readAdvisoryEvidence, reportableDate, utcDateOf,
 } from '../lib/advisories.mjs';
-import { audit, reevaluate, requestedBase, resolveBase, snapshot } from '../lib/audit.mjs';
+import { audit, reevaluate, renderSummary, requestedBase, resolveBase, snapshot } from '../lib/audit.mjs';
 import { annotateProvenance, inventory, lockEntries, readReport, scannerEnvironment, toolingScope } from '../lib/npm.mjs';
 import {
   advisoryBody, cannedAdvisories, cannedRunner, CLEAN_SCANNER, commitBase, fakeInstall, git, makeProject, NOW, npmReport, via,
@@ -186,16 +186,19 @@ describe('the clock: dates from GitHub, retained, never supplied (advisories.mjs
   it('REGRESSION: the same high INTRODUCED by the change → blocking', () => within({ base: { application: (lock) => { delete lock.packages['node_modules/tool']; return lock; } } }, ({ result }) => {
     assert.equal(toolFinding(result).provenance, 'introduced');
     assert.equal(result.outcome, 'blocking');
+    assert.match(renderSummary(result), /→ blocking \(introduced: not in the base\)/, 'the summary says why it was not deferred');
   }));
 
   it('REGRESSION: the same inherited high from its deadline on → blocking', () => {
     within({ advisories: cannedAdvisories((id) => ({ status: 200, body: advisoryBody(id, { reviewed: '2026-09-17T08:00:00Z' }) })) }, ({ result }) => {
       assert.equal(toolFinding(result).reportableSince, '2026-09-17');
       assert.equal(result.outcome, 'blocking', 'deadline 2026-09-24, and it is 2026-09-24 12:00 UTC');
+      assert.match(renderSummary(result), /→ blocking \(inherited, reportable since 2026-09-17; its window has closed\)/);
     });
     // CONTROL: one day later reviewed, still inside the window.
     within({ advisories: cannedAdvisories((id) => ({ status: 200, body: advisoryBody(id, { reviewed: '2026-09-18T08:00:00Z' }) })) }, ({ result }) => {
       assert.equal(result.outcome, 'obligations_pending');
+      assert.match(renderSummary(result), /→ deferred: inherited, blocks from 2026-09-25\n/);
     });
   });
 
@@ -204,6 +207,7 @@ describe('the clock: dates from GitHub, retained, never supplied (advisories.mjs
       assert.equal(toolFinding(result).provenance, 'inherited');
       assert.equal(toolFinding(result).reportableSince, '2026-09-21');
       assert.equal(result.outcome, 'blocking');
+      assert.match(renderSummary(result), /→ blocking\n/, 'a critical is not given a not-deferred reason: there was never a window');
     });
     within({ app: SHIPPED_HIGH }, ({ result }) => {
       assert.equal(result.findings[0].scope, 'runtime');
@@ -227,6 +231,7 @@ describe('the clock: dates from GitHub, retained, never supplied (advisories.mjs
       assert.equal(f.provenance, 'inherited');
       assert.equal('reportableSince' in f, false);
       assert.equal(result.outcome, 'blocking');
+      assert.match(renderSummary(result), /→ blocking \(inherited; no reportable date\)/);
       const retained = read(join(p.evidence, ADVISORIES_FILE));
       assert.equal(retained.advisories[0].id, GHSA, 'the failed answer is retained as evidence too');
     }));

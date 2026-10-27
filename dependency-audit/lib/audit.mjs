@@ -461,8 +461,19 @@ function provenanceLines(collection) {
     lines.push(`Provenance: against base ${b.commit} (${graphs}).`);
   } else lines.push(`Provenance: base ${b?.commit} is unavailable (${b?.reason}); treated as no base, so nothing can be deferred.`);
   const a = collection.advisories;
-  if (isMapping(a)) lines.push(`Clock: ${a.requested} advisory record(s) asked of GitHub (${a.authenticated ? 'with the job token' : 'unauthenticated'}), retained as ${a.file}; one with no date cannot be deferred.`);
+  if (isMapping(a)) lines.push(`Clock: ${a.requested} advisory record(s) asked of GitHub (${a.authenticated ? 'with the job token' : 'unauthenticated'}), retained as ${a.file}; a finding whose advisory has no date is never deferred.`);
   return lines;
+}
+
+/**
+ * Why a blocking HIGH tooling finding that carries provenance was not deferred — the one
+ * question a pull request's author has about it. Words only; the decision is core.mjs's.
+ */
+function notDeferredBecause(f) {
+  if (f.class !== 'blocking' || f.scope !== 'tooling' || f.severity !== 'high' || typeof f.provenance !== 'string') return '';
+  if (f.provenance === 'introduced') return ' (introduced: not in the base)';
+  if (typeof f.reportableSince !== 'string') return ' (inherited; no reportable date)';
+  return ` (inherited, reportable since ${f.reportableSince}; its window has closed)`;
 }
 
 /** A human summary: the headline, then what decided it. */
@@ -472,7 +483,7 @@ export function renderSummary(result, { markdown = false, collection = null } = 
   for (const line of provenanceLines(collection)) lines.push(markdown ? `${line}\n` : line);
   const group = new Map();
   for (const f of result.findings) {
-    const key = `${f.advisory}|${f.package}|${f.severity}|${f.scope}|${f.class}|${f.disposition}`;
+    const key = `${f.advisory}|${f.package}|${f.severity}|${f.scope}|${f.class}|${f.disposition}|${notDeferredBecause(f)}`;
     if (!group.has(key)) group.set(key, { ...f, paths: [] });
     group.get(key).paths.push(`${f.path}@${f.version}`);
   }
@@ -480,7 +491,7 @@ export function renderSummary(result, { markdown = false, collection = null } = 
     if (markdown) lines.push('| advisory | package | severity | scope | decision | where |', '|---|---|---|---|---|---|');
     for (const g of group.values()) {
       const open = g.class === 'triage' ? 'triage required' : g.class === 'deferred' ? `deferred: inherited, blocks from ${g.deadline}` : g.class;
-      const decision = g.disposition === 'open' ? open : `${g.disposition} (${g.coveredBy})`;
+      const decision = g.disposition === 'open' ? `${open}${notDeferredBecause(g)}` : `${g.disposition} (${g.coveredBy})`;
       lines.push(markdown
         ? `| ${g.advisory} | ${g.package} | ${g.severity} | ${g.scope} | ${decision} | ${g.paths.join('<br>')} |`
         : `  ${g.advisory}  ${g.package}  ${g.severity}  ${g.scope}  → ${decision}\n      ${g.paths.join('\n      ')}`);

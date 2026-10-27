@@ -455,7 +455,7 @@ export function verifyAssessment(files, { inspection, auditPolicy, auditPolicyBy
   if (!isInstant(now) || ms(a.decidedAt) > ms(now)) problem('assessment_time_invalid', `decided ${a.decidedAt}, after ${now}`);
   out.deadlineMs = assessmentDeadline(doc, releasePolicy);
   if (!Number.isFinite(out.deadlineMs)) problem('assessment_time_invalid', 'no deadline can be established');
-  else if (ms(now) >= out.deadlineMs) problem('assessment_expired', `the assessment (collected ${a.startedAt}) or an applied record stopped authorising promotion at ${new Date(out.deadlineMs).toISOString()}`);
+  else if (ms(now) >= out.deadlineMs) problem('assessment_expired', `the assessment (collected ${a.startedAt}), an applied record or a dated obligation stopped authorising promotion at ${new Date(out.deadlineMs).toISOString()}`);
   return out;
 }
 

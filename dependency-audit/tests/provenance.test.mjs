@@ -300,6 +300,14 @@ describe('re-deciding retained evidence: offline, and byte-identical', () => {
     assert.ok(again.reasons.some((r) => r.code === 'evidence_tampered'), JSON.stringify(again.reasons));
   }));
 
+  it('REGRESSION: a tamper OUTSIDE every body (here, the authentication flag) is caught by the file digest alone', () => within({}, ({ p }) => {
+    const path = join(p.evidence, ADVISORIES_FILE);
+    writeFileSync(path, readFileSync(path, 'utf8').replace('"authenticated": true', '"authenticated": false'));
+    const again = reevaluate(p.root, { evidenceDir: p.evidence, now: NOW });
+    assert.equal(again.outcome, 'incomplete');
+    assert.ok(again.reasons.some((r) => r.code === 'evidence_tampered'), JSON.stringify(again.reasons));
+  }));
+
   it('REGRESSION: a missing advisories.json the collection names is incomplete', () => within({}, ({ p }) => {
     rmSync(join(p.evidence, ADVISORIES_FILE));
     const again = reevaluate(p.root, { evidenceDir: p.evidence, now: NOW });

@@ -119,6 +119,15 @@ describe('the fresh assessment: provenance against the candidate\'s own retained
     assert.ok(verify(p, a, { files }).problems.some((x) => x.code === 'assessment_unreproducible'));
   }));
 
+  it('CONTRACT: the SCANNER graph has provenance too — an unchanged bundled package\'s high inside its window → obligations_pending', () => {
+    const scanner = { status: 1, stdout: npmReport({ bundled: { via: [via('bundled', 'high', '>=0.0.0', G)], nodes: ['node_modules/npm/node_modules/bundled'] }, npm: { severity: 'high', via: ['bundled'], nodes: ['node_modules/npm'] } }, 2) };
+    withAssessment({ application: { status: 0, stdout: npmReport({}, 4) }, scanner, advisories: reviewedOn('2026-09-23') }, (p, a) => {
+      assert.equal(a.doc.outcome, 'obligations_pending', JSON.stringify(a.doc.reasons));
+      assert.deepEqual(a.doc.obligations.map((o) => o.path), ['scanner:node_modules/npm/node_modules/bundled']);
+      assert.deepEqual(verify(p, a).problems, []);
+    });
+  });
+
   it('REGRESSION: a trusted scanner that moved since certification — a finding on a package the candidate\'s scanner lock does not hold — is introduced, and blocks', () => {
     const p = certifiedProject({});
     try {

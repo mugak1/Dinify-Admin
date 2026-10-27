@@ -38,6 +38,13 @@
  * decision from the raw scanner output — and compares it with facts from OUTSIDE the
  * candidate (the commit as git or the API holds it, the run as the API reports it). A
  * candidate cannot vouch for itself.
+ *
+ * CI-SIGNAL A-2. A certification audited against a base may pass with a DATED OBLIGATION
+ * (an inherited high tooling finding, deferred). The candidate then also retains the
+ * audit's advisory record (evidence/audit/advisories.json), and the reproduction gives the
+ * graphs that had provenance a base again — the candidate's OWN retained lock, the
+ * promotion rule — and reads the dates from that record, never asking GitHub. A
+ * certification without a base reproduces exactly as it did before A-2.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -45,8 +52,9 @@ import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSy
 import { dirname, join } from 'node:path';
 
 import { capture, gitRevision, loadPolicy, reevaluate, SNAPSHOT_SCHEMA, COLLECTION_SCHEMA, RESULT_SCHEMA, POLICY_SCHEMA } from '../../dependency-audit/lib/audit.mjs';
+import { ADVISORIES_FILE, applyDates, readAdvisoryEvidence } from '../../dependency-audit/lib/advisories.mjs';
 import { evaluate } from '../../dependency-audit/lib/core.mjs';
-import { readReport, toolingScope } from '../../dependency-audit/lib/npm.mjs';
+import { lockEntries, readReport, toolingScope } from '../../dependency-audit/lib/npm.mjs';
 import { retainedInventory } from '../../dependency-audit/lib/retained.mjs';
 import {
   DIGEST_RE, HEX_RE, ID_RE, SHA_RE, canonicalJson, digestOfValue, gitBlobSha1, isInstant, isObject, loadReleasePolicy,
@@ -421,6 +429,8 @@ export function certify(root, { now, env = process.env }) {
   for (const p of INPUTS) evidence.set(inputPath(p), readFileSync(join(root, p)));
   evidence.set(auditPath('policy.json'), auditPolicyBytes);
   for (const name of [...AUDIT_DOCS, ...RAW]) evidence.set(auditPath(name), readFileSync(join(root, AUDIT_EVIDENCE_DIR, name)));
+  // CI-signal A-2: the record the audit's dates came from travels with the raw output.
+  if (collection.doc.advisories !== undefined) evidence.set(auditPath(ADVISORIES_FILE), readFileSync(join(root, AUDIT_EVIDENCE_DIR, ADVISORIES_FILE)));
   const app = snapshot.binding.application;
   if (sha256Hex(evidence.get(inputPath('package.json'))) !== app.manifestSha256 || sha256Hex(evidence.get(inputPath('package-lock.json'))) !== app.lockfileSha256) {
     return { ok: false, problems: [reason('inputs_moved', 'package.json or package-lock.json is not what the snapshot recorded')] };
@@ -545,8 +555,29 @@ export function validateRecord(r) {
 }
 
 /**
+ * The provenance bases a reproduction of a RECORDED audit uses (CI-signal A-2): for each
+ * graph the collection says was given one (a base `present` or `absent` at that commit),
+ * the candidate's own retained lock for that graph. None at all for an audit that had no
+ * base. The base the certification compared against is not retained and is not needed: a
+ * finding it called introduced could only have blocked, so no passing certification
+ * depended on one.
+ */
+export function retainedBases(collection, lockBytesByGraph) {
+  const b = collection?.base;
+  if (!isObject(b) || b.state !== 'applied' || !isObject(b.graphs)) return {};
+  const out = {};
+  for (const graph of ['application', 'scanner']) {
+    if (!['present', 'absent'].includes(b.graphs[graph]?.state)) continue;
+    const entries = lockBytesByGraph[graph] ? lockEntries(lockBytesByGraph[graph]) : null;
+    if (entries) out[graph] = entries;
+  }
+  return out;
+}
+
+/**
  * A lock-graph inventory with NO installed observation, for re-reading a TOOLING graph's
- * report (the scanner). It is never presented as evidence of what was installed.
+ * report (the scanner). It is never presented as evidence of what was installed. It
+ * carries each entry's integrity, as `inventory()` does, because provenance compares it.
  */
 export function lockOnlyInventory(graph, manifestBytes, lockBytes) {
   let lock;
@@ -555,7 +586,7 @@ export function lockOnlyInventory(graph, manifestBytes, lockBytes) {
   }
   if (!isObject(lock?.packages)) return { packages: [], problems: [reason('lockfile_version', `${graph}: no packages map`)], digests: {}, counts: {} };
   const packages = Object.entries(lock.packages).filter(([path]) => path !== '')
-    .map(([path, entry]) => ({ path: `${graph}:${path}`, name: entry?.name ?? path.slice(path.lastIndexOf('node_modules/') + 13), version: entry?.version ?? null, scope: toolingScope(entry) }));
+    .map(([path, entry]) => ({ path: `${graph}:${path}`, name: entry?.name ?? path.slice(path.lastIndexOf('node_modules/') + 13), version: entry?.version ?? null, integrity: entry?.integrity ?? null, scope: toolingScope(entry) }));
   return { packages, problems: [], digests: { lockfileSha256: sha256Hex(lockBytes), manifestSha256: sha256Hex(manifestBytes) }, counts: { locked: packages.length } };
 }
 
@@ -675,9 +706,11 @@ export function inspectCandidate(files, expect) {
   // REPRODUCE the certification decision from the raw output and the retained inventory.
   const manifestBytes = files.get(inputPath('package.json'));
   const lockBytes = files.get(inputPath('package-lock.json'));
+  const scannerLockBytes = files.get(inputPath('dependency-audit/scanner/package-lock.json'));
   const appInv = retainedInventory({ graph: 'application', manifestBytes, lockBytes, snapshot });
-  const scannerInv = lockOnlyInventory('scanner', files.get(inputPath('dependency-audit/scanner/package.json')), files.get(inputPath('dependency-audit/scanner/package-lock.json')));
+  const scannerInv = lockOnlyInventory('scanner', files.get(inputPath('dependency-audit/scanner/package.json')), scannerLockBytes);
   const incomplete = [...appInv.problems, ...scannerInv.problems];
+  const bases = retainedBases(collection, { application: lockBytes, scanner: scannerLockBytes });
   const findings = [];
   for (const [graph, inv] of [['application', appInv], ['scanner', scannerInv]]) {
     const run = collection.graphs?.[graph]?.run;
@@ -686,12 +719,19 @@ export function inspectCandidate(files, expect) {
       problem('evidence_raw_mismatch', `${graph}: the raw scanner output is not the bytes the collection recorded`);
       continue;
     }
-    const rr = readReport({ graph, run: { ...run, stdout: stdout.toString('utf8') }, inv });
+    const rr = readReport({ graph, run: { ...run, stdout: stdout.toString('utf8') }, inv, base: bases[graph] });
     incomplete.push(...rr.problems);
     findings.push(...rr.findings);
   }
   if (out.problems.length) return out;
-  const reproduced = evaluate({ incomplete, findings, records: Array.isArray(auditPolicy.records) ? auditPolicy.records : [], now: result.decidedAt });
+  let dated = findings;
+  if (collection.advisories !== undefined) {
+    const read = readAdvisoryEvidence(files.get(auditPath(ADVISORIES_FILE)), collection.advisories?.sha256);
+    for (const p of read.problems) problem('evidence_advisories_invalid', `${p.code}: ${p.detail}`);
+    if (out.problems.length) return out;
+    dated = applyDates(findings, read.dates);
+  }
+  const reproduced = evaluate({ incomplete, findings: dated, records: Array.isArray(auditPolicy.records) ? auditPolicy.records : [], now: result.decidedAt });
   out.audit = { outcome: reproduced.outcome, counts: reproduced.counts };
   if (reproduced.outcome !== result.outcome || !same(reproduced.counts, result.counts)) {
     problem('evidence_unreproducible', `the raw output reads as ${reproduced.outcome} ${canonicalJson(reproduced.counts)}, the result says ${result.outcome}`);
@@ -699,6 +739,6 @@ export function inspectCandidate(files, expect) {
   if (!PASSING.includes(result.outcome) || !PASSING.includes(reproduced.outcome) || !PASSING.includes(r.audit.reevaluatedOutcome)) {
     problem('evidence_not_passing', `the certification audit concluded ${result.outcome}`);
   }
-  out.retained = { manifestBytes, lockBytes, snapshot };
+  out.retained = { manifestBytes, lockBytes, snapshot, scannerLockBytes };
   return out;
 }

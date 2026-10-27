@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
 import { audit, snapshot } from '../../dependency-audit/lib/audit.mjs';
-import { CLEAN, CLEAN_SCANNER, cannedRunner, fakeInstall, makeProject } from '../../dependency-audit/tests/project.mjs';
+import { CLEAN, CLEAN_SCANNER, cannedAdvisories, cannedRunner, fakeInstall, makeProject } from '../../dependency-audit/tests/project.mjs';
 import { commitFacts } from '../lib/admission.mjs';
 import { assess } from '../lib/assessment.mjs';
 import { certify, freeze, inspectCandidate, prebuild } from '../lib/certification.mjs';
@@ -69,7 +69,14 @@ export const BUILT = {
  * "installed", the audit snapshot taken. The release policy is the committed one with
  * the Node major set to the one running the tests (CI runs Node 20; the policy pins 20).
  */
-export function freshProject({ nodeMajor = Number(process.versions.node.split('.')[0]), records = [], withVerifier = false } = {}) {
+/**
+ * GitHub's advisory endpoint for the fixtures (CI-signal A-2): SYNTHETIC, at the clock's seam,
+ * so nothing here reaches the network. By default every advisory is a 404 — no record, so no
+ * date, so an inherited high blocks exactly as it did before A-2.
+ */
+export const NO_RECORDS = () => cannedAdvisories(() => ({ status: 404, body: '{"message":"Not Found"}' }), { authenticated: false });
+
+export function freshProject({ nodeMajor = Number(process.versions.node.split('.')[0]), records = [], withVerifier = false, withBase = false } = {}) {
   const p = makeProject({ records });
   // The verifier's own code, committed into the fixture, so the REAL CLI can run from it
   // as the trusted checkout (its ROOT is the repository that contains it).
@@ -88,8 +95,15 @@ export function freshProject({ nodeMajor = Number(process.versions.node.split('.
   git(p.root, 'init', '-q', '-b', 'main');
   git(p.root, 'add', '-A');
   git(p.root, 'commit', '-q', '-m', 'fixture');
+  // `withBase`: HEAD is a change on top of the fixture commit that touches no dependency, so
+  // the fixture commit is the base a push's `before` would name (CI-signal A-2).
+  let base = null;
+  if (withBase) {
+    base = git(p.root, 'rev-parse', 'HEAD');
+    git(p.root, 'commit', '-q', '--allow-empty', '-m', 'a change that touches no dependency');
+  }
   snapshot(p.root, { evidenceDir: p.evidence, now: NOW });
-  return p;
+  return { ...p, base };
 }
 
 export function writeBuild(root, files = BUILT) {
@@ -101,8 +115,8 @@ export function writeBuild(root, files = BUILT) {
  * Each stage can be interfered with through `between`, which is how the matrix moves an
  * inventory, rewrites an output or swaps evidence at exactly one boundary.
  */
-export function certifiedProject({ answers = {}, env = {}, between = {}, records = [], withVerifier = false } = {}) {
-  const p = freshProject({ records, withVerifier });
+export function certifiedProject({ answers = {}, env = {}, between = {}, records = [], withVerifier = false, withBase = false, advisories = NO_RECORDS() } = {}) {
+  const p = freshProject({ records, withVerifier, withBase });
   const stages = {};
   between.beforePrebuild?.(p);
   stages.prebuild = prebuild(p.root, { now: NOW });
@@ -114,7 +128,7 @@ export function certifiedProject({ answers = {}, env = {}, between = {}, records
   stages.audit = audit(p.root, {
     evidenceDir: p.evidence, now: NOW,
     runner: cannedRunner({ application: answers.application ?? CLEAN, scanner: answers.scanner ?? CLEAN_SCANNER }),
-    installScanner: fakeInstall,
+    installScanner: fakeInstall, base: p.base, advisories,
   });
   between.afterAudit?.(p);
   stages.certify = certify(p.root, { now: NOW, env: ciEnv(p.root, env) });
@@ -191,7 +205,7 @@ export function copyCandidate(from, edit = () => {}) {
  * admission decision reads — the state `prepare` leaves behind. The assessment's scanner
  * answers are canned (SYNTHETIC); `at` is the evaluation's clock.
  */
-export function evaluatedProject({ answers = {}, assessAnswers = {}, records = [], at = NOW, facts = {}, withVerifier = false } = {}) {
+export function evaluatedProject({ answers = {}, assessAnswers = {}, records = [], at = NOW, facts = {}, withVerifier = false, advisories = NO_RECORDS() } = {}) {
   const p = certifiedProject({ answers, records, withVerifier });
   const f = apiFacts(p, facts);
   const { policy } = loadReleasePolicy(p.root);
@@ -206,7 +220,7 @@ export function evaluatedProject({ answers = {}, assessAnswers = {}, records = [
     assessor: { workflowPath: policy.evaluation.workflowPath, runId: EVAL_RUN_ID, runAttempt: '1', revision: p.commit },
     outDir: out.dir, replayDir: replay.dir,
     runner: cannedRunner({ application: assessAnswers.application ?? CLEAN, scanner: assessAnswers.scanner ?? CLEAN_SCANNER }),
-    clock: steppingClock(at), installScanner: fakeInstall,
+    clock: steppingClock(at), installScanner: fakeInstall, advisories,
   });
   const input = (over = {}) => ({
     policy, target: p.commit, mode: 'deploy', source: 'automatic', commit,

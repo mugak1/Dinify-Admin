@@ -25,9 +25,14 @@ const DEPLOY = loadWorkflow(WF('deploy.yml'));
 const PKG = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
 const VALIDATE = CI.jobs.validate.steps;
 const SNAPSHOT = 'npm run audit:snapshot';
+/** The scan as the scheduled re-scan runs it: no base, so nothing can be deferred. */
 const SCAN = 'npm run audit:deps';
+/** The scan as `validate` runs it (CI-signal A-2): deepen the one-commit checkout, then audit against the base. */
+const DEEPEN = 'git fetch --no-tags --quiet --unshallow origin "$GITHUB_SHA"';
+const SCAN_BASED = `${DEEPEN}\nnpm run audit:deps -- --base "$BASE"`;
+const isScan = (step) => commandOf(step) === SCAN || commandOf(step) === SCAN_BASED;
 
-const indexOfRun = (steps, run) => steps.findIndex((s) => commandOf(s) === run);
+const indexOfRun = (steps, run) => steps.findIndex((s) => (run === SCAN ? isScan(s) : commandOf(s) === run));
 
 describe('the audit is part of the required `validate` check', () => {
   it('CONTRACT: the required job keeps its name and runs on every PR and every push to main', () => {
@@ -89,8 +94,35 @@ describe('the audit is part of the required `validate` check', () => {
   });
 });
 
+describe('CI-signal A-2: the scan is given its base and the job token, and nothing more', () => {
+  const scanStep = VALIDATE[indexOfRun(VALIDATE, SCAN)];
+
+  it('CONTRACT: the base and the token reach the step through `env`, never interpolated into the script', () => {
+    assert.equal(commandOf(scanStep), SCAN_BASED);
+    assert.deepEqual(scanStep.env, { BASE: '${{ github.event.pull_request.base.sha || github.event.before }}', GH_TOKEN: '${{ github.token }}' });
+    assert.doesNotMatch(scanStep.run, /\$\{\{/);
+  });
+
+  it('CONTRACT: the token grants nothing new — ci.yml still declares no permissions, so the job keeps the repository default', () => {
+    assert.equal(CI.permissions, undefined);
+    assert.equal(CI.jobs.validate.permissions, undefined);
+    assert.doesNotMatch(readFileSync(WF('ci.yml'), 'utf8'), /secrets\./);
+    // The scheduled re-scan has no base and so defers nothing: unchanged.
+    assert.equal(AUDIT.jobs.audit.steps.find((s) => commandOf(s) === SCAN).env, undefined);
+  });
+
+  it('REGRESSION MATRIX: the deepening fetch runs first; if it fails the audit never runs and the step is red — never a silent "no base"', () => {
+    const order = runStep(`${scanStep.run}\n`, { gitExit: 0, npmBody: 'echo "npm $*"' });
+    assert.equal(order.status, 0, order.stderr);
+    assert.match(order.stderr, /stub git fetch --no-tags --quiet --unshallow origin/);
+    const failed = runStep(`${scanStep.run}\n`, { gitExit: 128, npmExit: 0 });
+    assert.equal(failed.status, 128);
+    assert.doesNotMatch(failed.stderr, /stub npm/, 'the audit was not reached');
+  });
+});
+
 describe('an audit failure reaches the required check — executed, not asserted', () => {
-  const outcome = (failing) => (step) => (failing.includes(commandOf(step)) ? 'failure' : 'success');
+  const outcome = (failing) => (step) => (failing.some((run) => (run === SCAN ? isScan(step) : commandOf(step) === run)) ? 'failure' : 'success');
 
   it('CONTROL: every step green is a green `validate`', () => {
     assert.equal(simulateJob(VALIDATE, outcome([])).conclusion, 'success');
@@ -103,7 +135,7 @@ describe('an audit failure reaches the required check — executed, not asserted
   });
 
   it('REGRESSION MATRIX: the audit is cancelled → `validate` is not green', () => {
-    assert.equal(simulateJob(VALIDATE, (s) => (commandOf(s) === SCAN ? 'cancelled' : 'success')).conclusion, 'cancelled');
+    assert.equal(simulateJob(VALIDATE, (s) => (isScan(s) ? 'cancelled' : 'success')).conclusion, 'cancelled');
   });
 
   it('REGRESSION MATRIX: the snapshot is refused → `validate` is red and the scan never runs on an unbound tree', () => {
@@ -120,9 +152,9 @@ describe('an audit failure reaches the required check — executed, not asserted
 
   it('REGRESSION MATRIX: the step\'s own shell propagates the audit\'s exit status (1 blocking, 2 incomplete)', () => {
     const script = VALIDATE[indexOfRun(VALIDATE, SCAN)].run;
-    assert.equal(runStep(script, { npmExit: 0 }).status, 0, 'CONTROL: a passing audit passes the step');
-    assert.equal(runStep(script, { npmExit: 1 }).status, 1);
-    assert.equal(runStep(script, { npmExit: 2 }).status, 2);
+    assert.equal(runStep(script, { npmExit: 0, gitExit: 0 }).status, 0, 'CONTROL: a passing audit passes the step');
+    assert.equal(runStep(script, { npmExit: 1, gitExit: 0 }).status, 1);
+    assert.equal(runStep(script, { npmExit: 2, gitExit: 0 }).status, 2);
   });
 
   it('NEGATIVE CONTROL: piping the audit to a formatter under the default shell WOULD hide the failure — which is why no pipe is allowed', () => {
@@ -147,7 +179,7 @@ describe('an unaccounted vulnerability fails `validate` — decided by the real 
   const retainStep = VALIDATE.find((s) => s.name === 'Retain the dependency-audit evidence');
   const within = (answer, fn) => { const p = auditedProject(answer); try { return fn(p); } finally { p.cleanup(); } };
   const validateWith = (p) => {
-    const step = runStep(scanStep.run, { npmBody: p.evaluateCommand });
+    const step = runStep(scanStep.run, { npmBody: p.evaluateCommand, gitExit: 0 });
     const invoked = [];
     const job = simulateJob(VALIDATE, (s) => {
       invoked.push(s);
@@ -185,7 +217,7 @@ describe('an unaccounted vulnerability fails `validate` — decided by the real 
     assert.ok(result.reasons.some((r) => r.code === 'scanner_dangling_cause'));
     assert.ok(existsSync(join(p.evidence, 'collection.json')) && existsSync(join(p.evidence, 'snapshot.json')));
     // And a retention step that itself failed would not make a failed job pass either.
-    assert.equal(simulateJob(VALIDATE, (s) => (s === retainStep || commandOf(s) === SCAN ? 'failure' : 'success')).conclusion, 'failure');
+    assert.equal(simulateJob(VALIDATE, (s) => (s === retainStep || isScan(s) ? 'failure' : 'success')).conclusion, 'failure');
   }));
 
   it('CONTRACT: nothing that ran holds a credential — `validate` references no secret and requests no OIDC token', () => within(HIGH_RUNTIME_MISSING_CAUSE, (p) => {

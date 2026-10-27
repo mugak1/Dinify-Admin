@@ -119,8 +119,24 @@ jobs:
       # report, or an inventory that moved since the snapshot is never read as clean.
       # Placed LAST so the application gates above still report when only the audit
       # fails. No `if:`, no `continue-on-error`, no pipe: its exit status is the step's.
+      #
+      # CI-signal A-2. BASE is the commit this change was made on — the pull request's base,
+      # or a push's `before` — and the audit reads its lockfiles from git to tell an
+      # INHERITED finding from one the change INTRODUCED. The checkout above is one commit
+      # deep, so this step first fetches the rest of HEAD's history (this repository is
+      # small); without it the base is not in the clone and the audit treats it as NO base,
+      # which is the old rule. GH_TOKEN is the job's own token, used only to ask GitHub when
+      # each advisory became reportable (GET /advisories/{id}, a public read); the scanner
+      # never receives it. An inherited high TOOLING finding then blocks from 00:00 UTC
+      # seven days after that date rather than at once; a critical, any runtime finding and
+      # anything introduced still block now. Both values reach the step through `env`.
       - name: Dependency audit — scan the validated inventory and enforce the policy
-        run: npm run audit:deps
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --no-tags --quiet --unshallow origin "$GITHUB_SHA"
+          npm run audit:deps -- --base "$BASE"
 
       # RELEASE CERTIFICATION, part 3 of 3: only a job in which EVERY gate above passed
       # reaches this step (no `if:`, no `continue-on-error`). It proves the output is still

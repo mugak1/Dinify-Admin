@@ -20,7 +20,7 @@ import { ASSESSMENT_DOC, assess, assessmentDeadline, diagnosticNotes, verifyAsse
 import { inspectCandidate } from '../lib/certification.mjs';
 import { loadReleasePolicy, recordBytes } from '../lib/common.mjs';
 import { sha256Hex, walkTree } from '../lib/tree.mjs';
-import { EVAL_RUN_ID, NOW, RUN_ATTEMPT, RUN_ID, apiFacts, candidateFiles, certifiedProject, steppingClock, tempDir } from './fixtures.mjs';
+import { EVAL_RUN_ID, NOW, NO_RECORDS, RUN_ATTEMPT, RUN_ID, apiFacts, candidateFiles, certifiedProject, steppingClock, tempDir } from './fixtures.mjs';
 
 const codes = (problems) => problems.map((p) => p.code);
 
@@ -62,7 +62,7 @@ function trustedRootFrom(p, { records } = {}) {
   return t;
 }
 
-function runAssess(p, { answers = {}, trustedRoot = p.root, clock = steppingClock(NOW), install = fakeInstall } = {}) {
+function runAssess(p, { answers = {}, trustedRoot = p.root, clock = steppingClock(NOW), install = fakeInstall, advisories = NO_RECORDS() } = {}) {
   const inspection = inspectCandidate(candidateFiles(p.candidateDir), expectFor(p));
   assert.deepEqual(inspection.problems, [], 'the candidate must inspect clean before it is assessed');
   const out = tempDir('assessment-');
@@ -72,7 +72,7 @@ function runAssess(p, { answers = {}, trustedRoot = p.root, clock = steppingCloc
     trustedRoot, inspection,
     candidate: { commit: p.commit, runId: RUN_ID, runAttempt: RUN_ATTEMPT, artifactId: '5550001', artifactDigest: `sha256:${'a'.repeat(64)}` },
     assessor: { workflowPath: '.github/workflows/deploy.yml', runId: EVAL_RUN_ID, runAttempt: '1', revision: p.commit },
-    outDir: out.dir, replayDir: replay.dir, runner, clock, installScanner: install,
+    outDir: out.dir, replayDir: replay.dir, runner, clock, installScanner: install, advisories,
   });
   return { inspection, doc, result, unfinished, runner, outDir: out.dir, replayDir: replay.dir, cleanup: () => { out.cleanup(); replay.cleanup(); } };
 }

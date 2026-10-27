@@ -57,13 +57,22 @@ export function simulateJob(steps, outcomeOf) {
  * @param {object} options
  * @param {number} [options.npmExit]  the status the stub exits with
  * @param {string} [options.npmBody]  instead, the shell the stub runs (e.g. the real CLI)
+ * @param {number} [options.gitExit]  given, `git fetch` is a stub exiting with this status (a
+ *                                    step that deepens its checkout before the audit); every
+ *                                    other git command is the real one, which the evaluator
+ *                                    reads the revision with
  */
-export function runStep(script, { npmExit, npmBody, shell = ['bash', '-e'] } = {}) {
+export function runStep(script, { npmExit, npmBody, gitExit, shell = ['bash', '-e'] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'step-'));
   try {
     const stub = join(dir, 'npm');
     writeFileSync(stub, `#!/bin/sh\necho "stub npm $*" >&2\n${npmBody ?? `exit ${Number(npmExit)}`}\n`);
     chmodSync(stub, 0o755);
+    if (gitExit !== undefined) {
+      const realGit = spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+      writeFileSync(join(dir, 'git'), `#!/bin/sh\nif [ "$1" = fetch ]; then echo "stub git $*" >&2; exit ${Number(gitExit)}; fi\nexec "${realGit}" "$@"\n`);
+      chmodSync(join(dir, 'git'), 0o755);
+    }
     const file = join(dir, 'step.sh');
     writeFileSync(file, script);
     const r = spawnSync(shell[0], [...shell.slice(1), file], {

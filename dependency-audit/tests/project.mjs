@@ -8,7 +8,8 @@
  * scanner is exercised separately, against the real graph, by `npm run audit:deps`.
  */
 
-import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -149,4 +150,53 @@ export function auditedProject(answer) {
   cpSync(join(here, 'cli.mjs'), cli);
   cpSync(join(here, 'lib'), join(p.root, 'dependency-audit', 'lib'), { recursive: true });
   return { ...p, result, cli, evaluateCommand: `exec "${process.execPath}" "${cli}" evaluate` };
+}
+
+/** Real git in a fixture: never the user's signing or hooks, always the fixture's identity. */
+export function git(root, ...args) {
+  const r = spawnSync('git', ['-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null', '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', ...args], { cwd: root, encoding: 'utf8' });
+  if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
+  return r.stdout.trim();
+}
+
+/**
+ * Turn a fixture project into a git repository with TWO commits: a BASE whose lockfiles are
+ * the current ones passed through `application` / `scanner` (each receives a parsed copy and
+ * returns the lock the base held, or undefined to drop the file from the base), then HEAD
+ * with the project as written. Returns the base commit. node_modules and the evidence
+ * directory stay untracked, as in a real checkout.
+ */
+export function commitBase(root, { application = (lock) => lock, scanner = (lock) => lock } = {}) {
+  const paths = { application: join(root, 'package-lock.json'), scanner: join(root, 'dependency-audit', 'scanner', 'package-lock.json') };
+  const head = Object.fromEntries(Object.entries(paths).map(([g, path]) => [g, readFileSync(path, 'utf8')]));
+  writeFileSync(join(root, '.gitignore'), 'node_modules/\ndependency-audit/evidence/\n');
+  git(root, 'init', '-q', '-b', 'main');
+  for (const [graph, change] of [['application', application], ['scanner', scanner]]) {
+    const base = change(JSON.parse(head[graph]));
+    if (base === undefined) rmSync(paths[graph]);
+    else writeFileSync(paths[graph], `${JSON.stringify(base, null, 2)}\n`);
+  }
+  git(root, 'add', '-A');
+  git(root, 'commit', '-q', '-m', 'base');
+  const base = git(root, 'rev-parse', 'HEAD');
+  for (const [graph, path] of Object.entries(paths)) writeFileSync(path, head[graph]);
+  git(root, 'add', '-A');
+  git(root, 'commit', '-q', '--allow-empty', '-m', 'head');
+  return base;
+}
+
+/** A fixture GitHub answer for one advisory: the record of `id`, reviewed and published when stated. */
+export const advisoryBody = (id, { reviewed = '2026-09-21T08:00:00Z', published = '2026-09-20T10:00:00Z' } = {}) => JSON.stringify({
+  ghsa_id: id, type: 'reviewed', severity: 'high', published_at: published, updated_at: published, github_reviewed_at: reviewed, nvd_published_at: null, withdrawn_at: null,
+});
+
+/** An advisory fetcher at the clock's seam: answers each id with `answer(id)`, recording the ids asked. */
+export function cannedAdvisories(answer = (id) => ({ status: 200, body: advisoryBody(id) }), { authenticated = true } = {}) {
+  const asked = [];
+  const fetcher = (ids) => {
+    asked.push([...ids]);
+    return { answers: ids.map((id) => ({ id, retrievedAt: NOW, error: null, body: null, ...answer(id) })), authenticated };
+  };
+  fetcher.asked = asked;
+  return fetcher;
 }

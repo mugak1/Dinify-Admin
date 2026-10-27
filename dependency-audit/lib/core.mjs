@@ -9,17 +9,22 @@
  * in all three repositories — is the oracle both are tested against. Change a rule here and
  * the vectors fail until the same change lands in the other ecosystem.
  *
- * FOUR OUTCOMES, and they are not shades of one another:
+ * FIVE OUTCOMES, and they are not shades of one another:
  *
- *   within_policy    the audit completed and nothing the policy blocks was found
- *   exceptions_only  the audit completed and passes ONLY because of specifically approved,
- *                    still-valid exception records — visible, never reported as clean
- *   blocking         the audit completed and found something the policy blocks, or a
- *                    disposition record was refused (expired, malformed, broadened,
- *                    mismatched, unused)
- *   incomplete       no trustworthy result exists: the scanner, the collection, the parse,
- *                    the inventory binding or the provenance failed, or a finding could not
- *                    be classified. An empty report is NOT a clean report.
+ *   within_policy        the audit completed and nothing the policy blocks was found
+ *   exceptions_only      the audit completed and passes ONLY because of specifically
+ *                        approved, still-valid exception records — visible, never clean
+ *   obligations_pending  the audit completed and passes ONLY because an inherited high
+ *                        tooling finding is inside its dated deferral window — visible,
+ *                        with the date it starts to block, never clean
+ *   blocking             the audit completed and found something the policy blocks, or a
+ *                        disposition record was refused (expired, malformed, broadened,
+ *                        mismatched, unused)
+ *   incomplete           no trustworthy result exists: the scanner, the collection, the
+ *                        parse, the inventory binding or the provenance failed, or a finding
+ *                        could not be classified. An empty report is NOT a clean report.
+ *
+ * Precedence: incomplete > blocking > obligations_pending > exceptions_only > within_policy.
  *
  * THE RULES (the parent policy, D08 Stage B §6):
  *   - a CRITICAL or HIGH advisory blocks, whatever the scope — a build, test or publisher
@@ -31,19 +36,51 @@
  *   - anything else (unknown severity on tooling, unknown scope below high) cannot be
  *     evaluated, and a policy that cannot be evaluated has not passed: incomplete.
  *
+ * THE DATED OBLIGATION (CI-signal A-1). Disposition records apply first, unchanged.
+ * Then an UNEXCEPTED finding that would block is DEFERRED — class `deferred`, a `deadline`,
+ * counted under `deferred` — only when ALL of these hold:
+ *   - its scope is `tooling` and its severity is `high` (critical is never deferred);
+ *   - its optional `provenance` is exactly "inherited": the advisory was already reportable
+ *     for the base the change was made on, so the change did not introduce it;
+ *   - its optional `reportableSince` is a calendar date (the same check records use) no
+ *     later than the decision day;
+ *   - `now` is before 00:00 UTC on the deadline, `reportableSince` + HIGH_DEFERRAL_DAYS.
+ * Anything not ESTABLISHED falls back to blocking, exactly as before: a missing, null,
+ * malformed or unknown provenance; a missing, null, malformed, impossible or future date;
+ * a deadline already reached. It never falls back to deferral, and never to incomplete.
+ * The one exception is a field of the wrong JSON TYPE (a number, a boolean, a list, an
+ * object): that is an adapter that cannot fill in a finding, which the existing
+ * malformed-finding rule already answers — incomplete.
+ *
+ * INERT UNTIL SUPPLIED. No adapter emits `provenance` or `reportableSince` yet (step A-2
+ * does), and a result in which nothing was deferred is byte-identical to the one this
+ * evaluator produced before the rule existed: the `deferred` count, a finding's
+ * `deadline` and the `deferred_finding` reason appear ONLY when a deferral applied.
+ * Consumers re-decide retained results and compare `counts` exactly, so an always-present
+ * `deferred: 0` would make every result certified before the rule unreproducible.
+ *
  * Nothing here reads the network, the clock or the filesystem. `now` is an argument.
  */
 
-export const OUTCOMES = Object.freeze(['within_policy', 'exceptions_only', 'blocking', 'incomplete']);
+export const OUTCOMES = Object.freeze(['within_policy', 'exceptions_only', 'obligations_pending', 'blocking', 'incomplete']);
 export const SEVERITIES = Object.freeze(['critical', 'high', 'moderate', 'low', 'info']);
 export const SCOPES = Object.freeze(['runtime', 'tooling']);
 export const RECORD_KINDS = Object.freeze(['exception', 'triage']);
+/** A finding's optional provenance. Only "inherited" can defer; anything else blocks as before. */
+export const PROVENANCES = Object.freeze(['inherited', 'introduced']);
+
+/**
+ * The dated-obligation window for an inherited HIGH tooling finding, in calendar days from
+ * `reportableSince`. A reviewed code change in all three repositories, never a policy value.
+ * There is deliberately no window for CRITICAL: a critical finding blocks immediately.
+ */
+export const HIGH_DEFERRAL_DAYS = 7;
 
 /** A record may not outlive its approval by more than this. Bounded, never open-ended. */
 export const MAX_RECORD_DAYS = 90;
 export const MIN_TEXT = 20;
 
-const EXIT = Object.freeze({ within_policy: 0, exceptions_only: 0, blocking: 1, incomplete: 2 });
+const EXIT = Object.freeze({ within_policy: 0, exceptions_only: 0, obligations_pending: 0, blocking: 1, incomplete: 2 });
 export const exitCodeFor = (outcome) => (outcome in EXIT ? EXIT[outcome] : 2);
 
 const RECORD_KEYS = ['id', 'kind', 'advisory', 'aliases', 'package', 'version', 'paths', 'scope',
@@ -72,6 +109,12 @@ export function parseDate(text) {
 
 const DAY = 86400000;
 const isText = (v, min = 1) => typeof v === 'string' && v.trim().length >= min;
+
+/** Epoch milliseconds at 00:00 UTC as `YYYY-MM-DD`, or null when it is not one. */
+const isoDate = (ms) => {
+  const text = new Date(ms).toISOString().slice(0, 10);
+  return parseDate(text) === ms ? text : null;
+};
 
 /**
  * Structural validation of ONE disposition record. Returns the list of problems; an empty
@@ -155,12 +198,35 @@ const uncorroboratedAliases = (record, finding) => {
 };
 
 const FINDING_KEYS = ['advisory', 'package', 'version', 'path', 'scope', 'severity'];
+/** Optional: absent and null both mean "not supplied". Any other non-string is malformed. */
+const OPTIONAL_FINDING_KEYS = ['provenance', 'reportableSince'];
 
 /** A finding the adapter could not fill in completely is not something to decide on. */
 function findingProblems(finding, index) {
   if (finding === null || typeof finding !== 'object') return [`finding ${index} is not an object`];
+  const problems = [];
   const missing = FINDING_KEYS.filter((k) => typeof finding[k] !== 'string' || finding[k] === '');
-  return missing.length ? [`finding ${index} lacks ${missing.join(', ')}`] : [];
+  if (missing.length) problems.push(`finding ${index} lacks ${missing.join(', ')}`);
+  const mistyped = OPTIONAL_FINDING_KEYS.filter((k) => finding[k] !== undefined && finding[k] !== null && typeof finding[k] !== 'string');
+  if (mistyped.length) problems.push(`finding ${index} has ${mistyped.join(', ')} that is not a string`);
+  return problems;
+}
+
+/**
+ * The dated obligation for ONE finding the policy would otherwise block, decided after
+ * the records: its deadline (`YYYY-MM-DD`, from 00:00 UTC on which it blocks), or null
+ * when deferral is not ESTABLISHED — which means the finding blocks, exactly as before.
+ */
+export function deferralDeadline(finding, nowMs) {
+  if (finding === null || typeof finding !== 'object') return null;
+  if (finding.scope !== 'tooling' || finding.severity !== 'high') return null;
+  if (finding.provenance !== 'inherited') return null;
+  const sinceMs = parseDate(finding.reportableSince);
+  if (sinceMs === null || !Number.isFinite(nowMs)) return null;
+  if (sinceMs > Math.floor(nowMs / DAY) * DAY) return null;
+  const deadlineMs = sinceMs + HIGH_DEFERRAL_DAYS * DAY;
+  if (nowMs >= deadlineMs) return null;
+  return isoDate(deadlineMs);
 }
 
 /**
@@ -262,6 +328,14 @@ export function evaluate({ incomplete = [], findings = [], records = [], now }) 
   }
   for (const f of decided) {
     if (f.class === 'blocking' && f.disposition === 'open') {
+      const deadline = deferralDeadline(f, nowMs);
+      if (deadline !== null) {
+        f.class = 'deferred';
+        f.deadline = deadline;
+        reasons.push({ outcome: 'obligations_pending', code: 'deferred_finding',
+          detail: `${f.advisory} (${f.severity}) on ${f.package}@${f.version} at ${f.path} [${f.scope}]: inherited, reportable since ${f.reportableSince}; deferred until ${deadline}, from 00:00 UTC on which it blocks` });
+        continue;
+      }
       reasons.push({ outcome: 'blocking', code: 'blocking_finding',
         detail: `${f.advisory} (${f.severity}) on ${f.package}@${f.version} at ${f.path} [${f.scope}]` });
     }
@@ -277,10 +351,14 @@ export function evaluate({ incomplete = [], findings = [], records = [], now }) 
     refusedRecords: checked.filter((e) => e.problems.length).length,
     appliedRecords: checked.filter((e) => !e.problems.length && e.applied > 0).length,
   };
+  // Emitted only when a deferral applied: see INERT UNTIL SUPPLIED above.
+  const deferred = decided.filter((f) => f.class === 'deferred').length;
+  if (deferred > 0) counts.deferred = deferred;
 
   let outcome;
   if (reasons.some((r) => r.outcome === 'incomplete')) outcome = 'incomplete';
   else if (reasons.some((r) => r.outcome === 'blocking')) outcome = 'blocking';
+  else if (deferred > 0) outcome = 'obligations_pending';
   else if (counts.excepted > 0) outcome = 'exceptions_only';
   else outcome = 'within_policy';
 
@@ -301,6 +379,10 @@ export function headline(result) {
   if (c.findings === 0) tail.push('no advisories reported for the audited inventory');
   else tail.push(`${c.findings} advisory finding(s)`);
   if (c.blocking) tail.push(`${c.blocking} BLOCKING`);
+  if (c.deferred) {
+    const deadlines = (Array.isArray(result.findings) ? result.findings : []).filter((f) => f && f.class === 'deferred' && typeof f.deadline === 'string').map((f) => f.deadline).sort();
+    tail.push(`${c.deferred} inherited high tooling finding(s) DEFERRED under a dated obligation${deadlines.length ? ` (blocks from 00:00 UTC on ${deadlines[0]} at the earliest)` : ''}`);
+  }
   if (c.excepted) tail.push(`${c.excepted} under approved exception`);
   if (c.triageRequired) tail.push(`${c.triageRequired} lower-severity tooling finding(s) REQUIRE TRIAGE (not zero findings)`);
   if (c.triaged) tail.push(`${c.triaged} triaged`);
@@ -309,6 +391,7 @@ export function headline(result) {
   const label = {
     within_policy: 'AUDIT COMPLETE — WITHIN POLICY',
     exceptions_only: 'AUDIT COMPLETE — PASSES ONLY WITH APPROVED EXCEPTIONS',
+    obligations_pending: 'AUDIT COMPLETE — PASSES WITH DATED OBLIGATIONS OUTSTANDING',
     blocking: 'AUDIT COMPLETE — BLOCKING',
     incomplete: 'AUDIT UNAVAILABLE OR INCOMPLETE — NOT A CLEAN RESULT',
   }[result.outcome] ?? 'AUDIT OUTCOME UNKNOWN';

@@ -14,7 +14,8 @@ import { describe, it } from 'node:test';
 
 import { npmReport, via } from '../../dependency-audit/tests/project.mjs';
 import { commitFacts } from '../lib/admission.mjs';
-import { freeze, inspectCandidate, prebuild } from '../lib/certification.mjs';
+import { OUTCOMES, exitCodeFor } from '../../dependency-audit/lib/core.mjs';
+import { PASSING, freeze, inspectCandidate, prebuild } from '../lib/certification.mjs';
 import { loadReleasePolicy } from '../lib/common.mjs';
 import { writeArchive, readArchive } from '../lib/tar.mjs';
 import { describeFiles, sha256Hex } from '../lib/tree.mjs';
@@ -170,6 +171,21 @@ describe('the producer: only a job whose gates all passed yields a candidate', (
   it('REGRESSION MATRIX: no GitHub Actions run context → no candidate (a local build is never a certification)', () => withProject({ env: { GITHUB_RUN_ID: '' } }, (p) => {
     assert.ok(codes(p.stages.certify.problems).includes('no_workflow_context'));
   }));
+});
+
+describe('the passing outcomes — exactly the evaluator\'s exit-0 words (CI-signal A-1)', () => {
+  // The producer, the consumer and the fresh assessment all re-decide from RAW scanner
+  // output, and no adapter supplies the provenance that defers a finding until A-2, so
+  // `obligations_pending` cannot yet be produced end to end here. These pin the set.
+  it('CONTRACT: obligations_pending is a passing outcome, beside the two that already were', () => {
+    assert.deepEqual([...PASSING], ['within_policy', 'exceptions_only', 'obligations_pending']);
+  });
+  it('CONTRACT: the passing set is the evaluator\'s exit-0 set, so the two cannot drift apart', () => {
+    assert.deepEqual([...PASSING], OUTCOMES.filter((o) => exitCodeFor(o) === 0));
+  });
+  it('CONTRACT: a word the evaluator does not emit is not passing', () => {
+    for (const word of ['obligations_overdue', 'clean', 'blocking', 'incomplete', '']) assert.equal(PASSING.includes(word), false, word);
+  });
 });
 
 /**

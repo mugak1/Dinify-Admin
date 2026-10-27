@@ -39,18 +39,65 @@ artifact.
 | finding | decision |
 |---|---|
 | critical or high, any scope | **blocking** |
+| high on tooling, INHERITED and inside its 7-day window (see "Dated obligations" below) | **deferred** — inert until A-2 supplies the inputs |
 | any severity on a runtime package | **blocking** |
 | moderate / low / info on tooling | visible, **triage required** — counted, never reported as zero findings |
 | anything the policy cannot evaluate (unknown severity on tooling, unknown scope below high) | **incomplete** |
 
-Four outcomes, and the process exit status follows them:
+Five outcomes, and the process exit status follows them:
 
 | outcome | exit | meaning |
 |---|---|---|
 | `within_policy` | 0 | complete; nothing the policy blocks |
 | `exceptions_only` | 0 | complete; passes ONLY because of approved, unexpired exception records — the headline says so |
+| `obligations_pending` | 0 | complete; passes ONLY because an inherited high tooling finding is inside its dated window — the headline says so, with the date it starts to block |
 | `blocking` | 1 | complete; a blocking finding, or a disposition record was refused |
 | `incomplete` | 2 | no trustworthy result: scanner, network, parse, coverage, binding or provenance failure |
+
+Precedence: `incomplete` > `blocking` > `obligations_pending` > `exceptions_only` >
+`within_policy`.
+
+### Dated obligations (CI-signal A-1): the evaluator half, INERT until A-2
+
+Disposition records apply first, unchanged. Then a finding the policy would block, and
+that no record covers, is **deferred** (class `deferred`, a `deadline`, counted under
+`deferred`) only when ALL of these hold:
+
+- its scope is `tooling` and its severity is `high` — **critical is never deferred**, and
+  moderate, low and info stay triage;
+- its optional `provenance` is exactly `"inherited"` (the advisory was already reportable
+  for the base the change was made on, so the change did not introduce it);
+- its optional `reportableSince` is a calendar date `YYYY-MM-DD`, by the same check records
+  use, no later than the decision day;
+- the decision is made before 00:00 UTC on the deadline, `reportableSince` +
+  `HIGH_DEFERRAL_DAYS` (7). The window is a constant beside the rule in `lib/core.mjs`,
+  not a `policy.json` value: changing it is a reviewed code change in all three
+  repositories.
+
+Anything not established blocks, exactly as before: a missing, `null`, malformed or
+unknown provenance; a missing, `null`, malformed, impossible or future date; a deadline
+already reached. It never falls back to deferral, and never to incomplete. The one
+exception is a provenance or date of the wrong JSON type (a number, a boolean, a list, an
+object): that is an adapter that could not fill in a finding, which the existing
+malformed-finding rule answers — **incomplete**. `null` reads as absent, as the existing
+rule already treats it for the required fields. Each deferred finding gets a
+`deferred_finding` reason naming its deadline, and the headline names the earliest one.
+
+**Inert, byte for byte.** No adapter emits `provenance` or `reportableSince` yet — step A-2
+does, in Dinify-Frontend and Dinify-Admin — so no result carries the new outcome. A result
+in which nothing was deferred is byte-identical to the one the evaluator produced before
+the rule: `counts.deferred`, a finding's `deadline` and the `deferred_finding` reason
+appear ONLY when a deferral applied. That is load-bearing, because the release consumers
+re-decide retained results and compare `counts` exactly; an always-present `deferred: 0`
+would make every result certified before A-1 unreproducible. `tests/core.test.mjs` pins
+the full result of each of the 41 vectors that predate the rule, by digest; the same
+digests are pinned in Dinify-Backend's Python suite, because the two evaluators already
+produced identical bytes.
+
+The shared vectors are now 61 (the 41 before, plus 20 deferral vectors appended after
+them), digest `6365e880c55153f5ce50ca144434cb42d5c937be48218445da36cefb8ffb9653`,
+byte-identical in the three repositories. The release consumers' passing set accepts
+`obligations_pending` and nothing else new.
 
 **An incomplete audit fails the required check.** An empty report, truncated JSON, an error
 body, a scanner that timed out or never ran, a count that is not the lock graph, an

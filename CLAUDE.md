@@ -2239,11 +2239,26 @@ a successful CI push to main, or on `workflow_dispatch`.
   else and re-checks the inventory before and after each scan. It scans the application
   graph and the pinned scanner's own graph (npm 11.21.1, installed from its own lockfile
   with scripts disabled).
-- **Four outcomes, one policy, shared with Frontend and Backend:** `within_policy` 0,
-  `exceptions_only` 0, `blocking` 1, `incomplete` 2. High/critical blocks in every scope,
-  any runtime advisory blocks, lower-severity tooling is TRIAGE REQUIRED (visible, never
-  "zero findings"), and anything unevaluable is incomplete. `conformance.json` is
-  byte-identical in all three repos and its digest is pinned in each suite.
+- **Five outcomes, one policy, shared with Frontend and Backend:** `within_policy` 0,
+  `exceptions_only` 0, `obligations_pending` 0, `blocking` 1, `incomplete` 2. High/critical
+  blocks in every scope, any runtime advisory blocks, lower-severity tooling is TRIAGE
+  REQUIRED (visible, never "zero findings"), and anything unevaluable is incomplete.
+  `conformance.json` is byte-identical in all three repos and its digest is pinned in each
+  suite (61 vectors since A-1, digest `6365e880…`).
+- **The fifth outcome is the DATED OBLIGATION (CI-signal A-1), INERT until A-2.** After the
+  records, an unexcepted TOOLING HIGH finding whose optional `provenance` is exactly
+  `"inherited"` and whose optional `reportableSince` is a calendar date no later than the
+  decision day is deferred until 00:00 UTC on `reportableSince` + 7 days
+  (`HIGH_DEFERRAL_DAYS`, a constant in `lib/core.mjs`, never a policy value); critical is
+  never deferred, and anything not established blocks as before (a wrong JSON type is a
+  malformed finding, `null` is absent). No adapter emits either field yet — A-2 does — and
+  a result that deferred nothing is byte-identical to before: `counts.deferred`,
+  `deadline` and `deferred_finding` appear only when a deferral applied, because
+  `certification.mjs` and `assessment.mjs` re-decide retained results and compare `counts`
+  exactly. `tests/core.test.mjs` pins the full result of the 41 earlier vectors by digest.
+  `PASSING` accepts the new word and nothing else new. **Not done in A-1, and needed before
+  A-2 lets the outcome occur:** the deploy's assessment deadline is cut short by an applied
+  record's expiry but not by a deferred finding's deadline.
 - **The scanner is invoked hardened because narrowing is invisible** — measured on main:
   an inherited `NODE_ENV=production` made `npm audit` report zero vulnerable packages where
   it otherwise reports five, while still counting every package.

@@ -64,7 +64,13 @@ export const AUDIT_EVIDENCE_DIR = 'dependency-audit/evidence';
 export const RECORD = 'certification.json';
 export const ARCHIVE = 'payload.tar.gz';
 export const RELEASE_TXT = 'release.txt';
-export const PASSING = Object.freeze(['within_policy', 'exceptions_only']);
+/**
+ * The audit outcomes a candidate may carry: exactly the evaluator's exit-0 outcomes
+ * (dependency-audit/lib/core.mjs). `obligations_pending` is reachable only once an adapter
+ * supplies a finding's provenance and reportable date (CI-signal A-2); until then no result
+ * carries it, and every re-decision of retained evidence is what it was before A-1.
+ */
+export const PASSING = Object.freeze(['within_policy', 'exceptions_only', 'obligations_pending']);
 export const SOURCE_VERIFICATION = 'worktree-bytes-equal-commit-tree';
 export const SOURCE_STAGES = Object.freeze(['prebuild', 'freeze', 'certify']);
 /** Installed by `npm ci` and by the audit; covered by the inventory statement, never source. */

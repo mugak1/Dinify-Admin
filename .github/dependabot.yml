@@ -9,13 +9,16 @@
 #   github-actions  — version updates ON, grouped weekly, majors welcome
 #
 # The asymmetry is the whole design; the rationale sits above each block.
+# One further npm block, for the pinned dependency-audit scanner, tells
+# Dependabot to attempt nothing in that one directory (see its block).
 #
 # Neither repo had a dependabot.yml before this one, and that is why #635
 # happened the way it did: version updates are enabled BY committing this
 # file, so they were never on, and every Dependabot PR either repo has ever
 # received — #635 included — arrived as a SECURITY update. Security updates
 # are switched on by a repository setting rather than by this file, so
-# nothing here enables or disables them. It only shapes the pull requests
+# nothing here enables them. Apart from the scanner block, which tells them
+# to leave one directory alone, this file only shapes the pull requests
 # they open.
 
 version: 2
@@ -97,6 +100,51 @@ updates:
         update-types: ["version-update:semver-major"]
       - dependency-name: "@eslint/*"
         update-types: ["version-update:semver-major"]
+
+  # ---------------------------------------------------------------------
+  # npm — the pinned dependency-audit scanner: no updates at all
+  # ---------------------------------------------------------------------
+  # dependency-audit/scanner/ holds one dependency, the scanner `npm`, pinned
+  # to an exact version. Everything else in its lock is npm's own BUNDLED tree
+  # (`inBundle: true`): it ships inside the npm tarball, so no lock edit can
+  # move it. Dependabot cannot fix anything here, and every security update
+  # it attempted in this directory failed red with nothing anyone could act
+  # on (undici: `security_update_not_possible`; qs, which is not in this lock
+  # at all: `security_update_dependency_not_found`).
+  #
+  # The advisories are not lost. The repository's own dependency audit
+  # (dependency-audit/, run in CI and by the weekly audit.yml) scans this
+  # graph and reports every one, and moving the scanner is a deliberate,
+  # reviewed change (dependency-audit/README.md), never a bot bump.
+  #
+  # The mechanism is `ignore` with a bare `dependency-name`: GitHub documents
+  # that ignoring a dependency in this file prevents security AND version
+  # updates for it, and `"*"` matches every name. `exclude-paths` would NOT do
+  # this: GitHub documents it as version updates only. A block applies to
+  # security updates only when its `directory` is the manifest's own path,
+  # which is why this one names the scanner directory and nothing wider.
+  #
+  # Scoped to this directory ONLY, deliberately:
+  #   /                  keeps its security updates (the npm block above).
+  #                      That tree is not bundled, so its updates can land.
+  #   /release/publisher (Dinify-Frontend only) has no block, so it keeps the
+  #                      default security updates. Its tree is not bundled
+  #                      either, and a lock refresh there can fix things.
+  #
+  # What this block cannot promise: GitHub decides on its side whether to
+  # start a security-update job for an ignored dependency. If it still starts
+  # one, the open-source updater ends it with `all_versions_ignored`, which is
+  # red too. In a repository with Dependabot alerts off, no security updates
+  # run and this block is inert; it stays because the file is byte-identical.
+  #
+  # `open-pull-requests-limit: 0` keeps version updates off here, as for `/`.
+  - package-ecosystem: npm
+    directory: /dependency-audit/scanner
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    ignore:
+      - dependency-name: "*"
 
   # ---------------------------------------------------------------------
   # GitHub Actions — version updates ON

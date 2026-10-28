@@ -252,12 +252,22 @@ export const toolingScope = () => 'tooling';
  * The job's GitHub token is removed too: it is there for the advisory clock (advisories.mjs),
  * which runs in this repository's own code, and the scanner is third-party code that has
  * no use for it.
+ *
+ * So are the runner's five file-command paths. Each names a file the runner reads when the
+ * step ends, and what is written there sets environment variables, PATH entries, step
+ * outputs, the job summary or saved state for the steps that follow, a token-bearing step
+ * among them. The scanner has no use for any of them. This WITHHOLDS the variables and
+ * nothing more: it is not a boundary, because a process on the same runner can still find
+ * the files. The boundary is that the scanner is the pinned, integrity-checked npm, run
+ * with scripts disabled.
  */
+const FILE_COMMANDS = new Set(['GITHUB_ENV', 'GITHUB_PATH', 'GITHUB_OUTPUT', 'GITHUB_STEP_SUMMARY', 'GITHUB_STATE']);
+
 export function scannerEnvironment(base = process.env) {
   const env = {};
   const removed = [];
   for (const [key, value] of Object.entries(base)) {
-    if (/^npm_/i.test(key) || key === 'NODE_ENV' || key === 'NODE_OPTIONS' || key === 'GH_TOKEN' || key === 'GITHUB_TOKEN') { removed.push(key); continue; }
+    if (/^npm_/i.test(key) || key === 'NODE_ENV' || key === 'NODE_OPTIONS' || key === 'GH_TOKEN' || key === 'GITHUB_TOKEN' || FILE_COMMANDS.has(key)) { removed.push(key); continue; }
     env[key] = value;
   }
   env.npm_config_update_notifier = 'false';

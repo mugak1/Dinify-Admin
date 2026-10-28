@@ -17,7 +17,7 @@ import {
   ADVISORIES_FILE, advisoryIds, applyDates, buildAdvisoryEvidence, fetchAdvisories, readAdvisoryEvidence, reportableDate, utcDateOf,
 } from '../lib/advisories.mjs';
 import { audit, reevaluate, renderSummary, requestedBase, resolveBase, snapshot } from '../lib/audit.mjs';
-import { annotateProvenance, inventory, lockEntries, readReport, scannerEnvironment, toolingScope } from '../lib/npm.mjs';
+import { annotateProvenance, inventory, lockEntries, parentLockPath, provenanceOf, readReport, scannerEnvironment, toolingScope } from '../lib/npm.mjs';
 import {
   advisoryBody, cannedAdvisories, cannedRunner, CLEAN_SCANNER, commitBase, fakeInstall, git, makeProject, NOW, npmReport, via,
 } from './project.mjs';
@@ -99,6 +99,102 @@ describe('provenance: inherited only when the base holds the same path, version 
       assert.equal(annotateProvenance(direct, { graph: 'application', inv, base: undefined }), direct, 'no base: returned unchanged');
     } finally { p.cleanup(); }
   });
+});
+
+describe('provenance of a BUNDLED entry: its bundling package must be inherited too (npm.mjs)', () => {
+  const BUNDLED = 'node_modules/npm/node_modules/bundled';
+  const BUNDLED_HIGH = answer('bundled', 'high', BUNDLED, GHSA, 2);
+  const scannerLock = () => { const p = makeProject({}); try { return read(join(p.root, 'dependency-audit', 'scanner', 'package-lock.json')); } finally { p.cleanup(); } };
+  const scannerBase = (mutate) => { const lock = scannerLock(); mutate(lock.packages); return lockEntries(JSON.stringify(lock)); };
+  const readScanner = (base) => {
+    const p = makeProject({});
+    try {
+      const inv = inventory(join(p.root, 'dependency-audit', 'scanner'), { graph: 'scanner', scopeOf: toolingScope });
+      const direct = readReport({ graph: 'scanner', run: BUNDLED_HIGH, inv, base }).findings;
+      const annotated = annotateProvenance(readReport({ graph: 'scanner', run: BUNDLED_HIGH, inv }).findings, { graph: 'scanner', inv, base });
+      assert.equal(JSON.stringify(annotated), JSON.stringify(direct), 'the retained path and the direct path agree');
+      return direct[0];
+    } finally { p.cleanup(); }
+  };
+
+  it('PREMISE: the bundled entry carries no integrity, and npm (its bundling package) does', () => {
+    const lock = scannerLock();
+    assert.equal(lock.packages[BUNDLED].integrity, undefined);
+    assert.equal(lock.packages[BUNDLED].inBundle, true);
+    assert.ok(lock.packages['node_modules/npm'].integrity);
+  });
+  it('CONTROL: the same npm (version and integrity) in the base → the bundled entry is inherited', () => {
+    assert.equal(readScanner(scannerBase(() => {})).provenance, 'inherited');
+  });
+  it('REGRESSION: npm at ANOTHER RELEASE bundling the same entry at the same path and version → introduced', () => {
+    assert.equal(readScanner(scannerBase((pk) => { pk['node_modules/npm'].version = '11.0.0'; pk['node_modules/npm'].integrity = 'sha512-OLDNPM'; })).provenance, 'introduced');
+  });
+  it('REGRESSION: the same npm version with ANOTHER integrity → introduced', () => {
+    assert.equal(readScanner(scannerBase((pk) => { pk['node_modules/npm'].integrity = 'sha512-OTHER'; })).provenance, 'introduced');
+  });
+  it('REGRESSION: a base that holds the bundled entry but not its bundling package → introduced', () => {
+    assert.equal(readScanner(scannerBase((pk) => { delete pk['node_modules/npm']; })).provenance, 'introduced');
+  });
+  it('CONTROL: the bundled entry\'s own path and version still decide first — another bundled version → introduced', () => {
+    assert.equal(readScanner(scannerBase((pk) => { pk[BUNDLED].version = '0.9.0'; })).provenance, 'introduced');
+  });
+
+  it('CONTRACT: the NEAREST ancestor with an integrity decides, through bundled entries that have none', () => {
+    const entry = (version, integrity = null) => ({ version, integrity });
+    const graph = new Map([
+      ['node_modules/npm', entry('11.21.1', 'sha512-NPM')],
+      ['node_modules/npm/node_modules/a', entry('1.0.0')],
+      ['node_modules/npm/node_modules/a/node_modules/b', entry('2.0.0')],
+    ]);
+    const pkg = graph.get('node_modules/npm/node_modules/a/node_modules/b');
+    const base = (npm) => new Map([...graph, ['node_modules/npm', npm]]);
+    assert.equal(provenanceOf(pkg, 'node_modules/npm/node_modules/a/node_modules/b', base(entry('11.21.1', 'sha512-NPM')), graph), 'inherited');
+    assert.equal(provenanceOf(pkg, 'node_modules/npm/node_modules/a/node_modules/b', base(entry('12.2.1', 'sha512-NPM12')), graph), 'introduced');
+    assert.equal(parentLockPath('node_modules/@scope/pkg/node_modules/x'), 'node_modules/@scope/pkg');
+    assert.equal(parentLockPath('node_modules/top'), null);
+  });
+  it('REGRESSION: an entry with no integrity and no ancestor that has one, or with no audited graph to look in → introduced', () => {
+    const top = { version: '1.0.0', integrity: null };
+    assert.equal(provenanceOf(top, 'node_modules/top', new Map([['node_modules/top', top]]), new Map([['node_modules/top', top]])), 'introduced');
+    const nested = { version: '1.0.0', integrity: null };
+    const base = new Map([['node_modules/npm', { version: '1', integrity: 'sha512-X' }], ['node_modules/npm/node_modules/n', nested]]);
+    assert.equal(provenanceOf(nested, 'node_modules/npm/node_modules/n', base, undefined), 'introduced');
+  });
+  it('CONTROL: an entry WITH an integrity is decided on its own path, version and integrity, whatever its parent did', () => {
+    const own = { version: '3.1.0', integrity: 'sha512-CCCC' };
+    const graph = new Map([['node_modules/tool', { version: '1.0.0', integrity: 'sha512-NEW' }], ['node_modules/tool/node_modules/helper', own]]);
+    const base = new Map([['node_modules/tool', { version: '0.1.0', integrity: 'sha512-OLD' }], ['node_modules/tool/node_modules/helper', own]]);
+    assert.equal(provenanceOf(own, 'node_modules/tool/node_modules/helper', base, graph), 'inherited');
+  });
+
+  it('REGRESSION (the committed scanner lock): moving npm to another release that bundles the same undici makes undici introduced', () => {
+    const real = lockEntries(readFileSync(resolve(import.meta.dirname, '..', 'scanner', 'package-lock.json')));
+    const UNDICI = 'node_modules/npm/node_modules/undici';
+    const pkg = real.get(UNDICI);
+    assert.ok(pkg && pkg.integrity === null, 'undici is bundled, with no integrity of its own');
+    const otherNpm = new Map(real);
+    otherNpm.set('node_modules/npm', { version: '12.2.1', integrity: 'sha512-ANOTHER-RELEASE' });
+    // The change under audit is `real`; its base held another npm bundling the same undici.
+    assert.equal(provenanceOf(pkg, UNDICI, otherNpm, real), 'introduced');
+    assert.equal(provenanceOf(pkg, UNDICI, real, real), 'inherited', 'against an unchanged npm it is still inherited');
+  });
+
+  it('REGRESSION (audit, end to end): a high on a bundled entry whose npm moved in the change BLOCKS — it is not deferred', () => within({
+    scanner: BUNDLED_HIGH,
+    app: { status: 0, stdout: npmReport({}) },
+    base: { scanner: (lock) => { lock.packages['node_modules/npm'].integrity = 'sha512-BASENPM'; return lock; } },
+  }, ({ result }) => {
+    const f = result.findings.find((x) => x.package === 'bundled');
+    assert.equal(f.provenance, 'introduced');
+    assert.equal(result.outcome, 'blocking');
+  }));
+  it('CONTROL (audit, end to end): the same high with npm unchanged is inherited and deferred', () => within({
+    scanner: BUNDLED_HIGH,
+    app: { status: 0, stdout: npmReport({}) },
+  }, ({ result }) => {
+    assert.equal(result.findings.find((x) => x.package === 'bundled').provenance, 'inherited');
+    assert.equal(result.outcome, 'obligations_pending');
+  }));
 });
 
 describe('the base, read from git (audit.mjs)', () => {

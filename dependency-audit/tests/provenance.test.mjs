@@ -8,7 +8,7 @@
 
 import { strict as assert } from 'node:assert';
 import { createHash } from 'node:crypto';
-import { readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { describe, it } from 'node:test';
@@ -17,7 +17,7 @@ import {
   ADVISORIES_FILE, advisoryIds, applyDates, buildAdvisoryEvidence, fetchAdvisories, readAdvisoryEvidence, reportableDate, utcDateOf,
 } from '../lib/advisories.mjs';
 import { audit, reevaluate, renderSummary, requestedBase, resolveBase, snapshot } from '../lib/audit.mjs';
-import { annotateProvenance, inventory, lockEntries, readReport, scannerEnvironment, toolingScope } from '../lib/npm.mjs';
+import { annotateProvenance, inventory, lockEntries, parentLockPath, provenanceOf, readReport, scannerEnvironment, toolingScope } from '../lib/npm.mjs';
 import {
   advisoryBody, cannedAdvisories, cannedRunner, CLEAN_SCANNER, commitBase, fakeInstall, git, makeProject, NOW, npmReport, via,
 } from './project.mjs';
@@ -99,6 +99,102 @@ describe('provenance: inherited only when the base holds the same path, version 
       assert.equal(annotateProvenance(direct, { graph: 'application', inv, base: undefined }), direct, 'no base: returned unchanged');
     } finally { p.cleanup(); }
   });
+});
+
+describe('provenance of a BUNDLED entry: its bundling package must be inherited too (npm.mjs)', () => {
+  const BUNDLED = 'node_modules/npm/node_modules/bundled';
+  const BUNDLED_HIGH = answer('bundled', 'high', BUNDLED, GHSA, 2);
+  const scannerLock = () => { const p = makeProject({}); try { return read(join(p.root, 'dependency-audit', 'scanner', 'package-lock.json')); } finally { p.cleanup(); } };
+  const scannerBase = (mutate) => { const lock = scannerLock(); mutate(lock.packages); return lockEntries(JSON.stringify(lock)); };
+  const readScanner = (base) => {
+    const p = makeProject({});
+    try {
+      const inv = inventory(join(p.root, 'dependency-audit', 'scanner'), { graph: 'scanner', scopeOf: toolingScope });
+      const direct = readReport({ graph: 'scanner', run: BUNDLED_HIGH, inv, base }).findings;
+      const annotated = annotateProvenance(readReport({ graph: 'scanner', run: BUNDLED_HIGH, inv }).findings, { graph: 'scanner', inv, base });
+      assert.equal(JSON.stringify(annotated), JSON.stringify(direct), 'the retained path and the direct path agree');
+      return direct[0];
+    } finally { p.cleanup(); }
+  };
+
+  it('PREMISE: the bundled entry carries no integrity, and npm (its bundling package) does', () => {
+    const lock = scannerLock();
+    assert.equal(lock.packages[BUNDLED].integrity, undefined);
+    assert.equal(lock.packages[BUNDLED].inBundle, true);
+    assert.ok(lock.packages['node_modules/npm'].integrity);
+  });
+  it('CONTROL: the same npm (version and integrity) in the base → the bundled entry is inherited', () => {
+    assert.equal(readScanner(scannerBase(() => {})).provenance, 'inherited');
+  });
+  it('REGRESSION: npm at ANOTHER RELEASE bundling the same entry at the same path and version → introduced', () => {
+    assert.equal(readScanner(scannerBase((pk) => { pk['node_modules/npm'].version = '11.0.0'; pk['node_modules/npm'].integrity = 'sha512-OLDNPM'; })).provenance, 'introduced');
+  });
+  it('REGRESSION: the same npm version with ANOTHER integrity → introduced', () => {
+    assert.equal(readScanner(scannerBase((pk) => { pk['node_modules/npm'].integrity = 'sha512-OTHER'; })).provenance, 'introduced');
+  });
+  it('REGRESSION: a base that holds the bundled entry but not its bundling package → introduced', () => {
+    assert.equal(readScanner(scannerBase((pk) => { delete pk['node_modules/npm']; })).provenance, 'introduced');
+  });
+  it('CONTROL: the bundled entry\'s own path and version still decide first — another bundled version → introduced', () => {
+    assert.equal(readScanner(scannerBase((pk) => { pk[BUNDLED].version = '0.9.0'; })).provenance, 'introduced');
+  });
+
+  it('CONTRACT: the NEAREST ancestor with an integrity decides, through bundled entries that have none', () => {
+    const entry = (version, integrity = null) => ({ version, integrity });
+    const graph = new Map([
+      ['node_modules/npm', entry('11.21.1', 'sha512-NPM')],
+      ['node_modules/npm/node_modules/a', entry('1.0.0')],
+      ['node_modules/npm/node_modules/a/node_modules/b', entry('2.0.0')],
+    ]);
+    const pkg = graph.get('node_modules/npm/node_modules/a/node_modules/b');
+    const base = (npm) => new Map([...graph, ['node_modules/npm', npm]]);
+    assert.equal(provenanceOf(pkg, 'node_modules/npm/node_modules/a/node_modules/b', base(entry('11.21.1', 'sha512-NPM')), graph), 'inherited');
+    assert.equal(provenanceOf(pkg, 'node_modules/npm/node_modules/a/node_modules/b', base(entry('12.2.1', 'sha512-NPM12')), graph), 'introduced');
+    assert.equal(parentLockPath('node_modules/@scope/pkg/node_modules/x'), 'node_modules/@scope/pkg');
+    assert.equal(parentLockPath('node_modules/top'), null);
+  });
+  it('REGRESSION: an entry with no integrity and no ancestor that has one, or with no audited graph to look in → introduced', () => {
+    const top = { version: '1.0.0', integrity: null };
+    assert.equal(provenanceOf(top, 'node_modules/top', new Map([['node_modules/top', top]]), new Map([['node_modules/top', top]])), 'introduced');
+    const nested = { version: '1.0.0', integrity: null };
+    const base = new Map([['node_modules/npm', { version: '1', integrity: 'sha512-X' }], ['node_modules/npm/node_modules/n', nested]]);
+    assert.equal(provenanceOf(nested, 'node_modules/npm/node_modules/n', base, undefined), 'introduced');
+  });
+  it('CONTROL: an entry WITH an integrity is decided on its own path, version and integrity, whatever its parent did', () => {
+    const own = { version: '3.1.0', integrity: 'sha512-CCCC' };
+    const graph = new Map([['node_modules/tool', { version: '1.0.0', integrity: 'sha512-NEW' }], ['node_modules/tool/node_modules/helper', own]]);
+    const base = new Map([['node_modules/tool', { version: '0.1.0', integrity: 'sha512-OLD' }], ['node_modules/tool/node_modules/helper', own]]);
+    assert.equal(provenanceOf(own, 'node_modules/tool/node_modules/helper', base, graph), 'inherited');
+  });
+
+  it('REGRESSION (the committed scanner lock): moving npm to another release that bundles the same undici makes undici introduced', () => {
+    const real = lockEntries(readFileSync(resolve(import.meta.dirname, '..', 'scanner', 'package-lock.json')));
+    const UNDICI = 'node_modules/npm/node_modules/undici';
+    const pkg = real.get(UNDICI);
+    assert.ok(pkg && pkg.integrity === null, 'undici is bundled, with no integrity of its own');
+    const otherNpm = new Map(real);
+    otherNpm.set('node_modules/npm', { version: '12.2.1', integrity: 'sha512-ANOTHER-RELEASE' });
+    // The change under audit is `real`; its base held another npm bundling the same undici.
+    assert.equal(provenanceOf(pkg, UNDICI, otherNpm, real), 'introduced');
+    assert.equal(provenanceOf(pkg, UNDICI, real, real), 'inherited', 'against an unchanged npm it is still inherited');
+  });
+
+  it('REGRESSION (audit, end to end): a high on a bundled entry whose npm moved in the change BLOCKS — it is not deferred', () => within({
+    scanner: BUNDLED_HIGH,
+    app: { status: 0, stdout: npmReport({}) },
+    base: { scanner: (lock) => { lock.packages['node_modules/npm'].integrity = 'sha512-BASENPM'; return lock; } },
+  }, ({ result }) => {
+    const f = result.findings.find((x) => x.package === 'bundled');
+    assert.equal(f.provenance, 'introduced');
+    assert.equal(result.outcome, 'blocking');
+  }));
+  it('CONTROL (audit, end to end): the same high with npm unchanged is inherited and deferred', () => within({
+    scanner: BUNDLED_HIGH,
+    app: { status: 0, stdout: npmReport({}) },
+  }, ({ result }) => {
+    assert.equal(result.findings.find((x) => x.package === 'bundled').provenance, 'inherited');
+    assert.equal(result.outcome, 'obligations_pending');
+  }));
 });
 
 describe('the base, read from git (audit.mjs)', () => {
@@ -203,9 +299,13 @@ describe('the clock: dates from GitHub, retained, never supplied (advisories.mjs
   });
 
   it('REGRESSION: an inherited CRITICAL blocks at once; an inherited RUNTIME high blocks at once', () => {
-    within({ app: TOOL_CRITICAL }, ({ result }) => {
+    within({ app: TOOL_CRITICAL }, ({ p, result }) => {
       assert.equal(toolFinding(result).provenance, 'inherited');
-      assert.equal(toolFinding(result).reportableSince, '2026-09-21');
+      // ORACLE CORRECTED (A-2 follow-up): this used to assert the critical was DATED
+      // ('2026-09-21'). A date can defer only an inherited HIGH tooling finding, so GitHub
+      // is no longer asked about a critical at all — and with no question, no date.
+      assert.equal('reportableSince' in toolFinding(result), false);
+      assert.equal(existsSync(join(p.evidence, ADVISORIES_FILE)), false, 'nothing that could not defer was asked about, so there is no record of asking');
       assert.equal(result.outcome, 'blocking');
       assert.match(renderSummary(result), /→ blocking\n/, 'a critical is not given a not-deferred reason: there was never a window');
     });
@@ -252,18 +352,28 @@ describe('the clock: dates from GitHub, retained, never supplied (advisories.mjs
     assert.equal(reportableDate(advisoryBody(GHSA), GHSA.toUpperCase()), null, 'the record must be about the advisory asked');
   });
 
-  it('CONTRACT: only findings with provenance are asked about or dated — sorted, distinct, GHSA only', () => {
+  // ORACLE CORRECTED (A-2 follow-up): this asked about every GHSA id on a finding with
+  // provenance. Only an INHERITED HIGH TOOLING finding can be deferred, so only its date
+  // can change a decision, and only it is asked about now. DATING is unchanged: a date the
+  // record holds is still applied to any finding with provenance, which is what keeps a
+  // result retained before this change re-deciding byte-identically.
+  it('CONTRACT: only an INHERITED HIGH TOOLING finding is asked about — sorted, distinct, GHSA only; any finding with provenance is dated', () => {
+    const high = { scope: 'tooling', severity: 'high' };
     const findings = [
-      { advisory: 'GHSA-bbbb-bbbb-bbbb', provenance: 'inherited' },
-      { advisory: 'GHSA-aaaa-aaaa-aaaa', provenance: 'introduced' },
-      { advisory: 'GHSA-aaaa-aaaa-aaaa', provenance: 'inherited' },
-      { advisory: 'GHSA-cccc-cccc-cccc' },
-      { advisory: 'npm:1100', provenance: 'inherited' },
+      { ...high, advisory: 'GHSA-bbbb-bbbb-bbbb', provenance: 'inherited' },
+      { ...high, advisory: 'GHSA-aaaa-aaaa-aaaa', provenance: 'introduced' },
+      { ...high, advisory: 'GHSA-aaaa-aaaa-aaaa', provenance: 'inherited' },
+      { ...high, advisory: 'GHSA-cccc-cccc-cccc' },
+      { ...high, advisory: 'npm:1100', provenance: 'inherited' },
+      { scope: 'tooling', severity: 'critical', advisory: 'GHSA-dddd-dddd-dddd', provenance: 'inherited' },
+      { scope: 'runtime', severity: 'high', advisory: 'GHSA-eeee-eeee-eeee', provenance: 'inherited' },
+      { scope: 'tooling', severity: 'moderate', advisory: 'GHSA-ffff-ffff-ffff', provenance: 'inherited' },
     ];
     assert.deepEqual(advisoryIds(findings), ['GHSA-aaaa-aaaa-aaaa', 'GHSA-bbbb-bbbb-bbbb']);
-    const dated = applyDates(findings, new Map([['GHSA-cccc-cccc-cccc', '2026-09-01'], ['GHSA-bbbb-bbbb-bbbb', '2026-09-02']]));
+    const dated = applyDates(findings, new Map([['GHSA-cccc-cccc-cccc', '2026-09-01'], ['GHSA-bbbb-bbbb-bbbb', '2026-09-02'], ['GHSA-dddd-dddd-dddd', '2026-09-03']]));
     assert.equal(dated[0].reportableSince, '2026-09-02');
     assert.equal('reportableSince' in dated[3], false, 'no provenance, no date — whatever the record says');
+    assert.equal(dated[5].reportableSince, '2026-09-03', 'a retained date is still applied to a critical: re-decisions stay identical');
   });
 
   it('CONTRACT: the job token reaches the clock\'s child and never the scanner', () => {

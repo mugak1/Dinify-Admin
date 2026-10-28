@@ -9,6 +9,16 @@ on:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    # THE JOB TOKEN READS THE REPOSITORY AND NOTHING ELSE (A-2 follow-up). Without this the
+    # job took the repository's default grant. What the steps use it for, step by step:
+    # checkout and the audit's `git fetch --unshallow` read this repository (contents:
+    # read); the audit's GET /advisories/{id} is a public read that needs no permission;
+    # release certification reads only the runner's GITHUB_* variables and calls no API;
+    # setup-node's npm cache and both uploads authenticate with the runner's own runtime
+    # token, which no `permissions` key governs. Nothing here writes to the repository, its
+    # pull requests or its checks, and no OIDC token can be requested.
+    permissions:
+      contents: read
 
     steps:
       # Pinned to the same reviewed commits deploy.yml uses: since D08 B2.4 this job is

@@ -287,13 +287,28 @@ export function scannerArgs(registry) {
  * already there? Answered against a BASE — the lock graph of the commit the change was
  * made on — and against nothing else:
  *   - `inherited`  the base lockfile holds the SAME PATH with the same version and the same
- *                  integrity as the graph being audited;
+ *                  integrity as the graph being audited — and, for an entry that carries
+ *                  NO integrity, the package that BUNDLES it is inherited too (below);
  *   - `introduced` anything else: a new path, a moved one, another version, another
- *                  integrity, or a base that has no lockfile for this graph at all.
+ *                  integrity, another bundling package, or a base that has no lockfile for
+ *                  this graph at all.
  * With NO base the field is ABSENT. It is never guessed: an absent provenance is not
  * "inherited", and the evaluator (core.mjs) blocks a finding it cannot establish.
  *
- * A base is a Map of lock path → {version, integrity}, from `lockEntries()`.
+ * A BUNDLED ENTRY HAS NO INTEGRITY OF ITS OWN. npm's lock records a package shipped inside
+ * another package's tarball (`inBundle`) with a path and a version only — measured, 143 of
+ * the 144 entries in the scanner lock, everything under `node_modules/npm`. Compared on path
+ * and version alone, `null === null` would call it inherited whatever tarball it came out
+ * of: a change that moves npm from one release to another bundling the SAME undici would
+ * see undici's advisories as inherited although that change chose the tarball. So an entry
+ * with no integrity is inherited only when its NEAREST ANCESTOR THAT HAS ONE — the package
+ * whose tarball supplied its bytes — has the same version and integrity in the base too.
+ * An entry with no integrity and no such ancestor in the audited graph (none exist in
+ * either application lock today) has nothing that identifies its bytes, and is introduced.
+ *
+ * A base is a Map of lock path → {version, integrity}, from `lockEntries()`. So is the
+ * audited graph `provenanceOf` walks for ancestors (anything with a `get(lockPath)` that
+ * answers {version, integrity}); absent, an entry with no integrity is introduced.
  */
 export function lockEntries(lockBytes) {
   let lock;
@@ -308,10 +323,27 @@ export function lockEntries(lockBytes) {
   return entries;
 }
 
-/** The provenance of the package at `lockPath`, as the inventory records it, against `base`. */
-export function provenanceOf(pkg, lockPath, base) {
-  const held = base.get(lockPath);
-  return held && held.version === (pkg.version ?? null) && held.integrity === (pkg.integrity ?? null) ? 'inherited' : 'introduced';
+/** The lock path of the package whose node_modules holds `lockPath`, or null at the top. */
+export function parentLockPath(lockPath) {
+  const at = lockPath.lastIndexOf('/node_modules/');
+  return at === -1 ? null : lockPath.slice(0, at);
+}
+
+/**
+ * The provenance of the package at `lockPath`, as the inventory records it, against `base`.
+ * `current` is the audited graph by lock path, read only for an entry with no integrity.
+ */
+export function provenanceOf(pkg, lockPath, base, current) {
+  const same = (held, entry) => Boolean(held) && held.version === (entry.version ?? null) && held.integrity === (entry.integrity ?? null);
+  if (!same(base.get(lockPath), pkg)) return 'introduced';
+  if ((pkg.integrity ?? null) !== null) return 'inherited';
+  for (let at = parentLockPath(lockPath); at !== null; at = parentLockPath(at)) {
+    const ancestor = current?.get(at);
+    if (!ancestor) return 'introduced';
+    if ((ancestor.integrity ?? null) === null) continue;
+    return same(base.get(at), ancestor) ? 'inherited' : 'introduced';
+  }
+  return 'introduced';
 }
 
 /**
@@ -322,9 +354,10 @@ export function provenanceOf(pkg, lockPath, base) {
 export function annotateProvenance(findings, { graph, inv, base }) {
   if (!(base instanceof Map)) return findings;
   const byPath = new Map(inv.packages.map((p) => [p.path, p]));
+  const byLockPath = new Map(inv.packages.filter((p) => p.path.startsWith(`${graph}:`)).map((p) => [p.path.slice(graph.length + 1), p]));
   return findings.map((f) => {
     const pkg = typeof f.path === 'string' && f.path.startsWith(`${graph}:`) ? byPath.get(f.path) : undefined;
-    return pkg ? { ...f, provenance: provenanceOf(pkg, f.path.slice(graph.length + 1), base) } : f;
+    return pkg ? { ...f, provenance: provenanceOf(pkg, f.path.slice(graph.length + 1), base, byLockPath) } : f;
   });
 }
 
@@ -512,7 +545,7 @@ export function readReport({ graph, run, inv, base }) {
           severity,
           title: typeof via.title === 'string' ? via.title : '',
           url: typeof via.url === 'string' ? via.url : '',
-          ...(base instanceof Map ? { provenance: provenanceOf(pkg, node, base) } : {}),
+          ...(base instanceof Map ? { provenance: provenanceOf(pkg, node, base, byPath) } : {}),
         });
         if (pkg.scope === 'runtime') item.own.runtime = true;
       }

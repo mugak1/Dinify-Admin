@@ -7,7 +7,7 @@
  * nothing else: the UTC calendar date of the advisory's `github_reviewed_at`, else of its
  * `published_at`, as `GET https://api.github.com/advisories/{ghsa_id}` states them.
  *
- * THREE RULES, each the conservative direction:
+ * FIVE RULES, each the conservative direction:
  *   - NO ANSWER, NO DATE. A request that fails, times out, is refused, is rate-limited,
  *     answers anything but 200, or answers a body that is not this advisory's record
  *     leaves the finding with no date — so it blocks, exactly as it did before A-2. An
@@ -23,12 +23,24 @@
  *     (a graph with no base, or the publisher toolchain at promotion) is never given a
  *     date, and its advisory is not even asked about. A run with no base therefore makes
  *     no request and writes exactly what it wrote before A-2.
+ *   - ONLY WHAT A DATE CAN DEFER IS ASKED ABOUT. A date changes the decision for exactly
+ *     one kind of finding: an INHERITED HIGH TOOLING one (core.mjs's deferral rule); for
+ *     every other finding it decides nothing. So only those advisories are asked about
+ *     (`awaitsDate`). A finding not asked about simply carries no date, as before.
+ *   - A DATE ALREADY RETAINED IS REUSED, NOT ASKED AGAIN. A GitHub review or publication
+ *     date does not change, and a candidate's certification retained the answers it was
+ *     given, digest-bound in its evidence. A promotion takes each date from that record
+ *     first (`answersFrom`) and asks only for the advisories it lacks; every answer in the
+ *     record it writes says where it came from (`source`).
  *
  * The request is made by a CHILD PROCESS running this file, so the rest of the audit stays
  * synchronous; the token, when there is one, reaches only that child. `GH_TOKEN` is the
  * job's read-only token where a workflow supplies one. The endpoint is public, so a run
  * without one asks unauthenticated, at GitHub's lower rate limit — and a refusal there is
- * an ordinary "no date".
+ * an ordinary "no date". A token never shares a process with the scanner or with any
+ * candidate code: where a step runs the scanner it holds no token (the scanner's own
+ * environment is scrubbed of one too, npm.mjs `scannerEnvironment`), and a promotion that
+ * asks with a token does so from a SEPARATE step that runs only this repository's code.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -89,15 +101,24 @@ export function reportableDate(body, id) {
 }
 
 /**
- * The advisories to ask about: the GHSA identifiers of findings whose provenance was
- * established. Sorted and distinct, so the question — and the file that records its
+ * Could a date defer this finding? Every precondition of core.mjs's `deferralDeadline`
+ * except the date itself: tooling scope, high severity, inherited provenance — and a GHSA
+ * advisory, the only kind GitHub can be asked about. For any other finding a date decides
+ * nothing (it blocks, or is triaged, whatever the date), so it is not asked about.
+ */
+export function awaitsDate(finding) {
+  return isMapping(finding) && finding.scope === 'tooling' && finding.severity === 'high' && finding.provenance === 'inherited'
+    && typeof finding.advisory === 'string' && GHSA_RE.test(finding.advisory);
+}
+
+/**
+ * The advisories to ask about: the GHSA identifiers of the findings a date could defer
+ * (`awaitsDate`). Sorted and distinct, so the question — and the file that records its
  * answer — does not depend on the order the scanner listed them in.
  */
 export function advisoryIds(findings) {
   const ids = new Set();
-  for (const f of Array.isArray(findings) ? findings : []) {
-    if (isMapping(f) && typeof f.provenance === 'string' && typeof f.advisory === 'string' && GHSA_RE.test(f.advisory)) ids.add(f.advisory);
-  }
+  for (const f of Array.isArray(findings) ? findings : []) if (awaitsDate(f)) ids.add(f.advisory);
   return [...ids].sort();
 }
 
@@ -146,7 +167,9 @@ export function fetchAdvisories(ids, { token = process.env.GH_TOKEN ?? '' } = {}
 
 /**
  * The retained record of what was asked and what came back. Returns its bytes and digest;
- * the digest is what the collection records and what every reader checks first.
+ * the digest is what the collection records and what every reader checks first. An answer
+ * that says where it came from (`source`: `certification` or `fetched`) keeps that in the
+ * record; one that does not is written exactly as before.
  */
 export function buildAdvisoryEvidence({ answers, authenticated }) {
   const doc = {
@@ -160,6 +183,7 @@ export function buildAdvisoryEvidence({ answers, authenticated }) {
       error: a.error,
       bodySha256: a.body === null ? null : sha256(a.body),
       body: a.body,
+      ...(typeof a.source === 'string' ? { source: a.source } : {}),
     })),
   };
   const bytes = Buffer.from(`${JSON.stringify(doc, null, 2)}\n`);
@@ -194,6 +218,59 @@ export function readAdvisoryEvidence(bytes, recorded) {
     dates.set(a.id, a.status === 200 ? reportableDate(a.body, a.id) : null);
   }
   return { problems, dates };
+}
+
+/**
+ * The answers a RETAINED record already holds for `ids`, read through `readAdvisoryEvidence`
+ * against the digest recorded for it — so a record that is not the one that was written
+ * contributes nothing and is reported. With `requireDate`, only an answer that yields a
+ * date is taken (an earlier refusal or timeout is asked again rather than reused); without
+ * it, any recorded answer is (a fresh refusal is still the answer that was given).
+ *
+ * @param {Buffer|string|undefined} bytes  the retained record, or nothing if none was
+ * @param {string} recorded                the sha256 recorded for it
+ * @param {string[]} ids                   the advisories wanted
+ * @param {object} options
+ * @param {string} options.source          stamped on every answer taken (`certification`, `fetched`)
+ * @param {boolean} [options.requireDate]
+ * @returns {{answers: object[], missing: string[], problems: object[], authenticated: boolean}}
+ */
+export function answersFrom(bytes, recorded, ids, { source, requireDate = false }) {
+  const want = [...new Set(ids)].sort();
+  if (bytes === undefined || bytes === null) return { answers: [], missing: want, problems: [], authenticated: false };
+  const read = readAdvisoryEvidence(bytes, recorded);
+  if (read.problems.length) return { answers: [], missing: want, problems: read.problems, authenticated: false };
+  const doc = JSON.parse(Buffer.isBuffer(bytes) ? bytes.toString('utf8') : String(bytes));
+  const byId = new Map(doc.advisories.map((a) => [a.id, a]));
+  const answers = [];
+  const missing = [];
+  for (const id of want) {
+    const a = byId.get(id);
+    if (a && (!requireDate || typeof read.dates.get(id) === 'string')) {
+      answers.push({ id, status: a.status, retrievedAt: a.retrievedAt, error: a.error, body: a.body, source });
+    } else {
+      missing.push(id);
+    }
+  }
+  return { answers, missing, problems: [], authenticated: doc.authenticated };
+}
+
+/**
+ * One record from the answers a promotion assembled for `ids`: those REUSED from the
+ * certification, those FETCHED by the separate token-holding step, and — for an advisory
+ * neither supplied — an explicit `no_answer` entry, so the record names every advisory it
+ * was meant to date. `authenticated` is true only when every answer in it came from a
+ * request that carried a token.
+ */
+export function assembleAdvisoryEvidence(ids, { reused, fetched }) {
+  const byId = new Map();
+  for (const a of [...fetched.answers, ...reused.answers]) byId.set(a.id, a);
+  const answers = [...new Set(ids)].sort().map((id) => byId.get(id) ?? { id, status: 0, retrievedAt: null, error: 'no_answer', body: null, source: 'none' });
+  const authenticated = answers.length > 0
+    && (reused.answers.length === 0 || reused.authenticated === true)
+    && (fetched.answers.length === 0 || fetched.authenticated === true)
+    && answers.every((a) => a.source !== 'none');
+  return buildAdvisoryEvidence({ answers, authenticated });
 }
 
 /**

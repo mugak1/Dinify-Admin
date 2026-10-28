@@ -232,7 +232,9 @@ from the day its advisory became reportable; A-2 supplies those two facts
 
 - **`validate` audits against its base.** The audit step passes `--base` =
   `github.event.pull_request.base.sha || github.event.before` and the job token as
-  `GH_TOKEN`; `ci.yml`'s permissions are unchanged and the advisory endpoint is public.
+  `GH_TOKEN`; the advisory endpoint is public, and since the A-2 follow-up the `validate`
+  job grants that token `contents: read` and nothing else (it used to take the
+  repository's default grant).
   The checkout is depth 1, so the step first runs
   `git fetch --no-tags --quiet --unshallow origin "$GITHUB_SHA"`; a failed fetch fails
   the step under the runner's `bash -e`, never a silent audit without a base.
@@ -245,10 +247,14 @@ from the day its advisory became reportable; A-2 supplies those two facts
 - **The fresh assessment** (`prepare`) gives the application graph provenance against the
   candidate's retained lock and the scanner graph against the candidate's retained
   scanner lock, so a trusted scanner that moved since certification makes what changed
-  `introduced`, which blocks. It asks GitHub WITHOUT a token (`evaluate` has none), so an
-  unanswered or rate-limited request leaves no date and the inherited high blocks. The
-  answers are retained beside the assessment, and the assessment and the admission
-  record name every obligation (`advisory`, `path`, `deadline`).
+  `introduced`, which blocks. Only an inherited high tooling finding is dated (nothing
+  else can be deferred), and its date is REUSED from the certification's retained
+  `advisories.json` where that record holds one (A-2 follow-up, below). Only an advisory
+  it does not date is asked of GitHub, WITHOUT a token (`evaluate` has none), so an
+  unanswered or rate-limited request leaves no date and the inherited high blocks. Every
+  answer used is retained beside the assessment in ONE `advisories.json`, and the
+  assessment and the admission record name every obligation (`advisory`, `path`,
+  `deadline`).
 - **The privileged re-decision never asks.** `verifyAssessment` re-reads the retained
   `advisories.json` and re-derives the result offline: a tampered record is
   `assessment_advisories_invalid`, and an obligation list or deadline the record does not
@@ -264,6 +270,42 @@ Pinned by `release/tests/obligations.test.mjs` and
 `release/tests/certification-obligations.test.mjs`, and by two executed verify-step
 scenarios in `release/tests/workflow.test.mjs` (an obligation admitted; a tampered
 `advisories.json` refused).
+
+### CI-signal A-2 follow-up: the certification's dates are reused
+
+The review of A-2 found that the fresh assessment asked GitHub, unauthenticated, about every
+finding with a provenance, so a rate limit (60 requests an hour per runner address) could
+leave an inherited high undated and refuse a promotion whose date the certification had
+already retained, bound by sha256 in its record.
+
+**What changed.** `deploy.yml`'s evaluate step names the downloaded candidate in
+`CERTIFIED_CANDIDATE_DIR` (the same directory as `--candidate`; no token, no other change to
+the step). `assess()` reads the certification's `evidence/audit/advisories.json` from it
+BEFORE the scanner runs, and uses it only when its bytes are exactly the ones the inspected
+certification record lists (sha256 and length); a listed record that cannot be read, or is
+not those bytes, makes the assessment `incomplete` (`certified_advisories_unreadable`,
+`certified_advisories_altered`). Each date that record holds is reused
+(`source: "certification"`); only an inherited high tooling finding it does not date is asked
+of GitHub (`source: "fetched"`); an advisory with no answer is recorded `no_answer`
+(`source: "none"`) and blocks. The assessment's `advisories` entry adds `reused` and
+`fetched` beside the unchanged `file`, `sha256`, `requested` and `authenticated`.
+`verifyAssessment` is unchanged and re-reads the one retained record offline. A caller that
+names no candidate directory reuses nothing and asks as before.
+
+**Why Admin's remaining question carries no token** (Frontend's does). `release/cli.mjs
+evaluate` scans and decides in ONE process and deletes `GH_TOKEN` and `GITHUB_TOKEN` from its
+own environment before the scanner — third-party code — runs; a new advisory's id is known
+only after that scan. A step holding the token can therefore sit between the scan and the
+decision only if `evaluate` is split in two, as Frontend's `assess` was, and `release/cli.mjs`
+was outside this change. Until then the unauthenticated question is the fallback, and an
+unanswered one blocks. Splitting `evaluate` is the recommended follow-up.
+
+**Measured** (`release/tests/obligations.test.mjs`, a certification that dated the advisory,
+GitHub answering 403 at promotion): before, on unmodified `4abdb19`, one request and
+`blocking`; after, zero requests and `obligations_pending`. **No token reaches the scanner**,
+asserted at the call that starts it with `GH_TOKEN` and `GITHUB_TOKEN` set in the process's
+own environment, and `release/tests/workflow.test.mjs` pins the evaluate step's environment
+to `TARGET_SHA`, `MODE`, `SOURCE` and `CERTIFIED_CANDIDATE_DIR`.
 
 ### Scanner diagnostics: the last observed npm events
 

@@ -136,6 +136,37 @@ describe('the cross-ecosystem conformance vectors', () => {
     const always = (outcome) => ({ cases: VECTORS.cases.map((c) => ({ ...c, expect: { ...c.expect, outcome } })) });
     for (const outcome of OUTCOMES) assert.ok(runConformance(always(outcome)).length > 0, outcome);
   });
+
+  // The RUNTIME self-test (run before every real audit) must refuse what the unit suite above
+  // refuses, because a build can reach the gate without its unit suite having run. Two mutants
+  // of the dated obligation that the outcome/exit/records/counts comparison alone let through:
+  const emitsDeferredZero = (input) => {
+    const r = evaluate(input);
+    return Object.hasOwn(r.counts, 'deferred') ? r : { ...r, counts: { ...r.counts, deferred: 0 } };
+  };
+  const deadlineOneDayLate = (input) => {
+    const r = evaluate(input);
+    const later = (d) => new Date(Date.parse(`${d}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10);
+    return { ...r, findings: r.findings.map((f) => (f.class === 'deferred' ? { ...f, deadline: later(f.deadline) } : f)) };
+  };
+
+  it('REGRESSION: the runtime self-test refuses an evaluator that emits `deferred: 0` when nothing was deferred', () => {
+    const failures = runConformance(VECTORS, emitsDeferredZero);
+    assert.ok(failures.length >= 41, `every vector that defers nothing must catch it, got ${failures.length}`);
+    assert.ok(failures.every((f) => /counts\.deferred is present \(0\)/.test(f)), failures.slice(0, 3).join('\n'));
+  });
+
+  it('REGRESSION: the runtime self-test refuses an evaluator whose deferral deadline is one day late', () => {
+    const deferring = VECTORS.cases.filter((c) => (c.expect.deadlines ?? []).length > 0).length;
+    assert.ok(deferring > 0, 'the vectors carry deferrals to check');
+    const failures = runConformance(VECTORS, deadlineOneDayLate);
+    assert.equal(failures.length, deferring, failures.join('\n'));
+    assert.ok(failures.every((f) => /deadlines \[/.test(f)));
+  });
+
+  it('CONTROL: the same comparison with the real evaluator, passed explicitly, finds nothing', () => {
+    assert.deepEqual(runConformance(VECTORS, evaluate), []);
+  });
 });
 
 describe('the rules, directly', () => {

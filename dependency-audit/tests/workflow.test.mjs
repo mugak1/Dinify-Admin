@@ -103,9 +103,12 @@ describe('CI-signal A-2: the scan is given its base and the job token, and nothi
     assert.doesNotMatch(scanStep.run, /\$\{\{/);
   });
 
-  it('CONTRACT: the token grants nothing new — ci.yml still declares no permissions, so the job keeps the repository default', () => {
-    assert.equal(CI.permissions, undefined);
-    assert.equal(CI.jobs.validate.permissions, undefined);
+  // ORACLE CORRECTED (A-2 follow-up, item 4): this pinned that ci.yml declared NO
+  // permissions, so `validate` kept the repository's default grant. It now holds a
+  // read-only grant at the JOB, and nothing more.
+  it('CONTRACT (A-2 and its follow-up): the token grants nothing new — validate reads the repository and nothing else', () => {
+    assert.equal(CI.permissions, undefined, 'the grant is the job\'s, not the workflow\'s');
+    assert.deepEqual(CI.jobs.validate.permissions, { contents: 'read' });
     assert.doesNotMatch(readFileSync(WF('ci.yml'), 'utf8'), /secrets\./);
     // The scheduled re-scan has no base and so defers nothing: unchanged.
     assert.equal(AUDIT.jobs.audit.steps.find((s) => commandOf(s) === SCAN).env, undefined);

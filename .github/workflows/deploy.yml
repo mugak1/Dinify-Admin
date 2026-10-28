@@ -777,6 +777,10 @@ jobs:
       # policy), and writes the admission. Exit 0 admitted (or a labelled legacy
       # rollback), 1 refused. No token is in this step's environment, and the verifier
       # withholds the step-output and environment files from the scanner it runs.
+      # CERTIFIED_CANDIDATE_DIR names the candidate just downloaded (the same directory as
+      # --candidate) so the assessment REUSES the advisory dates its certification
+      # retained, digest-bound in its record; only an advisory that record does not date
+      # is asked of GitHub, unauthenticated, and an unanswered one still blocks.
       # ------------------------------------------------------------------------------
       - name: Inspect, assess and decide
         id: evaluate
@@ -785,6 +789,7 @@ jobs:
           TARGET_SHA: ${{ steps.resolve.outputs.sha }}
           MODE: ${{ steps.resolve.outputs.mode }}
           SOURCE: ${{ steps.resolve.outputs.source }}
+          CERTIFIED_CANDIDATE_DIR: candidate
         run: |
           set -euo pipefail
           node trusted/release/cli.mjs evaluate \

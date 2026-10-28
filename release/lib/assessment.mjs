@@ -38,12 +38,26 @@
  * PROVENANCE AND THE CLOCK (CI-signal A-2). Both graphs are given provenance against the
  * CANDIDATE'S OWN retained locks — the application against its retained package-lock.json,
  * the scanner against its retained scanner lock — because nothing can be introduced into
- * fixed bytes. When each advisory became reportable is asked of GitHub once, here, after
- * the scans (dependency-audit/lib/advisories.mjs; this step holds no token, so it asks
- * unauthenticated, and no answer is no date), and the record is written beside the raw
- * output as `advisories.json`. An inherited high tooling finding inside its window is then
- * a DATED OBLIGATION; its deadline is part of `assessmentDeadline`, so a promotion cannot
- * outrun it. `verifyAssessment` re-reads the record and never fetches.
+ * fixed bytes. Only an INHERITED HIGH TOOLING finding needs a date (nothing else can be
+ * deferred). Its date is REUSED from the certification's own retained record
+ * (evidence/audit/advisories.json, bound by sha256 in the certification record) wherever that
+ * record holds one; only an advisory it does not date is asked of GitHub, here, after the
+ * scans (dependency-audit/lib/advisories.mjs). This step holds NO token and must not: the
+ * scan and the decision run in one process (release/cli.mjs `evaluate`), and a new
+ * advisory's id is known only after the scan, so a step holding the token cannot sit
+ * between them. That question is therefore unauthenticated, and no answer is no date: the
+ * finding blocks. Every answer used — reused (`source: certification`), fetched
+ * (`source: fetched`) or neither (`no_answer`, `source: none`) — is written beside the raw
+ * output as ONE `advisories.json`. An inherited high tooling finding inside its window is
+ * then a DATED OBLIGATION; its deadline is part of `assessmentDeadline`, so a promotion
+ * cannot outrun it. `verifyAssessment` re-reads the record and never fetches.
+ *
+ * WHERE THE CERTIFIED RECORD COMES FROM. `inspectCandidate` validated it but does not hand
+ * its bytes on, and the CLI that calls `assess` passes no candidate directory, so the deploy
+ * workflow names that directory in CERTIFIED_CANDIDATE_DIR. The bytes are read BEFORE the
+ * scanner runs and used only when they are exactly the bytes the certification record lists
+ * (sha256 and length); anything else is incomplete. With no directory named (any caller
+ * outside the workflow) nothing is reused, and every date is asked for as before.
  */
 
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -52,7 +66,7 @@ import { join } from 'node:path';
 
 import { defaultInstallScanner, loadPolicy, POLICY_SCHEMA } from '../../dependency-audit/lib/audit.mjs';
 import {
-  ADVISORIES_FILE, advisoryIds, applyDates, buildAdvisoryEvidence, fetchAdvisories, readAdvisoryEvidence,
+  ADVISORIES_FILE, advisoryIds, answersFrom, applyDates, assembleAdvisoryEvidence, fetchAdvisories, readAdvisoryEvidence,
 } from '../../dependency-audit/lib/advisories.mjs';
 import { evaluate, headline } from '../../dependency-audit/lib/core.mjs';
 import { annotateProvenance, inventory, lockEntries, readReport, sha256, toolingScope } from '../../dependency-audit/lib/npm.mjs';
@@ -67,6 +81,32 @@ export const ASSESSMENT_SCHEMA = 'dinify.admin.assessment/1';
 export const ASSESSMENT_DOC = 'assessment.json';
 export const GRAPHS = Object.freeze(['application', 'scanner']);
 const RAW_RE = /^(application|scanner)\.scanner-(stdout|stderr)\.txt$/;
+/** The environment variable the deploy workflow names the downloaded candidate directory in. */
+export const CERTIFIED_CANDIDATE_ENV = 'CERTIFIED_CANDIDATE_DIR';
+/** The certification's advisory record, as the candidate carries it. */
+export const CERTIFIED_ADVISORIES = `evidence/audit/${ADVISORIES_FILE}`;
+
+/**
+ * The certification's retained advisory record, for reuse at promotion (CI-signal A-2
+ * follow-up). Read from `dir` (the downloaded candidate), and accepted only when the bytes
+ * are exactly the ones the inspected certification record lists for it.
+ *   {state: 'none'}                    no directory named, or the certification retained none
+ *   {state: 'read', bytes, sha256}     the listed bytes
+ *   {state: 'invalid', problem}        named and listed, but unreadable or not those bytes
+ */
+export function certifiedAdvisories(inspection, dir = process.env[CERTIFIED_CANDIDATE_ENV]) {
+  const files = inspection?.record?.evidence?.files;
+  const entry = Array.isArray(files) ? files.find((f) => isObject(f) && f.path === CERTIFIED_ADVISORIES) : undefined;
+  if (typeof dir !== 'string' || dir === '' || !entry) return { state: 'none' };
+  let bytes;
+  try { bytes = readFileSync(join(dir, CERTIFIED_ADVISORIES)); } catch {
+    return { state: 'invalid', problem: reason('certified_advisories_unreadable', `${CERTIFIED_ADVISORIES} is listed by the certification and cannot be read from ${CERTIFIED_CANDIDATE_ENV}`) };
+  }
+  if (sha256Hex(bytes) !== entry.sha256 || bytes.length !== entry.bytes) {
+    return { state: 'invalid', problem: reason('certified_advisories_altered', `${CERTIFIED_ADVISORIES} is not the bytes the certification record lists`) };
+  }
+  return { state: 'read', bytes, sha256: entry.sha256 };
+}
 
 /**
  * The dated obligations a decision carries: {advisory, path, deadline}, earliest first.
@@ -107,8 +147,12 @@ function appliedRecords(result, records) {
  * @param {string[]} [input.forbidden]  more directories the scanner-log root must not be
  *                                      inside or around (the CLI passes the candidate)
  * @param {Function} [input.advisories]  the clock (dependency-audit/lib/advisories.mjs)
+ * @param {string} [input.certifiedDir]  the downloaded candidate, for its retained advisory
+ *                                      record (default: CERTIFIED_CANDIDATE_DIR)
  */
-export function assess({ trustedRoot, inspection, candidate, assessor, outDir, replayDir, runner, clock, installScanner = defaultInstallScanner, forbidden = [], advisories = fetchAdvisories }) {
+export function assess({ trustedRoot, inspection, candidate, assessor, outDir, replayDir, runner, clock, installScanner = defaultInstallScanner, forbidden = [], advisories = fetchAdvisories, certifiedDir = process.env[CERTIFIED_CANDIDATE_ENV] }) {
+  // The certification's dates are read BEFORE the scanner (third-party code) runs.
+  const certified = certifiedAdvisories(inspection, certifiedDir);
   mkdirSync(outDir, { recursive: true });
   mkdirSync(replayDir, { recursive: true });
   const incomplete = [];
@@ -159,16 +203,30 @@ export function assess({ trustedRoot, inspection, candidate, assessor, outDir, r
       }
     }
   }
-  // THE CLOCK, after the scans, for the findings that carry provenance; the dates are read
-  // back from the very bytes retained, by the reader `verifyAssessment` uses.
+  // THE CLOCK, after the scans, for the findings a date could defer: reused from the
+  // certification's record where it dates them, asked of GitHub (unauthenticated) only for
+  // the rest. The dates are read back from the very bytes retained, by the reader
+  // `verifyAssessment` uses.
   let dated = findings;
+  if (certified.state === 'invalid') incomplete.push(certified.problem);
   const ids = advisoryIds(findings);
   if (ids.length > 0) {
-    let asked;
-    try { asked = advisories(ids); } catch { asked = { answers: ids.map((id) => ({ id, status: 0, retrievedAt: null, error: 'fetch_failed', body: null })), authenticated: false }; }
-    const built = buildAdvisoryEvidence(asked);
+    const reused = certified.state === 'read'
+      ? answersFrom(certified.bytes, certified.sha256, ids, { source: 'certification', requireDate: true })
+      : { answers: [], missing: [...new Set(ids)].sort(), problems: [], authenticated: false };
+    incomplete.push(...reused.problems);
+    let fetched = { answers: [], authenticated: false };
+    if (reused.missing.length > 0) {
+      let asked;
+      try { asked = advisories(reused.missing); } catch { asked = { answers: reused.missing.map((id) => ({ id, status: 0, retrievedAt: null, error: 'fetch_failed', body: null })), authenticated: false }; }
+      fetched = { answers: asked.answers.map((a) => ({ ...a, source: 'fetched' })), authenticated: asked.authenticated };
+    }
+    const built = assembleAdvisoryEvidence(ids, { reused, fetched });
     writeFileSync(join(outDir, ADVISORIES_FILE), built.bytes);
-    advisoryRecord = { file: ADVISORIES_FILE, sha256: built.sha256, requested: ids.length, authenticated: built.doc.authenticated };
+    advisoryRecord = {
+      file: ADVISORIES_FILE, sha256: built.sha256, requested: ids.length, authenticated: built.doc.authenticated,
+      reused: reused.answers.length, fetched: fetched.answers.length,
+    };
     const read = readAdvisoryEvidence(built.bytes, built.sha256);
     incomplete.push(...read.problems);
     dated = applyDates(findings, read.dates);

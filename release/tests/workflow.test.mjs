@@ -25,6 +25,7 @@ import { describe, it } from 'node:test';
 import { simulateJob } from '../../dependency-audit/tests/workflow-harness.mjs';
 import { parseYaml } from '../../dependency-audit/tests/yaml-subset.mjs';
 import { decideAdmission } from '../lib/admission.mjs';
+import { CERTIFIED_CANDIDATE_ENV } from '../lib/assessment.mjs';
 import { recordBytes } from '../lib/common.mjs';
 import { sha256Hex } from '../lib/tree.mjs';
 import { EVAL_RUN_ID, REPO_ROOT, evaluatedProject, git } from './fixtures.mjs';
@@ -70,6 +71,13 @@ describe('STATIC: the privilege boundary', () => {
     for (const [name, job] of Object.entries(DEPLOY.jobs)) if (name !== 'deploy') assert.notEqual(job.permissions?.['id-token'], 'write', name);
     assert.equal(DEPLOY.permissions, undefined, 'no workflow-level grant for a job to inherit');
     assert.equal(CI.jobs.validate.permissions?.['id-token'], undefined);
+  });
+
+  it('CONTRACT (A-2 follow-up): the evaluate step holds no token — it names only the downloaded candidate, the same directory as --candidate, for the certified advisory dates', () => {
+    const step = DEPLOY.jobs.prepare.steps.find((s) => s.id === 'evaluate');
+    assert.deepEqual(Object.keys(step.env).sort(), [CERTIFIED_CANDIDATE_ENV, 'MODE', 'SOURCE', 'TARGET_SHA'].sort());
+    assert.doesNotMatch(JSON.stringify(step.env), /token|secret/i);
+    assert.equal(step.env[CERTIFIED_CANDIDATE_ENV], /--candidate (\S+)/.exec(step.run)?.[1]);
   });
 
   it('CONTRACT: no npm, npx, build, package script or checkout of the target runs in the privileged job', () => {

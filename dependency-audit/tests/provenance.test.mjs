@@ -8,7 +8,7 @@
 
 import { strict as assert } from 'node:assert';
 import { createHash } from 'node:crypto';
-import { readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { describe, it } from 'node:test';
@@ -299,9 +299,13 @@ describe('the clock: dates from GitHub, retained, never supplied (advisories.mjs
   });
 
   it('REGRESSION: an inherited CRITICAL blocks at once; an inherited RUNTIME high blocks at once', () => {
-    within({ app: TOOL_CRITICAL }, ({ result }) => {
+    within({ app: TOOL_CRITICAL }, ({ p, result }) => {
       assert.equal(toolFinding(result).provenance, 'inherited');
-      assert.equal(toolFinding(result).reportableSince, '2026-09-21');
+      // ORACLE CORRECTED (A-2 follow-up): this used to assert the critical was DATED
+      // ('2026-09-21'). A date can defer only an inherited HIGH tooling finding, so GitHub
+      // is no longer asked about a critical at all — and with no question, no date.
+      assert.equal('reportableSince' in toolFinding(result), false);
+      assert.equal(existsSync(join(p.evidence, ADVISORIES_FILE)), false, 'nothing that could not defer was asked about, so there is no record of asking');
       assert.equal(result.outcome, 'blocking');
       assert.match(renderSummary(result), /→ blocking\n/, 'a critical is not given a not-deferred reason: there was never a window');
     });
@@ -348,18 +352,28 @@ describe('the clock: dates from GitHub, retained, never supplied (advisories.mjs
     assert.equal(reportableDate(advisoryBody(GHSA), GHSA.toUpperCase()), null, 'the record must be about the advisory asked');
   });
 
-  it('CONTRACT: only findings with provenance are asked about or dated — sorted, distinct, GHSA only', () => {
+  // ORACLE CORRECTED (A-2 follow-up): this asked about every GHSA id on a finding with
+  // provenance. Only an INHERITED HIGH TOOLING finding can be deferred, so only its date
+  // can change a decision, and only it is asked about now. DATING is unchanged: a date the
+  // record holds is still applied to any finding with provenance, which is what keeps a
+  // result retained before this change re-deciding byte-identically.
+  it('CONTRACT: only an INHERITED HIGH TOOLING finding is asked about — sorted, distinct, GHSA only; any finding with provenance is dated', () => {
+    const high = { scope: 'tooling', severity: 'high' };
     const findings = [
-      { advisory: 'GHSA-bbbb-bbbb-bbbb', provenance: 'inherited' },
-      { advisory: 'GHSA-aaaa-aaaa-aaaa', provenance: 'introduced' },
-      { advisory: 'GHSA-aaaa-aaaa-aaaa', provenance: 'inherited' },
-      { advisory: 'GHSA-cccc-cccc-cccc' },
-      { advisory: 'npm:1100', provenance: 'inherited' },
+      { ...high, advisory: 'GHSA-bbbb-bbbb-bbbb', provenance: 'inherited' },
+      { ...high, advisory: 'GHSA-aaaa-aaaa-aaaa', provenance: 'introduced' },
+      { ...high, advisory: 'GHSA-aaaa-aaaa-aaaa', provenance: 'inherited' },
+      { ...high, advisory: 'GHSA-cccc-cccc-cccc' },
+      { ...high, advisory: 'npm:1100', provenance: 'inherited' },
+      { scope: 'tooling', severity: 'critical', advisory: 'GHSA-dddd-dddd-dddd', provenance: 'inherited' },
+      { scope: 'runtime', severity: 'high', advisory: 'GHSA-eeee-eeee-eeee', provenance: 'inherited' },
+      { scope: 'tooling', severity: 'moderate', advisory: 'GHSA-ffff-ffff-ffff', provenance: 'inherited' },
     ];
     assert.deepEqual(advisoryIds(findings), ['GHSA-aaaa-aaaa-aaaa', 'GHSA-bbbb-bbbb-bbbb']);
-    const dated = applyDates(findings, new Map([['GHSA-cccc-cccc-cccc', '2026-09-01'], ['GHSA-bbbb-bbbb-bbbb', '2026-09-02']]));
+    const dated = applyDates(findings, new Map([['GHSA-cccc-cccc-cccc', '2026-09-01'], ['GHSA-bbbb-bbbb-bbbb', '2026-09-02'], ['GHSA-dddd-dddd-dddd', '2026-09-03']]));
     assert.equal(dated[0].reportableSince, '2026-09-02');
     assert.equal('reportableSince' in dated[3], false, 'no provenance, no date — whatever the record says');
+    assert.equal(dated[5].reportableSince, '2026-09-03', 'a retained date is still applied to a critical: re-decisions stay identical');
   });
 
   it('CONTRACT: the job token reaches the clock\'s child and never the scanner', () => {

@@ -11,14 +11,14 @@
  */
 
 import { strict as assert } from 'node:assert';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { cpSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { ADVISORIES_FILE } from '../../dependency-audit/lib/advisories.mjs';
 import { advisoryBody, cannedAdvisories, cannedRunner, CLEAN_SCANNER, fakeInstall, npmReport, via } from '../../dependency-audit/tests/project.mjs';
 import { commitFacts, decideAdmission, verifyAdmission } from '../lib/admission.mjs';
-import { ASSESSMENT_DOC, assess, assessmentDeadline, verifyAssessment } from '../lib/assessment.mjs';
+import { ASSESSMENT_DOC, CERTIFIED_ADVISORIES, CERTIFIED_CANDIDATE_ENV, assess, assessmentDeadline, verifyAssessment } from '../lib/assessment.mjs';
 import { inspectCandidate } from '../lib/certification.mjs';
 import { loadReleasePolicy } from '../lib/common.mjs';
 import { walkTree } from '../lib/tree.mjs';
@@ -43,7 +43,7 @@ function evaluatedInspection(p) {
   });
 }
 
-function runAssess(p, { application, scanner = CLEAN_SCANNER, advisories }) {
+function runAssess(p, { application, scanner = CLEAN_SCANNER, advisories, certifiedDir, runner }) {
   const inspection = evaluatedInspection(p);
   assert.deepEqual(inspection.problems, [], 'the candidate must inspect clean before it is assessed');
   const out = tempDir('assessment-');
@@ -52,7 +52,7 @@ function runAssess(p, { application, scanner = CLEAN_SCANNER, advisories }) {
     trustedRoot: p.root, inspection,
     candidate: { commit: p.commit, runId: RUN_ID, runAttempt: RUN_ATTEMPT, artifactId: '5550001', artifactDigest: `sha256:${'a'.repeat(64)}` },
     assessor: { workflowPath: '.github/workflows/deploy.yml', runId: EVAL_RUN_ID, runAttempt: '1', revision: p.commit },
-    outDir: out.dir, replayDir: replay.dir, runner: cannedRunner({ application, scanner }), clock: steppingClock(NOW), installScanner: fakeInstall, advisories,
+    outDir: out.dir, replayDir: replay.dir, runner: runner ?? cannedRunner({ application, scanner }), clock: steppingClock(NOW), installScanner: fakeInstall, advisories, certifiedDir,
   });
   return { inspection, doc, outDir: out.dir, cleanup: () => { out.cleanup(); replay.cleanup(); } };
 }
@@ -142,6 +142,135 @@ describe('the fresh assessment: provenance against the candidate\'s own retained
         assert.equal(a.doc.outcome, 'blocking', JSON.stringify(a.doc.reasons));
       } finally { a.cleanup(); }
     } finally { p.cleanup(); }
+  });
+});
+
+// ── CI-signal A-2 follow-up: the certification's dates are reused ─────────────────────
+//
+// Admin cannot give the question a token: `evaluate` scans and decides in ONE process and
+// removes the token before the scanner runs, and a new advisory's id is known only after the
+// scan. So the dates the certification already retained are REUSED, and only the rest is asked
+// — unauthenticated, as before, and an unanswered question still blocks.
+
+const G2 = 'GHSA-dddd-eeee-ffff';
+/** A GitHub that answers every question 403 and records what it was asked. */
+const refusing = () => cannedAdvisories(() => ({ status: 403, body: '{"message":"API rate limit exceeded"}' }), { authenticated: false });
+/** A certification against its base that dated G (reviewed 2026-09-23). */
+const certifiedDating = () => certifiedProject({ withBase: true, answers: { application: toolAt('high') }, advisories: reviewedOn('2026-09-23') });
+const entriesOf = (a) => JSON.parse(readFileSync(join(a.outDir, ADVISORIES_FILE), 'utf8')).advisories;
+
+describe('promotion REUSES the dates its certification retained, and asks only for the rest (A-2 follow-up)', () => {
+  it('PREMISE: the certification retained an advisory record, listed in its record', () => {
+    const p = certifiedDating();
+    try {
+      const record = JSON.parse(readFileSync(join(p.candidateDir, 'certification.json'), 'utf8'));
+      assert.ok(record.evidence.files.some((f) => f.path === CERTIFIED_ADVISORIES), JSON.stringify(record.evidence.files.map((f) => f.path)));
+    } finally { p.cleanup(); }
+  });
+
+  it('CONTRACT: the date is REUSED — GitHub is not asked even when it would refuse, and the inherited high is deferred', () => {
+    const p = certifiedDating();
+    const gh = refusing();
+    const a = runAssess(p, { application: toolAt('high'), advisories: gh, certifiedDir: p.candidateDir });
+    try {
+      assert.deepEqual(gh.asked, [], 'nothing was asked');
+      assert.equal(a.doc.outcome, 'obligations_pending', JSON.stringify(a.doc.reasons));
+      assert.deepEqual(a.doc.obligations, [{ advisory: G, path: TOOL, deadline: '2026-09-30' }]);
+      assert.deepEqual(entriesOf(a).map((e) => [e.id, e.source]), [[G, 'certification']]);
+      assert.deepEqual([a.doc.advisories.requested, a.doc.advisories.reused, a.doc.advisories.fetched], [1, 1, 0]);
+      assert.deepEqual(verify(p, a).problems, [], 'the privileged re-read reproduces it offline');
+    } finally { a.cleanup(); p.cleanup(); }
+  });
+
+  it('CONTRACT: an advisory the certification did not date is asked about — that one only — and the reused one is not', () => {
+    const p = certifiedDating();
+    const gh = cannedAdvisories((id) => ({ status: 200, body: advisoryBody(id, { reviewed: '2026-09-24T08:00:00Z', published: '2026-09-24T07:00:00Z' }) }), { authenticated: false });
+    const both = { status: 1, stdout: npmReport({ tool: { via: [via('tool', 'high', '>=0.0.0', G), via('tool', 'high', '>=0.0.0', G2)], nodes: ['node_modules/tool'] } }) };
+    const a = runAssess(p, { application: both, advisories: gh, certifiedDir: p.candidateDir });
+    try {
+      assert.deepEqual(gh.asked, [[G2]]);
+      assert.deepEqual(entriesOf(a).map((e) => [e.id, e.source]), [[G, 'certification'], [G2, 'fetched']]);
+      assert.equal(a.doc.outcome, 'obligations_pending', JSON.stringify(a.doc.reasons));
+      assert.deepEqual(a.doc.obligations.map((o) => [o.advisory, o.deadline]), [[G, '2026-09-30'], [G2, '2026-10-01']]);
+      assert.deepEqual(verify(p, a).problems, []);
+    } finally { a.cleanup(); p.cleanup(); }
+  });
+
+  for (const [label, answer] of [['a 403', () => ({ status: 403, body: '{"message":"API rate limit exceeded"}' })], ['a timeout', () => ({ status: 0, error: 'timeout' })]]) {
+    it(`REGRESSION: ${label} for the advisory the certification did not date leaves it undated — it BLOCKS; the reused one is still dated`, () => {
+      const p = certifiedDating();
+      const both = { status: 1, stdout: npmReport({ tool: { via: [via('tool', 'high', '>=0.0.0', G), via('tool', 'high', '>=0.0.0', G2)], nodes: ['node_modules/tool'] } }) };
+      const a = runAssess(p, { application: both, advisories: cannedAdvisories(answer, { authenticated: false }), certifiedDir: p.candidateDir });
+      try {
+        assert.equal(a.doc.outcome, 'blocking');
+        // The reused date still defers G; G2, undated, is what blocks.
+        assert.deepEqual(a.doc.obligations.map((o) => o.advisory), [G]);
+        assert.deepEqual(entriesOf(a).map((e) => [e.id, e.source]), [[G, 'certification'], [G2, 'fetched']]);
+        assert.ok(verify(p, a).problems.some((x) => x.code === 'assessment_not_passing'));
+      } finally { a.cleanup(); p.cleanup(); }
+    });
+  }
+
+  it('REGRESSION: a certified record that is NOT the bytes the certification lists is incomplete — it is never read as a date', () => {
+    const p = certifiedDating();
+    const copy = tempDir('candidate-');
+    cpSync(p.candidateDir, copy.dir, { recursive: true });
+    const path = join(copy.dir, CERTIFIED_ADVISORIES);
+    writeFileSync(path, readFileSync(path, 'utf8').replace('2026-09-23T08', '2026-09-25T08'));
+    const gh = refusing();
+    const a = runAssess(p, { application: toolAt('high'), advisories: gh, certifiedDir: copy.dir });
+    try {
+      assert.equal(a.doc.outcome, 'incomplete');
+      assert.ok(a.doc.reasons.some((r) => r.code === 'certified_advisories_altered'), JSON.stringify(a.doc.reasons));
+    } finally { a.cleanup(); copy.cleanup(); p.cleanup(); }
+  });
+
+  it('REGRESSION: a certified record the workflow names but that cannot be read is incomplete', () => {
+    const p = certifiedDating();
+    const copy = tempDir('candidate-');
+    cpSync(p.candidateDir, copy.dir, { recursive: true });
+    rmSync(join(copy.dir, CERTIFIED_ADVISORIES));
+    const a = runAssess(p, { application: toolAt('high'), advisories: refusing(), certifiedDir: copy.dir });
+    try {
+      assert.equal(a.doc.outcome, 'incomplete');
+      assert.ok(a.doc.reasons.some((r) => r.code === 'certified_advisories_unreadable'), JSON.stringify(a.doc.reasons));
+    } finally { a.cleanup(); copy.cleanup(); p.cleanup(); }
+  });
+
+  it('CONTROL: with no candidate directory named, nothing is reused and the date is asked for as before', () => {
+    const p = certifiedDating();
+    const gh = reviewedOn('2026-09-23');
+    const before = process.env[CERTIFIED_CANDIDATE_ENV];
+    delete process.env[CERTIFIED_CANDIDATE_ENV];
+    const a = runAssess(p, { application: toolAt('high'), advisories: gh });
+    try {
+      assert.deepEqual(gh.asked, [[G]]);
+      assert.deepEqual(entriesOf(a).map((e) => [e.id, e.source]), [[G, 'fetched']]);
+      assert.equal(a.doc.outcome, 'obligations_pending');
+    } finally { if (before !== undefined) process.env[CERTIFIED_CANDIDATE_ENV] = before; a.cleanup(); p.cleanup(); }
+  });
+
+  it('CONTRACT: no token reaches the scanner — asserted at the call that starts it, with tokens in this process\'s environment', () => {
+    const p = certifiedDating();
+    const inner = cannedRunner({ application: toolAt('high'), scanner: CLEAN_SCANNER });
+    const seen = [];
+    const runner = (call) => { if (call.command === process.execPath) seen.push(call.env); return inner(call); };
+    const saved = { GH_TOKEN: process.env.GH_TOKEN, GITHUB_TOKEN: process.env.GITHUB_TOKEN };
+    process.env.GH_TOKEN = 'ghs_PROCESSTOKEN0001';
+    process.env.GITHUB_TOKEN = 'ghs_PROCESSTOKEN0002';
+    try {
+      const a = runAssess(p, { application: toolAt('high'), advisories: refusing(), certifiedDir: p.candidateDir, runner });
+      a.cleanup();
+      assert.equal(seen.length, 2, 'premise: the scanner was started for both graphs');
+      for (const env of seen) {
+        assert.equal(env.GH_TOKEN, undefined);
+        assert.equal(env.GITHUB_TOKEN, undefined);
+        assert.ok(!Object.values(env).some((v) => /\bgh[pousr]_[A-Za-z0-9_]{8,}/.test(String(v))), 'a value shaped like a GitHub token reached the scanner');
+      }
+    } finally {
+      for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+      p.cleanup();
+    }
   });
 });
 

@@ -153,6 +153,19 @@ describe('the scanner invocation cannot be narrowed by what it inherits', () => 
     assert.equal(env.PATH, '/bin');
     assert.deepEqual(removed, ['NODE_ENV', 'NODE_OPTIONS', 'NPM_CONFIG_PRODUCTION', 'npm_config_omit', 'npm_config_registry']);
   });
+
+  it('CONTRACT: the runner\'s five file-command paths are withheld from the scanner, by name, and the rest of its context is not', () => {
+    // Each names a file the runner reads when the step ends (environment, PATH, outputs,
+    // summary, saved state for later steps). Withheld, not sealed: see scannerEnvironment.
+    const files = { GITHUB_ENV: '/r/env', GITHUB_PATH: '/r/path', GITHUB_OUTPUT: '/r/output', GITHUB_STEP_SUMMARY: '/r/summary', GITHUB_STATE: '/r/state' };
+    const { env, removed } = scannerEnvironment({ PATH: '/bin', HOME: '/h', GITHUB_ACTIONS: 'true', GITHUB_WORKSPACE: '/w', ...files });
+    for (const key of Object.keys(files)) assert.equal(key in env, false, `${key} reaches the scanner`);
+    assert.deepEqual(removed, ['GITHUB_ENV', 'GITHUB_OUTPUT', 'GITHUB_PATH', 'GITHUB_STATE', 'GITHUB_STEP_SUMMARY']);
+    assert.equal(env.GITHUB_ACTIONS, 'true');
+    assert.equal(env.GITHUB_WORKSPACE, '/w');
+    assert.equal(env.PATH, '/bin');
+    assert.equal(env.HOME, '/h');
+  });
 });
 
 describe('reading a scanner answer', () => withProject({}, ({ root }) => {

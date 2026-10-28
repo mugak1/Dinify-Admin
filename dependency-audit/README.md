@@ -224,6 +224,10 @@ while `metadata.dependencies.total` still counted all 794 packages. So
 the scanner runs with every dependency type `--include`d, `--package-lock=true`, the
 public registry named explicitly, and `NODE_ENV`, `NODE_OPTIONS` and every `npm_*`
 variable removed from its environment.
+The job's token and the runner's five file-command paths (`GITHUB_ENV`, `GITHUB_PATH`,
+`GITHUB_OUTPUT`, `GITHUB_STEP_SUMMARY`, `GITHUB_STATE`) are withheld from it too. That is not a
+boundary, since a process on the same runner can still find those files; the boundary is that
+the scanner is the pinned, integrity-checked npm, run with scripts disabled.
 The audit level is pinned too (`--audit-level=low`, npm's own default): it moves only the
 exit code, never the JSON body, but npm reads it from any npmrc the environment scrub
 cannot reach, and the exit-status check above assumes it. Measured with the pinned npm, an

@@ -371,15 +371,22 @@ describe('the committed policy of THIS repository', () => {
   // 2026-10-23, so the braces record matched nothing: STALE, NOT remediated.
   //
   // TWO undici records joined it on 2026-10-24 (#48), for GHSA-xjj6-f33q-929c: the application
-  // copy @angular/build pins exactly (7.29.1) and the copy npm 11.21.1 bundles (6.29.0). Neither
-  // can take the fixed release without a package.json or scanner change. The node-gyp copy in
-  // the application graph took 6.29.1 in the lock instead, so nothing covers it.
+  // copy @angular/build pinned exactly (7.29.1) and the copy npm 11.21.1 bundles (6.29.0). The
+  // node-gyp copy in the application graph took 6.29.1 in the lock instead.
+  //
+  // On 2026-10-28 (#55) the APPLICATION undici record was REMOVED, REMEDIATED: @angular/build
+  // 21.2.29 pins undici 7.30.1, which fixes it and the three other high advisories on 7.29.1,
+  // and the lock took it with no package.json change. The SCANNER copy cannot move (no npm
+  // release bundles 6.29.1), so two more scanner undici records joined, for GHSA-2m5v-pch6-74hx
+  // and GHSA-qrxm-fqhp-jwvm, whose deferral ends at 00:00 UTC on 2026-11-03. Frontend carries
+  // the same three scanner records.
   const GRAPH = {
     'application-http-cache-semantics-GHSA-ch52-4w7c-c8xp': 'application',
-    'application-undici-GHSA-xjj6-f33q-929c': 'application',
     'scanner-undici-GHSA-xjj6-f33q-929c': 'scanner',
+    'scanner-undici-GHSA-2m5v-pch6-74hx': 'scanner',
+    'scanner-undici-GHSA-qrxm-fqhp-jwvm': 'scanner',
   };
-  it('CONTRACT: the approved records are exactly the http-cache-semantics and two undici tooling exceptions, each pinned to its graph and well-formed as approved', () => {
+  it('CONTRACT: the approved records are exactly the http-cache-semantics and three scanner undici tooling exceptions, each pinned to its graph and well-formed as approved', () => {
     assert.deepEqual(policy.records.map((r) => r.id), Object.keys(GRAPH));
     for (const record of policy.records) {
       assert.deepEqual(validateRecord(record, parseDate(record.approval.date)), [], record.id);
@@ -395,8 +402,9 @@ describe('the committed policy of THIS repository', () => {
   it('CONTRACT: the provenance and expiry of every approved record', () => {
     const PROVENANCE = {
       'application-http-cache-semantics-GHSA-ch52-4w7c-c8xp': ['https://github.com/mugak1/Dinify-Admin/pull/46', '2026-10-23', '2026-12-31'],
-      'application-undici-GHSA-xjj6-f33q-929c': ['https://github.com/mugak1/Dinify-Admin/pull/48', '2026-10-24', '2026-11-30'],
       'scanner-undici-GHSA-xjj6-f33q-929c': ['https://github.com/mugak1/Dinify-Admin/pull/48', '2026-10-24', '2026-11-30'],
+      'scanner-undici-GHSA-2m5v-pch6-74hx': ['https://github.com/mugak1/Dinify-Admin/pull/55', '2026-10-28', '2026-11-30'],
+      'scanner-undici-GHSA-qrxm-fqhp-jwvm': ['https://github.com/mugak1/Dinify-Admin/pull/55', '2026-10-28', '2026-11-30'],
     };
     assert.deepEqual(Object.keys(PROVENANCE), Object.keys(GRAPH));
     for (const record of policy.records) {
@@ -408,31 +416,44 @@ describe('the committed policy of THIS repository', () => {
   });
 
   // The approved records driven through the real evaluator with findings shaped exactly as the
-  // pinned scanner reports them, and the subjects of the five records removed with the scanner
+  // pinned scanner reports them, and the subjects of the six records removed since the scanner
   // move. These pin what each committed record DOES cover and what it must keep refusing, and
   // that nothing committed covers a former subject if it is ever reported again (an advisory
-  // reinstated or widened, or the scanner rolled back). The generic rules themselves are pinned
-  // by the conformance vectors and the core suite.
-  describe('the approved exceptions against their exact subjects, and the five former subjects', () => {
+  // reinstated or widened, the scanner rolled back, or @angular/build rolled back to a release
+  // pinning undici 7.29.1). The generic rules themselves are pinned by the conformance vectors
+  // and the core suite.
+  describe('the approved exceptions against their exact subjects, and the former subjects', () => {
     const APP_HCS = 'application-http-cache-semantics-GHSA-ch52-4w7c-c8xp';
-    const APP_UNDICI = 'application-undici-GHSA-xjj6-f33q-929c';
-    const SCANNER_UNDICI = 'scanner-undici-GHSA-xjj6-f33q-929c';
-    const UNDICI = [APP_UNDICI, SCANNER_UNDICI];
+    const SCANNER_XJJ6 = 'scanner-undici-GHSA-xjj6-f33q-929c';
+    const SCANNER_2M5V = 'scanner-undici-GHSA-2m5v-pch6-74hx';
+    const SCANNER_QRXM = 'scanner-undici-GHSA-qrxm-fqhp-jwvm';
+    const UNDICI = [SCANNER_XJJ6, SCANNER_2M5V, SCANNER_QRXM];
     // A moment at which every committed record is in date; each expiry is pinned on its own below.
     const IN_DATE = '2026-11-29T23:59:59Z';
     const finding = (advisory, alias, pkg, version, path, severity = 'high', scope = 'tooling') => ({ advisory, aliases: [alias], package: pkg, version, path, scope, severity });
+    const SCANNER_UNDICI_PATH = 'scanner:node_modules/npm/node_modules/undici';
     const SUBJECTS = {
       [APP_HCS]: finding('GHSA-ch52-4w7c-c8xp', 'npm:1240991', 'http-cache-semantics', '4.2.0', 'application:node_modules/http-cache-semantics'),
-      [APP_UNDICI]: finding('GHSA-xjj6-f33q-929c', 'npm:1243113', 'undici', '7.29.1', 'application:node_modules/undici'),
-      [SCANNER_UNDICI]: finding('GHSA-xjj6-f33q-929c', 'npm:1243114', 'undici', '6.29.0', 'scanner:node_modules/npm/node_modules/undici'),
+      [SCANNER_XJJ6]: finding('GHSA-xjj6-f33q-929c', 'npm:1243114', 'undici', '6.29.0', SCANNER_UNDICI_PATH),
+      [SCANNER_2M5V]: finding('GHSA-2m5v-pch6-74hx', 'npm:1243476', 'undici', '6.29.0', SCANNER_UNDICI_PATH),
+      [SCANNER_QRXM]: finding('GHSA-qrxm-fqhp-jwvm', 'npm:1243479', 'undici', '6.29.0', SCANNER_UNDICI_PATH),
     };
     const IDS = Object.keys(SUBJECTS);
+    // The application undici 7.29.1 the lock no longer carries, as the pinned scanner reported
+    // it on 2026-10-28: the high advisories on that copy, each with its own npm alias.
+    const APPLICATION_UNDICI = {
+      'GHSA-xjj6-f33q-929c': finding('GHSA-xjj6-f33q-929c', 'npm:1243113', 'undici', '7.29.1', 'application:node_modules/undici'),
+      'GHSA-4w7w-5xrc-9h26': finding('GHSA-4w7w-5xrc-9h26', 'npm:1243473', 'undici', '7.29.1', 'application:node_modules/undici'),
+      'GHSA-2m5v-pch6-74hx': finding('GHSA-2m5v-pch6-74hx', 'npm:1243475', 'undici', '7.29.1', 'application:node_modules/undici'),
+      'GHSA-qrxm-fqhp-jwvm': finding('GHSA-qrxm-fqhp-jwvm', 'npm:1243478', 'undici', '7.29.1', 'application:node_modules/undici'),
+    };
     const FORMER = {
-      'scanner-undici-GHSA-rfgv-xxqx-mfg5': finding('GHSA-rfgv-xxqx-mfg5', 'npm:1240042', 'undici', '6.28.0', 'scanner:node_modules/npm/node_modules/undici'),
+      'scanner-undici-GHSA-rfgv-xxqx-mfg5': finding('GHSA-rfgv-xxqx-mfg5', 'npm:1240042', 'undici', '6.28.0', SCANNER_UNDICI_PATH),
       'scanner-brace-expansion-GHSA-qhr7-859c-m2p7': finding('GHSA-qhr7-859c-m2p7', 'npm:1240107', 'brace-expansion', '5.0.9', 'scanner:node_modules/npm/node_modules/brace-expansion'),
       'scanner-brace-expansion-GHSA-6j4f-fj2g-mc7p': finding('GHSA-6j4f-fj2g-mc7p', 'npm:1240111', 'brace-expansion', '5.0.9', 'scanner:node_modules/npm/node_modules/brace-expansion'),
       'application-braces-GHSA-vfj7-8cjw-p6xm': finding('GHSA-vfj7-8cjw-p6xm', 'npm:1240992', 'braces', '3.0.3', 'application:node_modules/braces'),
       'scanner-http-cache-semantics-GHSA-ch52-4w7c-c8xp': finding('GHSA-ch52-4w7c-c8xp', 'npm:1240991', 'http-cache-semantics', '4.2.0', 'scanner:node_modules/npm/node_modules/http-cache-semantics'),
+      'application-undici-GHSA-xjj6-f33q-929c': APPLICATION_UNDICI['GHSA-xjj6-f33q-929c'],
     };
     const clone = (f) => ({ ...f, aliases: [...f.aliases] });
     const subjects = () => Object.values(SUBJECTS).map(clone);
@@ -488,14 +509,22 @@ describe('the committed policy of THIS repository', () => {
       assert.equal(open.coveredBy, null);
     });
 
-    it('CONTRACT: neither undici record covers the other graph\'s copy, and the node-gyp copy is covered by neither', () => {
-      // Each record alone, against the other graph's copy alone: moved, not added.
-      for (const [id, other] of [[APP_UNDICI, SCANNER_UNDICI], [SCANNER_UNDICI, APP_UNDICI]]) {
-        const r = decide(onlySubjects(other), { records: onlyRecords(id) });
+    it('CONTRACT: no scanner undici record covers the application copy of its advisory, and the node-gyp copy is covered by none', () => {
+      // Each record alone, against the application copy alone: moved, not added.
+      for (const id of UNDICI) {
+        const app = clone(APPLICATION_UNDICI[SUBJECTS[id].advisory]);
+        const r = decide([app], { records: onlyRecords(id) });
         assert.equal(r.outcome, 'blocking', id);
         assert.equal(status(r, id).status, 'refused', id);
-        assert.equal(at(r, SUBJECTS[other].path, SUBJECTS[other].advisory).disposition, 'open', id);
+        assert.equal(at(r, app.path, app.advisory).disposition, 'open', id);
       }
+      // Every high advisory on the application copy, reported again beside the committed
+      // subjects (@angular/build rolled back): each blocks, and the committed records still apply.
+      const back = decide([...subjects(), ...Object.values(APPLICATION_UNDICI).map(clone)]);
+      assert.equal(back.outcome, 'blocking');
+      assert.equal(back.counts.blocking, Object.keys(APPLICATION_UNDICI).length);
+      for (const f of Object.values(APPLICATION_UNDICI)) assert.equal(at(back, f.path, f.advisory).coveredBy, null, f.advisory);
+      for (const id of IDS) assert.equal(status(back, id).status, 'applied', id);
       // The node-gyp copy took the fixed release in the lock; reported again, it blocks.
       const nodeGyp = finding('GHSA-xjj6-f33q-929c', 'npm:1243113', 'undici', '6.29.0', 'application:node_modules/node-gyp/node_modules/undici');
       const r = decide([...subjects(), nodeGyp]);
@@ -505,8 +534,19 @@ describe('the committed policy of THIS repository', () => {
       for (const id of IDS) assert.equal(status(r, id).status, 'applied', id);
     });
 
+    it('CONTRACT: no scanner undici record covers another advisory on the same node — each one withdrawn leaves its own subject open and blocking', () => {
+      for (const id of UNDICI) {
+        const r = decide(subjects(), { records: policy.records.filter((x) => x.id !== id) });
+        assert.equal(r.outcome, 'blocking', id);
+        assert.equal(at(r, SUBJECTS[id].path, SUBJECTS[id].advisory).disposition, 'open', id);
+        assert.equal(at(r, SUBJECTS[id].path, SUBJECTS[id].advisory).coveredBy, null, id);
+        assert.equal(r.counts.excepted, IDS.length - 1, id);
+        for (const other of IDS.filter((x) => x !== id)) assert.equal(status(r, other).status, 'applied', `${id}: ${other} still covers its own subject`);
+      }
+    });
+
     it('CONTRACT: a record is not matched by any other version of its package', () => {
-      const OTHER = { [APP_HCS]: '4.3.0', [APP_UNDICI]: '7.30.1', [SCANNER_UNDICI]: '6.29.1' };
+      const OTHER = { [APP_HCS]: '4.3.0', [SCANNER_XJJ6]: '6.29.1', [SCANNER_2M5V]: '6.29.1', [SCANNER_QRXM]: '6.29.1' };
       for (const id of IDS) {
         const r = decide(replace(id, { version: OTHER[id] }));
         assert.equal(r.outcome, 'blocking', id);
@@ -527,7 +567,7 @@ describe('the committed policy of THIS repository', () => {
       assert.deepEqual(status(lapsed, APP_HCS).problems, ['expired on 2026-12-31']);
     });
 
-    it('CONTRACT: both undici records expire at 00:00 UTC on 2026-11-30 — valid through the second before, refused from it', () => {
+    it('CONTRACT: the three undici records expire at 00:00 UTC on 2026-11-30 — valid through the second before, refused from it', () => {
       const before = decide(subjects(), { now: '2026-11-29T23:59:59Z' });
       assert.equal(before.outcome, 'exceptions_only');
       assert.equal(before.counts.excepted, IDS.length);

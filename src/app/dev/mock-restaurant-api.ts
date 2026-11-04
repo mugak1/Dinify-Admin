@@ -281,10 +281,27 @@ export class MockRestaurantApi implements RestaurantApi {
     restaurantId: string,
     request: SetPaymentTimingRequest,
   ): Observable<CommercialMutationResult> {
-    return this.writeAxis(restaurantId, request, PAYMENT_TIMINGS, (commercial, axis) => ({
-      ...commercial,
-      payment_timing: axis as CommercialAxis<PaymentTiming>,
-    }));
+    return this.writeAxis(
+      restaurantId,
+      request,
+      PAYMENT_TIMINGS,
+      (commercial, axis) => ({
+        ...commercial,
+        payment_timing: axis as CommercialAxis<PaymentTiming>,
+      }),
+      // The backend refuses `pay_first` until its Step 4 (Step 2, PR BE-B): a 409 with
+      // its own code, decided before the stored value is read, so even a restaurant
+      // already on `pay_first` asking for it again is refused rather than no-op'd. A
+      // stored `pay_first` (the fixtures have some) can still be moved to `pay_after`.
+      (value) =>
+        value === 'pay_first'
+          ? {
+              status: 409,
+              message: 'Pay first is not available yet.',
+              code: 'payment_timing_pay_first_unavailable',
+            }
+          : null,
+    );
   }
 
   setPaymentCollectionMode(
@@ -300,16 +317,17 @@ export class MockRestaurantApi implements RestaurantApi {
   /**
    * One axis write, applying the SERVER'S OWN RULES in the server's own order.
    *
-   * Refusals first (vocabulary, reason, then concurrency), then the same-state no-op,
-   * then the real mutation — because a request that is malformed is refused before its
-   * concurrency assertion is even considered, and a same-state retry succeeds even when
-   * that assertion has gone stale.
+   * Refusals first (vocabulary, reason, then any value the writer does not accept yet,
+   * then concurrency), then the same-state no-op, then the real mutation — because a
+   * request that is malformed is refused before its concurrency assertion is even
+   * considered, and a same-state retry succeeds even when that assertion has gone stale.
    */
   private writeAxis(
     restaurantId: string,
     request: { value: string; expected_current: string | null; reason: string },
     vocabulary: readonly string[],
     apply: (commercial: CommercialSummary, axis: CommercialAxis<string>) => CommercialSummary,
+    refuse: (value: string) => Record<string, unknown> | null = () => null,
   ): Observable<CommercialMutationResult> {
     const found = this.findDetail(restaurantId);
     if (!found) {
@@ -340,6 +358,12 @@ export class MockRestaurantApi implements RestaurantApi {
         reason: [`Please state a reason of at least ${MIN_REASON_LENGTH} characters.`],
       });
     }
+
+    // The DOMAIN writer's refusal of a value it does not accept yet. On the server it
+    // runs after the serializer (so after the checks above) and before any state is
+    // read, which is why it precedes the same-state no-op and the stale lever.
+    const refusal = refuse(request.value);
+    if (refusal) return this.throwLater(409, refusal);
 
     const commercial = this.commercialFor(restaurantId, found.commercial);
     const current = this.axisOf(commercial, vocabulary).value;

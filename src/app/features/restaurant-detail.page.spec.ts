@@ -1433,6 +1433,93 @@ describe('RestaurantOverviewTab', () => {
       flush();
     }));
 
+    // --- the backend's pay_first refusal (Step 2, PR BE-B, until its Step 4) ----------
+
+    const PAY_FIRST_REFUSAL = () =>
+      throwError(() => ({
+        status: 409,
+        error: {
+          status: 409,
+          message: 'Pay first is not available yet.',
+          code: 'payment_timing_pay_first_unavailable',
+        },
+      }));
+
+    it('shows the server’s pay_first refusal and keeps the editor, the draft and the token', fakeAsync(async () => {
+      // A 409 like the stale one, and the opposite instruction: nothing moved, so the
+      // operator is told the real reason, keeps what they typed, and nothing is re-read.
+      api.answer = () => of(detail({ commercial: commercial({ timing: 'pay_after' }) }));
+      await loaded();
+      api.writeAnswer = PAY_FIRST_REFUSAL;
+
+      openEditor('Payment timing');
+      chooseAndReason('pay_first');
+      saveButton().click();
+      harness.detectChanges();
+
+      expect(api.writes.length).withContext('one attempt, never retried').toBe(1);
+      expect(editor()).withContext('the editor stays open').not.toBeNull();
+      expect(editor()!.textContent).toContain('Pay first is not available yet.');
+      expect(commercialText()).not.toContain('Configuration changed since you loaded it');
+      expect(commercialText()).not.toContain('Review the current value');
+      expect(
+        editor()!.querySelector<HTMLTextAreaElement>('[data-commercial-reason]')!.value,
+      ).withContext('draft preserved').toBe(REASON);
+      expect(api.detailCalls.length).withContext('no reload: the screen is not stale').toBe(1);
+      expect(axisValue('payment_timing')).toBe('Pay after');
+      flush();
+    }));
+
+    it('lets the operator choose another value straight away, with the SAME token', fakeAsync(async () => {
+      // Loaded unconfigured. The refusal moved nothing, so the next attempt still asserts
+      // the value the operator reviewed (explicit null), not a token re-read or cleared.
+      await loaded();
+      api.writeAnswer = PAY_FIRST_REFUSAL;
+
+      openEditor('Payment timing');
+      chooseAndReason('pay_first');
+      saveButton().click();
+      harness.detectChanges();
+      expect(editor()!.textContent).toContain('Pay first is not available yet.');
+
+      api.writeAnswer = () => of({ changed: true, commercial: commercial({ timing: 'pay_after' }) });
+      chooseAndReason('pay_after');
+      saveButton().click();
+      harness.detectChanges();
+
+      expect(api.writes.length).toBe(2);
+      expect(api.writes[0].body['expected_current']).toBeNull();
+      expect(api.writes[1].body['expected_current']).withContext('the same reviewed token').toBeNull();
+      expect(api.writes[1].body['value']).toBe('pay_after');
+      expect(editor()).withContext('closed on success').toBeNull();
+      expect(axisValue('payment_timing')).toBe('Pay after');
+      expect(commercialText()).toContain('Payment timing recorded.');
+      expect(commercialText()).not.toContain('Pay first is not available yet.');
+      flush();
+    }));
+
+    it('still treats a 409 WITHOUT that code as a conflict, and reloads', fakeAsync(async () => {
+      // The control: only the code changes the outcome. A 409 carrying the refusal's
+      // sentence but the stale code (or no code) is the concurrency path, unchanged.
+      await loaded();
+      api.writeAnswer = () =>
+        throwError(() => ({
+          status: 409,
+          error: { status: 409, message: 'Pay first is not available yet.', code: 'stale_service_configuration' },
+        }));
+
+      openEditor('Payment timing');
+      chooseAndReason('pay_first');
+      saveButton().click();
+      harness.detectChanges();
+
+      expect(editor()).toBeNull();
+      expect(text()).toContain('Configuration changed since you loaded it');
+      expect(api.detailCalls.length).withContext('reload requested').toBe(2);
+      tick();
+      flush();
+    }));
+
     it('REFUSES A NEW DECISION until the post-conflict reload has landed', fakeAsync(async () => {
       // THE REGRESSION THIS EXISTS FOR. Handling a 409 releases the write slot and starts
       // a replacement GET — but the tab outlet stays mounted through the loading state,

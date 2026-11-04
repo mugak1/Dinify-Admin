@@ -27,6 +27,25 @@ export function extractErrorMessage(error: unknown, fallback = 'Something went w
 }
 
 /**
+ * The machine-readable `code` an admin-plane refusal carries, or null.
+ *
+ * The elevated commercial writes answer a domain refusal as `{"status": 409, "message":
+ * "...", "code": "stale_service_configuration"}`. Two 409s on one route can call for
+ * different reactions, and only the code can tell them apart: a STALE configuration
+ * means "reload and look again", while `payment_timing_pay_first_unavailable` (backend
+ * Step 2, PR BE-B) means "that value is not accepted yet", and nothing moved.
+ *
+ * Read the same way as the message (`unwrap` first), so the development mock's
+ * `Error`-subclass carrier and a real `HttpErrorResponse` give one answer.
+ */
+export function extractErrorCode(error: unknown): string | null {
+  const body = unwrap(error);
+  if (!isRecord(body)) return null;
+  const code = body['code'];
+  return typeof code === 'string' && code ? code : null;
+}
+
+/**
  * Get to the response BODY, whatever is carrying it.
  *
  * Order matters. An error object with an `error` property is unwrapped BEFORE the

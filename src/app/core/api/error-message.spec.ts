@@ -1,7 +1,12 @@
 import { HttpErrorResponse } from '@angular/common/http';
 
 import { ELEVATION_REQUIRED_DETAIL } from './api.constants';
-import { extractDetail, extractErrorMessage, extractNestedFieldErrors } from './error-message';
+import {
+  extractDetail,
+  extractErrorCode,
+  extractErrorMessage,
+  extractNestedFieldErrors,
+} from './error-message';
 
 function httpError(status: number, body: unknown): HttpErrorResponse {
   return new HttpErrorResponse({ status, error: body });
@@ -142,5 +147,32 @@ describe('extractDetail', () => {
   it('returns null for a non-string detail', () => {
     expect(extractDetail(httpError(400, { detail: { nested: true } }))).toBeNull();
     expect(extractDetail(httpError(400, { detail: ['a', 'b'] }))).toBeNull();
+  });
+});
+
+/**
+ * `extractErrorCode` reads the machine-readable `code` a domain refusal carries. Two 409s
+ * on one route can mean opposite things (a stale configuration vs a value the server does
+ * not accept yet), and only the code tells them apart.
+ */
+describe('extractErrorCode', () => {
+  it('reads the code off a real HttpErrorResponse body', () => {
+    const body = { status: 409, message: 'Pay first is not available yet.', code: 'payment_timing_pay_first_unavailable' };
+    expect(extractErrorCode(httpError(409, body))).toBe('payment_timing_pay_first_unavailable');
+  });
+
+  it('reads it off the development mock carrier too', () => {
+    expect(extractErrorCode({ status: 409, error: { code: 'stale_service_configuration' } })).toBe(
+      'stale_service_configuration',
+    );
+  });
+
+  it('is null when there is no usable code', () => {
+    expect(extractErrorCode(httpError(409, { status: 409, message: 'Conflict.' }))).toBeNull();
+    expect(extractErrorCode(httpError(409, { code: '' }))).toBeNull();
+    expect(extractErrorCode(httpError(409, { code: 42 }))).toBeNull();
+    expect(extractErrorCode(httpError(500, '<html>'))).toBeNull();
+    expect(extractErrorCode(new Error('boom'))).toBeNull();
+    expect(extractErrorCode(undefined)).toBeNull();
   });
 });

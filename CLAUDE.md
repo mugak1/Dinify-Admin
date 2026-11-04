@@ -968,7 +968,7 @@ silently overwriting somebody else's decision.
 POST /api/admin/v1/restaurants/<uuid>/commercial/payment-timing/
 POST /api/admin/v1/restaurants/<uuid>/commercial/payment-collection-mode/
 
-{ "value": "pay_first", "expected_current": null, "reason": "…" }
+{ "value": "pay_after", "expected_current": null, "reason": "…" }
       -> 200 { "changed": true, "commercial": { …the canonical projection… } }
 ```
 
@@ -1053,6 +1053,7 @@ client discards the response, manufacturing an indeterminate outcome out of a ta
 | `changed: false` | adopt, close, "…was already set to that value. Nothing was changed." |
 | 400 | form and draft STAY OPEN, server's field errors beside the field they name |
 | 409 | no auto-retry, editor discarded, `reload()`, "review the current value" |
+| 409 `payment_timing_pay_first_unavailable` | the SERVER'S sentence in the editor; editor, draft and token KEPT; no reload |
 | 404 | editor discarded, `reload()` — the established not-found path takes the screen |
 | elevation cancelled | draft KEPT, "Nothing was changed." |
 | elevation abandoned | draft kept, global auth/outage state stays authoritative |
@@ -1062,6 +1063,21 @@ client discards the response, manufacturing an indeterminate outcome out of a ta
 when `expected_current` has gone stale, so a lost response followed by an exact retry is
 not a false conflict and does not re-stamp attribution. Nothing manufactures a fresh
 `set_at` for it, and it is never described as a new decision.
+
+**ONE 409 IS NOT A CONFLICT: THE `pay_first` REFUSAL.** Until its Step 4 the backend
+refuses `pay_first` on the timing route (backend Step 2, PR BE-B) with `409
+{"code": "payment_timing_pay_first_unavailable", "message": "Pay first is not available
+yet."}`. Nothing moved, so the concurrency outcome would be wrong in every part: it would
+say the configuration changed, throw away the operator's reason and re-read a screen that
+is not stale. `onWriteFailed` therefore checks THE CODE (`extractErrorCode`, never the
+prose) before the generic 409 branch, shows the server's sentence inside the open editor,
+keeps the draft and the captured token, and starts no reload; the operator can pick
+`pay_after` straight away under the same assertion. A restaurant already on `pay_first`
+keeps it and can be moved off it; the editor already refuses to re-save the stored value,
+so the UI cannot send that retry. The "Pay first" option stays selectable: against a
+backend that does not refuse it, this branch is never reached, so the Admin can deploy
+before or after the backend. When the backend's Step 4 removes the refusal, remove this
+branch and its mock refusal with it.
 
 **A 409 IS NEVER RETRIED AUTOMATICALLY.** Replaying with a fresh token would overwrite
 whatever the other operator just decided — the precise thing `expected_current` exists to
@@ -1112,7 +1128,8 @@ renders. Nothing generates a reason: no "Admin update", no "Changed via portal".
 
 ### MOCK MODE RUNS THE REAL INTERACTION
 `MockRestaurantApi` implements all five writes with the server's own rules in the server's
-own order — shape, reason, then the clock, then state, with same-state and exact-retry
+own order — shape, reason, then the clock (or, on payment timing, the `pay_first`
+refusal), then state, with same-state and exact-retry
 checked BEFORE the concurrency assertion. A successful write overlays the fixture so later reads (workspace AND
 directory) reflect it. **There is no mock-only UI path** and no simulated elevation: that
 machinery has its own tests, and a second implementation in a fixture would prove nothing

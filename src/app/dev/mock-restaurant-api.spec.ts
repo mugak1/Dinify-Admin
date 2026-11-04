@@ -419,3 +419,60 @@ describe('MockRestaurantApi — creation and owner invitation', () => {
     }));
   });
 });
+
+/**
+ * THE MOCK REFUSES `pay_first` AS THE SERVER DOES (backend Step 2, PR BE-B, until its
+ * Step 4): a 409 with the server's code and sentence, decided before the stored value is
+ * read, so `npm start` shows the same refusal a real backend gives.
+ */
+describe('MockRestaurantApi — the pay_first refusal', () => {
+  let api: MockRestaurantApi;
+  const ankole = byName('Ankole Grill House');
+
+  beforeEach(() => {
+    sessionStorage.clear();
+    spyOn(console, 'warn');
+    api = new MockRestaurantApi();
+  });
+
+  afterEach(() => sessionStorage.clear());
+
+  it('starts from a restaurant already on pay_first, as the fixture says', () => {
+    expect(ankole.commercial.payment_timing.value).toBe('pay_first');
+  });
+
+  it('refuses pay_first with the server’s 409, code and sentence, even as a retry of the stored value', fakeAsync(() => {
+    const refused = settle(
+      api.setPaymentTiming(ankole.id, { value: 'pay_first', expected_current: 'pay_first', reason: REASON }),
+    );
+    expect(refused.error?.status).toBe(409);
+    expect(body(refused.error)).toEqual({
+      status: 409,
+      message: 'Pay first is not available yet.',
+      code: 'payment_timing_pay_first_unavailable',
+    });
+
+    // Nothing moved: the stored pay_first is still there to be moved off.
+    const moved = settle(
+      api.setPaymentTiming(ankole.id, { value: 'pay_after', expected_current: 'pay_first', reason: REASON }),
+    );
+    expect(moved.value?.changed).toBeTrue();
+    expect(moved.value?.commercial.payment_timing.value).toBe('pay_after');
+  }));
+
+  it('refuses a malformed request as a 400 before the refusal is considered', fakeAsync(() => {
+    const short = settle(
+      api.setPaymentTiming(ankole.id, { value: 'pay_first', expected_current: 'pay_first', reason: 'short' }),
+    );
+    expect(short.error?.status).toBe(400);
+  }));
+
+  it('leaves the collection-mode axis alone', fakeAsync(() => {
+    const current = ankole.commercial.payment_collection_mode.value;
+    const value = current === 'offline' ? 'psp_online' : 'offline';
+    const written = settle(
+      api.setPaymentCollectionMode(ankole.id, { value, expected_current: current, reason: REASON }),
+    );
+    expect(written.value?.changed).toBeTrue();
+  }));
+});

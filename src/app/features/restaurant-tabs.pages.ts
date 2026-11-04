@@ -2,7 +2,11 @@ import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@a
 import { RouterLink } from '@angular/router';
 
 import { AdminServiceStatus } from '../core/api/service-status';
-import { extractErrorMessage, extractFieldErrors } from '../core/api/error-message';
+import {
+  extractErrorCode,
+  extractErrorMessage,
+  extractFieldErrors,
+} from '../core/api/error-message';
 import { classifyTransportFailure, extractRequestId } from '../core/api/transport-failure';
 import { CommandNotRunError } from '../core/auth/command-owner';
 import { ElevationAbandonedError, ElevationCancelledError } from '../core/auth/elevation.service';
@@ -274,6 +278,19 @@ const TERMS_COPY: Record<'record' | 'replace' | 'end', CommercialWriteCopy> = {
  */
 const COMMERCIAL_CONTINUITY_UNCONFIRMED =
   'This tab could not confirm that its admin session is still current, so this change was not run. Nothing was changed. Try again once the admin service is reachable.';
+
+/**
+ * The backend's refusal of `pay_first` (Step 2, PR BE-B), until its Step 4.
+ *
+ * A 409 like the stale-configuration one, and the opposite instruction: nothing moved and
+ * the token this editor holds is still good, so the editor and draft stay open and no
+ * re-read starts. Only the code separates the two, so the code is what is read. Against
+ * a backend that does not refuse `pay_first`, this branch is never reached.
+ */
+export const PAY_FIRST_UNAVAILABLE_CODE = 'payment_timing_pay_first_unavailable';
+
+/** Shown only if the refusal arrives without a message, which the backend never sends. */
+const PAY_FIRST_UNAVAILABLE_FALLBACK = 'Pay first is not available yet.';
 
 export function readStatus(error: unknown): number | null {
   if (typeof error !== 'object' || error === null) return null;
@@ -1501,6 +1518,20 @@ export class RestaurantOverviewTab {
     }
 
     const status = readStatus(error);
+
+    // A VALUE THE SERVER DOES NOT ACCEPT YET, NOT A CONFLICT. The backend refuses
+    // `pay_first` until payments exist (its Step 4) with a 409 carrying its own code and
+    // sentence. Treating it as the concurrency outcome below would tell the operator the
+    // configuration changed (it did not), throw away their reason and re-read a screen
+    // that is not stale. So: the server's sentence, the editor and the draft kept, the
+    // captured token kept (nothing moved, so it is still the value they reviewed), no
+    // reload. Checked BEFORE the generic 409 because the status alone cannot tell the two
+    // apart.
+    if (status === 409 && extractErrorCode(error) === PAY_FIRST_UNAVAILABLE_CODE) {
+      this.serviceStatus.markReachable();
+      this.writeError.set(extractErrorMessage(error, PAY_FIRST_UNAVAILABLE_FALLBACK));
+      return;
+    }
 
     // THE CONCURRENCY OUTCOME. Another write moved this axis after this screen took its
     // token. Not validation, not an outage, not a defect — and emphatically NOT retried

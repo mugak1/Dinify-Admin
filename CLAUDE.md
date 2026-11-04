@@ -2315,9 +2315,10 @@ a successful CI push to main, or on `workflow_dispatch`.
   README; the shared tests pin a captured real report from each npm repo as the control.
 - **Three exceptions are approved**, all `kind: exception`, `scope: tooling`: the scanner's
   bundled `undici` 6.29.0 (npm 11.21.1), one record per advisory — GHSA-xjj6-f33q-929c (#48,
-  2026-10-24) and GHSA-2m5v-pch6-74hx / GHSA-qrxm-fqhp-jwvm (#55, 2026-10-28) — all
-  `expires: 2026-11-30` (valid through 2026-11-29, lapsing at 00:00 UTC on 2026-11-30, never
-  extended automatically). The fix, 6.29.1, is bundled by no npm release this Node can run, and
+  2026-10-24) and GHSA-2m5v-pch6-74hx / GHSA-qrxm-fqhp-jwvm (#55, 2026-10-28) — all RENEWED
+  on 2026-11-04 (#58), NOT remediated, re-measured and re-approved, to
+  `expires: 2026-12-31` (valid through 2026-12-30, lapsing at 00:00 UTC on 2026-12-31, never
+  extended automatically; no npm release has been published since 2026-10-15). The fix, 6.29.1, is bundled by no npm release this Node can run, and
   a bundled package cannot be moved by the lock. The application `undici` record was removed
   REMEDIATED in #55 (`@angular/build` 21.2.29 pins 7.30.1).
   - **The application `http-cache-semantics` 4.2.0 record (#46) was removed on 2026-11-04,

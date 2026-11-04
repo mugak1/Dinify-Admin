@@ -386,6 +386,12 @@ describe('the committed policy of THIS repository', () => {
   // vulnerability"), npm's advisory feed stopped reporting it, and the record matched nothing.
   // http-cache-semantics 4.2.0 is unchanged in the lock. Its subject joins FORMER below, so if
   // the advisory is ever reinstated it blocks with nothing covering it.
+  //
+  // On 2026-11-04 (#58) the three scanner undici records were RENEWED, NOT remediated: no npm
+  // release has been published since 2026-10-15, so none bundles undici 6.29.1, and the records
+  // would have lapsed at 00:00 UTC on 2026-11-30. Each was re-measured and re-approved, with the
+  // same ids, subjects and scope, and a new expiry of 2026-12-31. A renewal is a new approval:
+  // it replaces the provenance below rather than adding to it.
   const GRAPH = {
     'scanner-undici-GHSA-xjj6-f33q-929c': 'scanner',
     'scanner-undici-GHSA-2m5v-pch6-74hx': 'scanner',
@@ -406,9 +412,9 @@ describe('the committed policy of THIS repository', () => {
   // by the pull request that added it, and none is renewed automatically.
   it('CONTRACT: the provenance and expiry of every approved record', () => {
     const PROVENANCE = {
-      'scanner-undici-GHSA-xjj6-f33q-929c': ['https://github.com/mugak1/Dinify-Admin/pull/48', '2026-10-24', '2026-11-30'],
-      'scanner-undici-GHSA-2m5v-pch6-74hx': ['https://github.com/mugak1/Dinify-Admin/pull/55', '2026-10-28', '2026-11-30'],
-      'scanner-undici-GHSA-qrxm-fqhp-jwvm': ['https://github.com/mugak1/Dinify-Admin/pull/55', '2026-10-28', '2026-11-30'],
+      'scanner-undici-GHSA-xjj6-f33q-929c': ['https://github.com/mugak1/Dinify-Admin/pull/58', '2026-11-04', '2026-12-31'],
+      'scanner-undici-GHSA-2m5v-pch6-74hx': ['https://github.com/mugak1/Dinify-Admin/pull/58', '2026-11-04', '2026-12-31'],
+      'scanner-undici-GHSA-qrxm-fqhp-jwvm': ['https://github.com/mugak1/Dinify-Admin/pull/58', '2026-11-04', '2026-12-31'],
     };
     assert.deepEqual(Object.keys(PROVENANCE), Object.keys(GRAPH));
     for (const record of policy.records) {
@@ -547,15 +553,19 @@ describe('the committed policy of THIS repository', () => {
       }
     });
 
-    it('CONTRACT: the three undici records expire at 00:00 UTC on 2026-11-30 — valid through the second before, refused from it', () => {
-      const before = decide(subjects(), { now: '2026-11-29T23:59:59Z' });
+    it('CONTRACT: the three undici records expire at 00:00 UTC on 2026-12-31 — valid through the second before, refused from it', () => {
+      // The previous expiry is no longer a boundary: the renewal (#58) carries the records past it.
+      const pastTheOldExpiry = decide(subjects(), { now: '2026-11-30T00:00:00Z' });
+      assert.equal(pastTheOldExpiry.outcome, 'exceptions_only');
+      assert.equal(pastTheOldExpiry.counts.excepted, IDS.length);
+      const before = decide(subjects(), { now: '2026-12-30T23:59:59Z' });
       assert.equal(before.outcome, 'exceptions_only');
       assert.equal(before.counts.excepted, IDS.length);
-      const lapsed = decide(subjects(), { now: '2026-11-30T00:00:00Z' });
+      const lapsed = decide(subjects(), { now: '2026-12-31T00:00:00Z' });
       assert.equal(lapsed.outcome, 'blocking');
       assert.equal(lapsed.counts.excepted, 0, 'no record is still in date');
       for (const id of UNDICI) {
-        assert.deepEqual(status(lapsed, id).problems, ['expired on 2026-11-30'], id);
+        assert.deepEqual(status(lapsed, id).problems, ['expired on 2026-12-31'], id);
         assert.equal(at(lapsed, SUBJECTS[id].path, SUBJECTS[id].advisory).disposition, 'open', id);
       }
     });

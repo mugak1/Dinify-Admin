@@ -248,21 +248,25 @@ through `@angular/cli` → `pacote` → `make-fetch-happen`. If the advisory is 
 widened, it blocks again with nothing covering it, which the CONTRACT pins.
 
 **The three cover the `undici` 6.29.0 bundled in the pinned scanner, npm 11.21.1, one
-record per advisory. All three expire on 2026-11-30: valid through 2026-11-29, and they lapse
-at 00:00 UTC on 2026-11-30 with no automatic extension.** The fix for all three is 6.29.1
+record per advisory. All three expire on 2026-12-31: valid through 2026-12-30, and they lapse
+at 00:00 UTC on 2026-12-31 with no automatic extension.** They were RENEWED on 2026-11-04
+(#58), NOT remediated, before their first expiry (2026-11-30): re-measured, re-approved, same
+ids, subjects and scope. The fix for all three is 6.29.1
 (published 2026-10-15), and no npm release bundles it: 11.21.1 is the latest npm 11.x and
-bundles 6.29.0, and npm 12.x needs Node 22 (12.2.1, the latest, bundles 6.29.0 too). A bundled
+bundles 6.29.0, and npm 12.x needs Node 22 (12.2.1, the latest, bundles 6.29.0 too). No npm
+release has been published since 2026-10-15. A bundled
 package cannot be moved by the lock or an override. Its only requirer in the bundle is
 `node-gyp`'s download code, which `npm audit` does not run. A scanner crash would leave the
 audit incomplete, which fails closed. Each record is removed in the change that moves the
 scanner to an npm bundling `undici` 6.29.1 or later.
 - `scanner-undici-GHSA-xjj6-f33q-929c` ("Denial of Service via unhandled error on excessive
-  content-encodings"), approved by the owner on 2026-10-24 (#48).
+  content-encodings"), first approved by the owner on 2026-10-24 (#48).
 - `scanner-undici-GHSA-2m5v-pch6-74hx` ("TLS certificate validation bypass via dropped tls
   options in Agent") and `scanner-undici-GHSA-qrxm-fqhp-jwvm` ("Denial of Service via TLS 1.2
-  certificate-changing renegotiation"), approved by the owner on 2026-10-28 (#55). Both are
+  certificate-changing renegotiation"), first approved by the owner on 2026-10-28 (#55). Both are
   inherited and dated reportable from 2026-10-27, so they were deferred only until 2026-11-03,
   when the scanner graph would have blocked.
+- All three renewed together on 2026-11-04 (#58), approval pending the owner's merge.
 
 In runs measured on 2026-10-24 with a load probe and positive controls, `ng version`, lint, the
 production build, the test suite and the scanner's exact audit argv against both graphs
@@ -276,6 +280,14 @@ any file under `node_modules/undici`, both reports were complete, and five posit
 requiring it in a worker thread and in a child process) each recorded 95 `undici` files, each
 in the expected process or thread.
 
+**Re-measured on 2026-11-04 for the renewal**, on Node 20.20.2, with the same two hooks loaded
+through `NODE_OPTIONS` so they reach every process and worker thread, and the scanner's exact
+argv and cwd with its scrubbed environment (only the probe's `NODE_OPTIONS` and output
+directory added). Against the application graph on `main` and the scanner's own graph, each
+audit resolved 582 module files and none under `node_modules/undici`, and both reports were
+complete. The same five positive controls each recorded 95 `undici` files, the worker-thread
+and child-process controls in the worker and the child rather than the parent.
+
 **`application-undici-GHSA-xjj6-f33q-929c` (#48) was removed on 2026-10-28 (#55), REMEDIATED.**
 `@angular/build` 21.2.29 pins `undici` 7.30.1, which fixes GHSA-xjj6-f33q-929c and the three
 other high advisories on 7.29.1 (GHSA-4w7w-5xrc-9h26, GHSA-2m5v-pch6-74hx,
@@ -284,7 +296,7 @@ GHSA-qrxm-fqhp-jwvm). `package.json` already allowed it, so the lock took it wit
 2026-10-24, so no record covers it either.
 
 With these records the audit is **`exceptions_only`**, and the headline says so. It is never
-"clean" or "no vulnerabilities". From 00:00 UTC on 2026-11-30 the three `undici` records are
+"clean" or "no vulnerabilities". From 00:00 UTC on 2026-12-31 the three `undici` records are
 refused as expired. A lapsed record's finding blocks, unless a new, separately approved record
 replaces it.
 
@@ -444,6 +456,10 @@ Measured locally on Node 20.20.2, credential-free, against the live advisory dat
 lower-severity tooling findings requiring triage (`glob`, `minimatch` in both graphs; `ip-address`
 and `undici` in the scanner graph). Nothing blocks, nothing is deferred, and no record is
 refused. The three remaining records lapse at 00:00 UTC on 2026-11-30.
+
+On 2026-11-04 (#58) the three scanner `undici` records were RENEWED to 2026-12-31, NOT
+remediated (above). Measured locally on Node 20.20.2 against the live advisory data, the audit
+is unchanged: **`exceptions_only`**, the same 17 findings, 3 under the renewed exceptions.
 
 ## How it runs
 

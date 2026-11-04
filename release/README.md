@@ -397,7 +397,8 @@ triage records"). The record set moved with it:
   the earlier of the 24-hour window and 00:00 UTC on 2026-12-31.
 - **That record was removed on 2026-11-04**, STALE, NOT a remediation: GitHub withdrew its
   advisory on 2026-10-28 (`dependency-audit/README.md`). The deadline is now set by the three
-  scanner `undici` records, which lapse at 00:00 UTC on 2026-11-30.
+  scanner `undici` records, which lapse at 00:00 UTC on 2026-12-31 since their renewal on
+  2026-11-04 (#58; they would have lapsed on 2026-11-30).
 
 The stub runs above were not repeated with the new scanner. What was checked instead, on
 2026-10-23, locally on Node 20 against `registry.npmjs.org`, credential-free: `assess()` over

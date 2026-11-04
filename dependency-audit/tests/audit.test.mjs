@@ -380,13 +380,18 @@ describe('the committed policy of THIS repository', () => {
   // release bundles 6.29.1), so two more scanner undici records joined, for GHSA-2m5v-pch6-74hx
   // and GHSA-qrxm-fqhp-jwvm, whose deferral ends at 00:00 UTC on 2026-11-03. Frontend carries
   // the same three scanner records.
+  //
+  // On 2026-11-04 the APPLICATION http-cache-semantics record was REMOVED, STALE, NOT
+  // remediated: GitHub WITHDREW GHSA-ch52-4w7c-c8xp on 2026-10-28 ("not a valid
+  // vulnerability"), npm's advisory feed stopped reporting it, and the record matched nothing.
+  // http-cache-semantics 4.2.0 is unchanged in the lock. Its subject joins FORMER below, so if
+  // the advisory is ever reinstated it blocks with nothing covering it.
   const GRAPH = {
-    'application-http-cache-semantics-GHSA-ch52-4w7c-c8xp': 'application',
     'scanner-undici-GHSA-xjj6-f33q-929c': 'scanner',
     'scanner-undici-GHSA-2m5v-pch6-74hx': 'scanner',
     'scanner-undici-GHSA-qrxm-fqhp-jwvm': 'scanner',
   };
-  it('CONTRACT: the approved records are exactly the http-cache-semantics and three scanner undici tooling exceptions, each pinned to its graph and well-formed as approved', () => {
+  it('CONTRACT: the approved records are exactly the three scanner undici tooling exceptions, each pinned to its graph and well-formed as approved', () => {
     assert.deepEqual(policy.records.map((r) => r.id), Object.keys(GRAPH));
     for (const record of policy.records) {
       assert.deepEqual(validateRecord(record, parseDate(record.approval.date)), [], record.id);
@@ -401,7 +406,6 @@ describe('the committed policy of THIS repository', () => {
   // by the pull request that added it, and none is renewed automatically.
   it('CONTRACT: the provenance and expiry of every approved record', () => {
     const PROVENANCE = {
-      'application-http-cache-semantics-GHSA-ch52-4w7c-c8xp': ['https://github.com/mugak1/Dinify-Admin/pull/46', '2026-10-23', '2026-12-31'],
       'scanner-undici-GHSA-xjj6-f33q-929c': ['https://github.com/mugak1/Dinify-Admin/pull/48', '2026-10-24', '2026-11-30'],
       'scanner-undici-GHSA-2m5v-pch6-74hx': ['https://github.com/mugak1/Dinify-Admin/pull/55', '2026-10-28', '2026-11-30'],
       'scanner-undici-GHSA-qrxm-fqhp-jwvm': ['https://github.com/mugak1/Dinify-Admin/pull/55', '2026-10-28', '2026-11-30'],
@@ -416,14 +420,13 @@ describe('the committed policy of THIS repository', () => {
   });
 
   // The approved records driven through the real evaluator with findings shaped exactly as the
-  // pinned scanner reports them, and the subjects of the six records removed since the scanner
+  // pinned scanner reports them, and the subjects of the seven records removed since the scanner
   // move. These pin what each committed record DOES cover and what it must keep refusing, and
   // that nothing committed covers a former subject if it is ever reported again (an advisory
   // reinstated or widened, the scanner rolled back, or @angular/build rolled back to a release
   // pinning undici 7.29.1). The generic rules themselves are pinned by the conformance vectors
   // and the core suite.
   describe('the approved exceptions against their exact subjects, and the former subjects', () => {
-    const APP_HCS = 'application-http-cache-semantics-GHSA-ch52-4w7c-c8xp';
     const SCANNER_XJJ6 = 'scanner-undici-GHSA-xjj6-f33q-929c';
     const SCANNER_2M5V = 'scanner-undici-GHSA-2m5v-pch6-74hx';
     const SCANNER_QRXM = 'scanner-undici-GHSA-qrxm-fqhp-jwvm';
@@ -433,7 +436,6 @@ describe('the committed policy of THIS repository', () => {
     const finding = (advisory, alias, pkg, version, path, severity = 'high', scope = 'tooling') => ({ advisory, aliases: [alias], package: pkg, version, path, scope, severity });
     const SCANNER_UNDICI_PATH = 'scanner:node_modules/npm/node_modules/undici';
     const SUBJECTS = {
-      [APP_HCS]: finding('GHSA-ch52-4w7c-c8xp', 'npm:1240991', 'http-cache-semantics', '4.2.0', 'application:node_modules/http-cache-semantics'),
       [SCANNER_XJJ6]: finding('GHSA-xjj6-f33q-929c', 'npm:1243114', 'undici', '6.29.0', SCANNER_UNDICI_PATH),
       [SCANNER_2M5V]: finding('GHSA-2m5v-pch6-74hx', 'npm:1243476', 'undici', '6.29.0', SCANNER_UNDICI_PATH),
       [SCANNER_QRXM]: finding('GHSA-qrxm-fqhp-jwvm', 'npm:1243479', 'undici', '6.29.0', SCANNER_UNDICI_PATH),
@@ -454,6 +456,8 @@ describe('the committed policy of THIS repository', () => {
       'application-braces-GHSA-vfj7-8cjw-p6xm': finding('GHSA-vfj7-8cjw-p6xm', 'npm:1240992', 'braces', '3.0.3', 'application:node_modules/braces'),
       'scanner-http-cache-semantics-GHSA-ch52-4w7c-c8xp': finding('GHSA-ch52-4w7c-c8xp', 'npm:1240991', 'http-cache-semantics', '4.2.0', 'scanner:node_modules/npm/node_modules/http-cache-semantics'),
       'application-undici-GHSA-xjj6-f33q-929c': APPLICATION_UNDICI['GHSA-xjj6-f33q-929c'],
+      // Withdrawn 2026-10-28, not fixed: the lock still carries 4.2.0. Reinstated, it blocks.
+      'application-http-cache-semantics-GHSA-ch52-4w7c-c8xp': finding('GHSA-ch52-4w7c-c8xp', 'npm:1240991', 'http-cache-semantics', '4.2.0', 'application:node_modules/http-cache-semantics'),
     };
     const clone = (f) => ({ ...f, aliases: [...f.aliases] });
     const subjects = () => Object.values(SUBJECTS).map(clone);
@@ -463,7 +467,6 @@ describe('the committed policy of THIS repository', () => {
     const status = (result, id) => result.records.find((r) => r.id === id);
     const at = (result, path, advisory) => result.findings.find((x) => x.path === path && x.advisory === advisory);
     const onlyRecords = (...ids) => policy.records.filter((x) => ids.includes(x.id));
-    const onlySubjects = (...ids) => ids.map((id) => clone(SUBJECTS[id]));
 
     it('CONTROL: each record excepts exactly its own subject, and the result says it passes only with exceptions', () => {
       const r = decide(subjects());
@@ -495,18 +498,6 @@ describe('the committed policy of THIS repository', () => {
       assert.equal(all.counts.blocking, Object.keys(FORMER).length);
       assert.equal(all.counts.excepted, IDS.length);
       assert.equal(all.counts.refusedRecords, 0);
-    });
-
-    it('CONTRACT: the scanner copy of http-cache-semantics is not covered by the application record', () => {
-      const scannerHcs = clone(FORMER['scanner-http-cache-semantics-GHSA-ch52-4w7c-c8xp']);
-      // Moved, not added: the application subject gone and only the scanner copy reported.
-      const r = decide([scannerHcs], { records: onlyRecords(APP_HCS) });
-      assert.equal(r.outcome, 'blocking');
-      assert.equal(status(r, APP_HCS).status, 'refused');
-      assert.ok(status(r, APP_HCS).problems.some((p) => p.includes(`path ${SUBJECTS[APP_HCS].path} matches no current finding`)));
-      const open = at(r, scannerHcs.path, scannerHcs.advisory);
-      assert.equal(open.disposition, 'open');
-      assert.equal(open.coveredBy, null);
     });
 
     it('CONTRACT: no scanner undici record covers the application copy of its advisory, and the node-gyp copy is covered by none', () => {
@@ -546,7 +537,7 @@ describe('the committed policy of THIS repository', () => {
     });
 
     it('CONTRACT: a record is not matched by any other version of its package', () => {
-      const OTHER = { [APP_HCS]: '4.3.0', [SCANNER_XJJ6]: '6.29.1', [SCANNER_2M5V]: '6.29.1', [SCANNER_QRXM]: '6.29.1' };
+      const OTHER = { [SCANNER_XJJ6]: '6.29.1', [SCANNER_2M5V]: '6.29.1', [SCANNER_QRXM]: '6.29.1' };
       for (const id of IDS) {
         const r = decide(replace(id, { version: OTHER[id] }));
         assert.equal(r.outcome, 'blocking', id);
@@ -556,25 +547,13 @@ describe('the committed policy of THIS repository', () => {
       }
     });
 
-    it('CONTRACT: the http-cache-semantics record expires at 00:00 UTC on 2026-12-31 — valid through the second before, refused from it', () => {
-      const own = { records: onlyRecords(APP_HCS) };
-      const before = decide(onlySubjects(APP_HCS), { ...own, now: '2026-12-30T23:59:59Z' });
-      assert.equal(before.outcome, 'exceptions_only');
-      assert.equal(before.counts.excepted, 1);
-      const lapsed = decide(onlySubjects(APP_HCS), { ...own, now: '2026-12-31T00:00:00Z' });
-      assert.equal(lapsed.outcome, 'blocking');
-      assert.equal(lapsed.counts.excepted, 0);
-      assert.deepEqual(status(lapsed, APP_HCS).problems, ['expired on 2026-12-31']);
-    });
-
     it('CONTRACT: the three undici records expire at 00:00 UTC on 2026-11-30 — valid through the second before, refused from it', () => {
       const before = decide(subjects(), { now: '2026-11-29T23:59:59Z' });
       assert.equal(before.outcome, 'exceptions_only');
       assert.equal(before.counts.excepted, IDS.length);
       const lapsed = decide(subjects(), { now: '2026-11-30T00:00:00Z' });
       assert.equal(lapsed.outcome, 'blocking');
-      assert.equal(lapsed.counts.excepted, 1, 'only the http-cache-semantics record is still in date');
-      assert.equal(status(lapsed, APP_HCS).status, 'applied');
+      assert.equal(lapsed.counts.excepted, 0, 'no record is still in date');
       for (const id of UNDICI) {
         assert.deepEqual(status(lapsed, id).problems, ['expired on 2026-11-30'], id);
         assert.equal(at(lapsed, SUBJECTS[id].path, SUBJECTS[id].advisory).disposition, 'open', id);

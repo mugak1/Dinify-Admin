@@ -2296,28 +2296,22 @@ a successful CI push to main, or on `workflow_dispatch`.
   container npm never writes (a list or `null` where the name map belongs) are INCOMPLETE,
   exit 2 — never zero findings. Reason codes and the pinned-scanner contract are in the
   README; the shared tests pin a captured real report from each npm repo as the control.
-- **Three exceptions are approved**, all `kind: exception`, `scope: tooling`.
-  - Application `http-cache-semantics` 4.2.0 (GHSA-ch52-4w7c-c8xp). The owner approved it on
-    2026-10-23 (#46). It replaces the 2026-10-07 record for the same subject (#42), which would
-    have lapsed on 31 October.
-  - `undici` GHSA-xjj6-f33q-929c (high), one record per graph, approved by the owner on
-    2026-10-24 (#48), both `expires: 2026-11-30`:
-    - application `undici` 7.29.1, pinned exactly by `@angular/build` (latest 21.2.28 included);
-    - scanner `undici` 6.29.0, bundled in npm 11.21.1, the latest 11.x.
-
-    Fixed releases exist (7.30.1, 6.29.1), but neither copy can take one without a
-    `package.json` or scanner change, and there are no overrides. `node-gyp`'s copy took 6.29.1
-    in the lock. In runs measured on 2026-10-24 with a load probe and positive controls, build,
-    test, lint, `ng version` and the scanner's audit argv loaded neither copy; `ng serve`
-    (whose SSR-only SSL plugin is the application copy's sole requirer) was source-traced.
-
-  The bullets below describe the http-cache-semantics record unless they say otherwise.
-  - **Expiry.** `expires: 2026-12-31`, so it is valid through 2026-12-30 and lapses at
-    00:00 UTC on 2026-12-31. It is not extended automatically, and from then its finding
-    blocks unless a new, separately approved record replaces it.
-  - **No fix.** The advisory lists no patched version. **http-cache-semantics 4.3.0 is NOT a
-    fix.** It only falls outside the scanner's recorded range; the vulnerable mechanism is
-    byte-identical, so it is deliberately not installed in the application graph.
+- **Three exceptions are approved**, all `kind: exception`, `scope: tooling`: the scanner's
+  bundled `undici` 6.29.0 (npm 11.21.1), one record per advisory — GHSA-xjj6-f33q-929c (#48,
+  2026-10-24) and GHSA-2m5v-pch6-74hx / GHSA-qrxm-fqhp-jwvm (#55, 2026-10-28) — all
+  `expires: 2026-11-30` (valid through 2026-11-29, lapsing at 00:00 UTC on 2026-11-30, never
+  extended automatically). The fix, 6.29.1, is bundled by no npm release this Node can run, and
+  a bundled package cannot be moved by the lock. The application `undici` record was removed
+  REMEDIATED in #55 (`@angular/build` 21.2.29 pins 7.30.1).
+  - **The application `http-cache-semantics` 4.2.0 record (#46) was removed on 2026-11-04,
+    STALE, NOT a remediation.** GitHub withdrew GHSA-ch52-4w7c-c8xp on 2026-10-28 ("not a
+    valid vulnerability"), npm's feed stopped reporting it, and the refused record made `main`
+    audit blocking (scheduled audit, 2026-11-02). 4.2.0 is unchanged in the lock; if the
+    advisory is reinstated it blocks with nothing covering it. In the same change
+    `follow-redirects` 1.16.1 → 1.16.2 lock-only (GHSA-mrwp-f3q8-3g9p, high, tooling, inherited
+    and deferred until 2026-11-06).
+  - The historical notes below are as they stood for the http-cache-semantics record while it
+    was approved.
   - **Applicability.** In the runs measured on 2026-10-23, build, test, lint and `ng version`
     did not load it. Package operations were traced in the source, not exercised.
   - **Five records were removed when the scanner moved to npm 11.21.1**, the first npm whose

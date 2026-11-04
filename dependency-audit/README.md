@@ -236,24 +236,18 @@ outranks every npmrc, so the invocation and the check cannot disagree.
 
 ## Exceptions and triage records
 
-**Four records are approved.** The first is
-**`application-http-cache-semantics-GHSA-ch52-4w7c-c8xp`, a
-`kind: "exception"` with `scope: "tooling"`, approved by the owner on 2026-10-23 (#46). It
-expires on 2026-12-31: valid through 2026-12-30, and it lapses at 00:00 UTC on 2026-12-31 with
-no automatic extension.** It replaces the record for the same subject approved on 2026-10-07
-(#42), which would have lapsed at 00:00 UTC on 2026-10-31. It covers `http-cache-semantics`
-4.2.0 in the APPLICATION graph (GHSA-ch52-4w7c-c8xp). It arrives through `@angular/cli`
-21.2.29 (21.2.28 when the record was approved; the chain below it is unchanged) → `pacote`
-21.5.1 → `make-fetch-happen` 15.0.6, and that traced consumer constructs
-its cache policy with `shared: false`. In the runs measured on 2026-10-23, build, test, lint and
-`ng version` did not load it. Package operations (`ng add`, `ng update`) were traced in the
-source, not exercised. The advisory lists no patched version and 4.3.0 is the latest release.
-**http-cache-semantics 4.3.0 is not a fix**: it falls outside the scanner's recorded range, but
-the vulnerable max-stale and shared `Set-Cookie` handling is byte-identical. Taking it in the
-application graph would hide the finding without remediating it, so it is deliberately not
-installed there.
+**Three records are approved**, all `kind: "exception"` with `scope: "tooling"`.
 
-**The other three cover the `undici` 6.29.0 bundled in the pinned scanner, npm 11.21.1, one
+**`application-http-cache-semantics-GHSA-ch52-4w7c-c8xp` (#46, approved 2026-10-23) was removed
+on 2026-11-04, STALE, NOT a remediation.** GitHub WITHDREW GHSA-ch52-4w7c-c8xp on 2026-10-28
+("not a valid vulnerability"), npm's advisory feed stopped reporting it (a bulk query for
+`http-cache-semantics` 4.2.0 returns nothing), and the record matched no finding, so the
+evaluator refused it and the audit blocked — on `main` too: the scheduled audit at `52643af`
+failed on 2026-11-02. `http-cache-semantics` 4.2.0 is unchanged in the lock and still arrives
+through `@angular/cli` → `pacote` → `make-fetch-happen`. If the advisory is reinstated or
+widened, it blocks again with nothing covering it, which the CONTRACT pins.
+
+**The three cover the `undici` 6.29.0 bundled in the pinned scanner, npm 11.21.1, one
 record per advisory. All three expire on 2026-11-30: valid through 2026-11-29, and they lapse
 at 00:00 UTC on 2026-11-30 with no automatic extension.** The fix for all three is 6.29.1
 (published 2026-10-15), and no npm release bundles it: 11.21.1 is the latest npm 11.x and
@@ -291,8 +285,8 @@ GHSA-qrxm-fqhp-jwvm). `package.json` already allowed it, so the lock took it wit
 
 With these records the audit is **`exceptions_only`**, and the headline says so. It is never
 "clean" or "no vulnerabilities". From 00:00 UTC on 2026-11-30 the three `undici` records are
-refused as expired, and from 00:00 UTC on 2026-12-31 the http-cache-semantics one is. A
-lapsed record's finding blocks, unless a new, separately approved record replaces it.
+refused as expired. A lapsed record's finding blocks, unless a new, separately approved record
+replaces it.
 
 **Five records were removed when the scanner moved to npm 11.21.1, and only three of the
 removals are remediations.** npm 11.21.1 is the first npm whose distributed tarball bundles
@@ -306,6 +300,9 @@ fixed copies; 11.19.1, 11.20.0 and 11.21.0 do not, and 12.x requires Node 22.22.
 | `scanner-http-cache-semantics-GHSA-ch52-4w7c-c8xp` | STALE, **NOT a remediation**: npm 11.21.1 bundles `http-cache-semantics` 4.3.0, outside the recorded range `<=4.2.0`, with the vulnerable mechanism unchanged. npm's own cache policies are still built with `shared: false` |
 | `application-braces-GHSA-vfj7-8cjw-p6xm` | STALE, **NOT a remediation**: GitHub WITHDREW GHSA-vfj7-8cjw-p6xm on 2026-10-23 ("not a practically exploitable vulnerability") and npm's advisory feed stopped reporting it. `braces` 3.0.3 is unchanged and still the latest release |
 
+A seventh, removed later: `application-http-cache-semantics-GHSA-ch52-4w7c-c8xp`, STALE, **NOT
+a remediation** (above).
+
 If either stale advisory is reinstated or widened, or the scanner is rolled back, the
 finding blocks again with no record. The CONTRACT in `tests/audit.test.mjs` pins that.
 
@@ -317,7 +314,7 @@ has none.
 The CONTRACT in `tests/audit.test.mjs` pins the set by id, graph, kind, scope, provenance and
 expiry. It drives each record through the real evaluator against its exact subject, asserts
 what it must keep refusing (including the application graph's `undici` copy, `node-gyp`'s,
-and another advisory on the same scanner node), and drives the six former subjects through the
+and another advisory on the same scanner node), and drives the seven former subjects through the
 evaluator, each of which must block with nothing covering it.
 
 Several advisories with a supported fixed release were fixed in the lock instead of being
@@ -431,6 +428,22 @@ approved exceptions and 7 requiring triage. #55 answers it as follows:
 Measured at 19:00 UTC, local on Node 20.20.0 and credential-free, the audit is
 **`exceptions_only`** with 7 findings: 4 under approved exceptions, 3 requiring triage, none
 deferred and none blocking. No record is refused.
+
+On 2026-11-04 `main` (`52643af`) audited **blocking**, as the scheduled audit had on
+2026-11-02: the `http-cache-semantics` record was refused as stale (its advisory withdrawn on
+2026-10-28), and `follow-redirects` 1.16.1 (GHSA-mrwp-f3q8-3g9p, high, tooling, karma →
+`http-proxy`) was deferred as an inherited finding until 00:00 UTC on 2026-11-06, after which it
+would block. The change that answers it:
+- Lock-only, in range: `npm update follow-redirects` moves karma's copy 1.16.1 → 1.16.2 (the
+  advisory's range is `>=1.16.0 <=1.16.1`; 1.16.2 was published 2026-10-25). One lock entry, no
+  `package.json` edit and no override.
+- The stale `http-cache-semantics` record removed.
+
+Measured locally on Node 20.20.2, credential-free, against the live advisory data, the audit is
+**`exceptions_only`** with 17 findings: 3 under the scanner `undici` exceptions and 14
+lower-severity tooling findings requiring triage (`glob`, `minimatch` in both graphs; `ip-address`
+and `undici` in the scanner graph). Nothing blocks, nothing is deferred, and no record is
+refused. The three remaining records lapse at 00:00 UTC on 2026-11-30.
 
 ## How it runs
 

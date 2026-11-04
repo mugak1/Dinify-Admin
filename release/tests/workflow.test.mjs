@@ -31,6 +31,7 @@ import { sha256Hex } from '../lib/tree.mjs';
 import { EVAL_RUN_ID, REPO_ROOT, evaluatedProject, git } from './fixtures.mjs';
 import { advisoryBody, cannedAdvisories, npmReport, via } from '../../dependency-audit/tests/project.mjs';
 import { remoteScriptOf } from './host-model.mjs';
+import { REPLAY_BASE, REPLAY_MERGES, apiTree, replayTree, servedCI } from './shipped-fixtures.mjs';
 
 const DEPLOY_TEXT = readFileSync(join(REPO_ROOT, '.github/workflows/deploy.yml'), 'utf8');
 const DEPLOY = parseYaml(DEPLOY_TEXT);
@@ -347,6 +348,204 @@ printf '%s\\n${code}' '${body}'`;
       assert.notEqual(r.outputs.proceed, 'true');
     });
   }
+});
+
+describe('EXECUTED: no shipped change, no deploy — the guard with the REAL classifier, against stubbed curl and gh', () => {
+  const guard = step(PRIV, 'Forward-only ordering guard (automatic runs only)');
+  const SERVED = 'b2'.repeat(20);
+  const TARGET = 'a1'.repeat(20);
+  const blob = (c) => c.repeat(40);
+  const BASE = [['src/main.ts', '100644', blob('1')], ['README.md', '100644', blob('2')], ['package.json', '100644', blob('3')]];
+  const REPO = '/repos/mugak1/Dinify-Admin/';
+  const key = (endpoint) => endpoint.replace(REPO, '').replace(/[^A-Za-z0-9]/g, '_');
+  const curl = (body, { code = 200 } = {}) => `
+d=""; prev=""
+for a in "$@"; do [ "$prev" = "-D" ] && d="$a"; prev="$a"; done
+[ -n "$d" ] && printf 'HTTP/2 ${code}\\ncache-control: no-store\\n' > "$d"
+printf '%s\\n${code}' '${body}'`;
+  // Every endpoint is a file in $FIX; one that is not there answers 404 and exits 1.
+  const gh = `k="$(printf '%s' "$2" | sed 's#^${REPO}##' | tr -c 'A-Za-z0-9' '_')"
+if [ -f "$FIX/$k" ]; then cat "$FIX/$k"; else echo '{"message":"Not Found"}'; exit 1; fi`;
+  const node = (classifier = '') => `[ "$2" = served ] && { echo '{"mismatched":[],"unreachable":[]}'; exit 1; }
+${classifier}
+exec "$REAL_NODE" "$@"`;
+
+  /**
+   * One guard run. `served`/`target` are API documents ({commit, tree}); `ci` the served
+   * commit's CI facts (servedCI); `only` limits which endpoints answer.
+   */
+  function guardRun({ source = 'automatic', servedSha = SERVED, targetSha = TARGET, served, target, ci, compare = ['ahead', servedSha], release = servedSha, releaseCode = 200, only, classifier } = {}) {
+    const cwd = mkdtempSync(join(tmpdir(), 'shipped-guard-'));
+    const fix = join(cwd, 'fix');
+    try {
+      mkdirSync(fix);
+      mkdirSync(join(cwd, 'facts'));
+      symlinkSync(REPO_ROOT, join(cwd, 'trusted'));
+      const s = served ?? apiTree(servedSha, blob('5'), BASE);
+      const t = target ?? apiTree(targetSha, blob('6'), [...BASE.slice(0, 1), ['README.md', '100644', blob('9')], BASE[2]]);
+      writeFileSync(join(cwd, 'facts', 'commit.json'), JSON.stringify(t.commit));
+      writeFileSync(join(cwd, 'facts', 'tree.json'), JSON.stringify(t.tree));
+      const c = ci ?? servedCI(servedSha);
+      const endpoints = {
+        [`compare/${servedSha}...${targetSha}`]: { status: compare[0], merge_base_commit: { sha: compare[1] } },
+        [`git/commits/${servedSha}`]: s.commit,
+        [`git/trees/${s.commit.tree.sha}?recursive=1`]: s.tree,
+        'actions/workflows/ci.yml': c.ciWorkflow,
+        [`actions/workflows/ci.yml/runs?head_sha=${servedSha}&branch=main&event=push&status=success&per_page=100`]: c.runs,
+        [`actions/runs/${c.run.id}`]: c.run,
+        [`actions/runs/${c.run.id}/artifacts?per_page=100`]: c.artifacts,
+      };
+      for (const [e, body] of Object.entries(endpoints)) if (!only || only.includes(e.split('/')[0])) writeFileSync(join(fix, key(REPO + e)), JSON.stringify(body));
+      const r = execStep(guard.run, {
+        cwd,
+        env: { TARGET_SHA: targetSha, SOURCE: source, PUBLIC_HOST: 'admin.example.invalid', GITHUB_RUN_ID: '1', GITHUB_RUN_ATTEMPT: '1', FIX: fix, REAL_NODE: process.execPath },
+        stubs: { curl: curl(release, { code: releaseCode }), gh, node: node(classifier) },
+      });
+      const json = join(cwd, 'shipped-change.json');
+      return { ...r, decisionFile: existsSync(json) ? JSON.parse(readFileSync(json, 'utf8')) : null };
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  }
+  const outcome = (r) => [r.status, r.outputs.proceed, r.outputs.decision];
+
+  it('CONTROL: documentation only, served candidate retained with 30 days left → AUTO-SKIP-NO-SHIPPED-CHANGE, with the exact reason', () => {
+    const r = guardRun();
+    assert.deepEqual(outcome(r), [0, 'false', 'AUTO-SKIP-NO-SHIPPED-CHANGE'], r.stderr);
+    assert.equal(r.outputs.reason, `No shipped change since ${SERVED}; not deployed`);
+    assert.equal(r.outputs.served_sha, SERVED);
+    assert.deepEqual(r.decisionFile.changed.map((c) => c.path), ['README.md']);
+    assert.match(r.calls, /gh api \/repos\/mugak1\/Dinify-Admin\/git\/trees\//);
+  });
+
+  it('CONTROL: one shipped path → AUTO-PROCEED, and the reason says which', () => {
+    const r = guardRun({ target: apiTree(TARGET, blob('6'), [['src/main.ts', '100644', blob('8')], ...BASE.slice(1)]) });
+    assert.deepEqual(outcome(r), [0, 'true', 'AUTO-PROCEED']);
+    assert.match(r.outputs.reason, /forward move \(1 shipped path changed since .*src\/main\.ts.*; deploying\)$/);
+  });
+
+  it('PRECEDENCE PAIR, through the guard: release/README.md skips, release/lib/shipped.mjs deploys', () => {
+    const add = (p) => apiTree(TARGET, blob('6'), [...BASE, [p, '100644', blob('8')]]);
+    assert.equal(guardRun({ target: add('release/README.md') }).outputs.decision, 'AUTO-SKIP-NO-SHIPPED-CHANGE');
+    assert.equal(guardRun({ target: add('release/lib/shipped.mjs') }).outputs.decision, 'AUTO-PROCEED');
+  });
+
+  it('REGRESSION: a symlink at an allowlisted path → AUTO-PROCEED', () => {
+    const r = guardRun({ target: apiTree(TARGET, blob('6'), [...BASE, ['docs/link.md', '120000', blob('8')]]) });
+    assert.deepEqual(outcome(r), [0, 'true', 'AUTO-PROCEED']);
+  });
+
+  describe('the served-candidate retention guard', () => {
+    it('CONTROL: retained with 30 days left → skip', () => {
+      assert.deepEqual(outcome(guardRun({ ci: servedCI(SERVED, { daysLeft: 30 }) })), [0, 'false', 'AUTO-SKIP-NO-SHIPPED-CHANGE']);
+    });
+    it('REGRESSION: 13 days left → AUTO-PROCEED, and shipped_check says why', () => {
+      const r = guardRun({ ci: servedCI(SERVED, { daysLeft: 13 }) });
+      assert.deepEqual(outcome(r), [0, 'true', 'AUTO-PROCEED']);
+      assert.match(r.outputs.shipped_check, /\((12\.9|13) days left; at least 14 required\); deploying$/);
+    });
+    it('REGRESSION: the candidate missing → AUTO-PROCEED', () => {
+      const r = guardRun({ ci: servedCI(SERVED, { artifact: false }) });
+      assert.deepEqual(outcome(r), [0, 'true', 'AUTO-PROCEED']);
+      assert.match(r.outputs.shipped_check, /certification_no_candidate/);
+    });
+    it('REGRESSION: an unreadable expiry → AUTO-PROCEED', () => {
+      const r = guardRun({ ci: servedCI(SERVED, { expiresAt: null }) });
+      assert.deepEqual(outcome(r), [0, 'true', 'AUTO-PROCEED']);
+      assert.match(r.outputs.shipped_check, /states no readable expiry/);
+    });
+    it('REGRESSION: the run listing or artifact listing unreadable (API failure) → AUTO-PROCEED', () => {
+      for (const only of [['compare', 'git'], ['compare', 'git', 'actions/workflows/ci.yml']]) {
+        assert.deepEqual(outcome(guardRun({ only })).slice(1), ['true', 'AUTO-PROCEED'], JSON.stringify(only));
+      }
+    });
+  });
+
+  for (const [label, opts, why] of [
+    ['a truncated served tree', { served: apiTree(SERVED, blob('5'), BASE, { truncated: true }) }, /truncated/],
+    ['every tree read failing (API failure)', { only: ['compare'] }, /could not compare the trees/],
+    ['a classifier that does not run to a decision', { classifier: '[ "$2" = shipped-change ] && exit 3' }, /did not run to a decision; deploying$/],
+    ['a classifier that prints nothing usable', { classifier: '[ "$2" = shipped-change ] && { echo "{}"; exit 0; }' }, /^the shipped-change check gave no reason; deploying$/],
+  ]) {
+    it(`FALL-THROUGH: ${label} → AUTO-PROCEED (deploys, as before the check existed)`, () => {
+      const r = guardRun(opts);
+      assert.deepEqual(outcome(r), [0, 'true', 'AUTO-PROCEED'], r.stderr);
+      assert.match(r.outputs.shipped_check, why);
+    });
+  }
+
+  it('CONTRACT: a manual dispatch never reaches the check, even with documentation only', () => {
+    const r = guardRun({ source: 'manual' });
+    assert.deepEqual(outcome(r), [0, 'true', 'MANUAL']);
+    assert.equal(r.calls, '');
+    assert.equal(r.outputs.shipped_check, undefined);
+  });
+
+  it('UNCHANGED: an unreadable served commit still fails closed red, never deploys and never skips', () => {
+    for (const opts of [{ releaseCode: 503 }, { release: 'not a sha' }]) {
+      const r = guardRun(opts);
+      assert.equal(r.status, 1, JSON.stringify(opts));
+      assert.equal(r.outputs.proceed, undefined);
+    }
+  });
+
+  it('UNCHANGED: divergent histories fail closed and a stale target skips — neither reads a tree', () => {
+    const diverged = guardRun({ compare: ['diverged', blob('e')] });
+    assert.equal(diverged.status, 1);
+    const stale = guardRun({ compare: ['behind', TARGET] });
+    assert.deepEqual(outcome(stale), [0, 'false', 'AUTO-SKIP-STALE']);
+    for (const r of [diverged, stale]) assert.doesNotMatch(r.calls, /git\/trees|shipped-change/);
+  });
+
+  it('REPLAY, through the guard: #57 and #56 deploy; #58 and #59 skip, #59 against #56 (still served)', () => {
+    let served = REPLAY_BASE;
+    const got = [];
+    for (const { pr, commit } of REPLAY_MERGES) {
+      const r = guardRun({ servedSha: served, targetSha: commit, served: replayTree(served), target: replayTree(commit), ci: servedCI(served) });
+      assert.equal(r.status, 0, r.stderr);
+      got.push([pr, served.slice(0, 7), r.outputs.decision]);
+      if (r.outputs.proceed === 'true') served = commit;
+    }
+    assert.deepEqual(got, [
+      ['#57', '52643af', 'AUTO-PROCEED'],
+      ['#56', 'd73dd04', 'AUTO-PROCEED'],
+      ['#58', '547e647', 'AUTO-SKIP-NO-SHIPPED-CHANGE'],
+      ['#59', '547e647', 'AUTO-SKIP-NO-SHIPPED-CHANGE'],
+    ]);
+  });
+});
+
+describe('EXECUTED: the job summary states what the shipped-change check decided', () => {
+  const record = step(PRIV, 'Record outcome');
+  const SERVED = 'b2'.repeat(20);
+  const summary = (env, file) => {
+    const cwd = mkdtempSync(join(tmpdir(), 'summary-'));
+    try {
+      if (file) writeFileSync(join(cwd, 'shipped-change.json'), JSON.stringify(file));
+      const out = join(cwd, 'summary.md');
+      const r = execStep(record.run, { cwd, env: { JOB_STATUS: 'success', TARGET_SHA: 'a1'.repeat(20), MODE: 'deploy', SOURCE: 'automatic', CI_RUN_ID: '7', SERVED_SHA: SERVED, GITHUB_STEP_SUMMARY: out, ...env } });
+      assert.equal(r.status, 0, r.stderr);
+      return readFileSync(out, 'utf8');
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  };
+
+  it('CONTRACT: a skip says "No shipped change since <served>; not deployed", lists what changed and the retention, and that nothing was deployed', () => {
+    const s = summary(
+      { PROCEED: 'false', DECISION: 'AUTO-SKIP-NO-SHIPPED-CHANGE', ORDER_REASON: `No shipped change since ${SERVED}; not deployed`, KIND: 'certified', CERT_RUN: '7', CERT_ATTEMPT: '1', CERT_ARTIFACT: '77', CERT_DIGEST: `sha256:${'a'.repeat(64)}`, PAYLOAD_TREE: 'c'.repeat(64), ARCHIVE_SHA256: 'd'.repeat(64), DEADLINE_EPOCH: '1790515658' },
+      { changed: [{ path: 'README.md', change: 'modified' }, { path: 'docs/a.md', change: 'added' }], retention: { detail: 'admin-candidate-1-1 is retained until 2026-12-04T22:00:00.000Z (30 days left)' } },
+    );
+    assert.match(s, /^## Admin automatic deployment SKIPPED — AUTO-SKIP-NO-SHIPPED-CHANGE$/m);
+    assert.match(s, new RegExp(`^No shipped change since \`${SERVED}\`; not deployed\\.$`, 'm'));
+    assert.match(s, /^ {2}- `README\.md` \(modified\)$/m);
+    assert.match(s, /^ {2}- `docs\/a\.md` \(added\)$/m);
+    assert.match(s, /Served candidate retention: admin-candidate-1-1 is retained until 2026-12-04T22:00:00\.000Z \(30 days left\)/);
+    assert.match(s, /\*\*Nothing was deployed\.\*\*/);
+  });
+
+  it('CONTRACT: a forward move the check let through says why it deploys', () => {
+    const why = 'no shipped change since x, but its CI candidate cannot stay the rollback target: admin-candidate-1-1 expires 2026-11-17T22:00:00.000Z (13 days left; at least 14 required); deploying';
+    const s = summary({ PROCEED: 'true', DECISION: 'AUTO-PROCEED', ORDER_REASON: 'forward', SHIPPED_CHECK: why });
+    assert.ok(s.includes(`- Shipped-change check: ${why}`));
+    assert.doesNotMatch(s, /No shipped change since `/);
+  });
 });
 
 describe('EXECUTED: the privileged verify step, running the REAL verifier from a fixture checkout', () => {

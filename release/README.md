@@ -438,6 +438,7 @@ These are automatic runs only. Manual runs are never subject to them.
 | served vs target | decision |
 |---|---|
 | target descends from the served commit | `AUTO-PROCEED` |
+| target descends from the served commit, no changed path ships, and the served candidate is retained with ≥ 14 days left | `AUTO-SKIP-NO-SHIPPED-CHANGE` (below) |
 | same commit, **every** admitted file matches publicly | `AUTO-SKIP-IDENTICAL-ARTIFACT` |
 | same commit, some file differs or is unreachable | `AUTO-SKIP-SAME-COMMIT`. Nothing deployed, and the summary says this is **not** evidence that this candidate is served |
 | target is an ancestor of the served commit | `AUTO-SKIP-STALE` |
@@ -445,6 +446,53 @@ These are automatic runs only. Manual runs are never subject to them.
 
 An automatic run whose target predates the contract is refused at `prepare`: it fails
 red, and is not a green skip. Only a re-run of a pre-merge CI run can produce one.
+
+### No shipped change, no deploy
+
+Dinify-Frontend approves exact Admin commits, so every move of the served commit needs a
+reviewed frontend refresh. When the target descends from the served commit, the guard
+asks the trusted verifier whether anything Admin ships changed
+(`node trusted/release/cli.mjs shipped-change --served --target --facts facts
+--served-facts served-facts`, deciding in `lib/shipped.mjs`, which is pure). The guard
+gathers the facts best effort through the API with the job's existing `actions: read`:
+the served commit and its recursive tree, `ci.yml`, the served commit's successful
+push-to-main runs (one is chosen by the existing `choose-run` rule), that run and its
+artifact listing. The target's commit and tree are the `facts/` the job already read.
+
+It **skips** (`AUTO-SKIP-NO-SHIPPED-CHANGE`, green, no AWS) only when both hold:
+
+1. **No changed path ships.** The trees are compared by path, mode and object, and both
+   sides of every change are judged.
+   - **Not shipped (the allowlist):** `**/*.md`, `docs/**`, `dependency-audit/**` except
+     `dependency-audit/scanner/**`, `.github/workflows/claude.yml`,
+     `.github/workflows/claude-code-review.yml`.
+   - **Always shipped, winning over the allowlist:** `src/**`, `public/**`,
+     `package*.json`, `angular.json`, `tsconfig*.json`, `tailwind.config.js` (those four by
+     basename), `.github/workflows/ci.yml`, `.github/workflows/deploy.yml`,
+     `dependency-audit/scanner/**`.
+   - **Everything else ships by default**, `release/` included: `release/README.md` skips
+     but `release/lib/shipped.mjs` deploys, so a change to the allowlist itself always
+     deploys.
+   - **Only regular files** (`100644`, `100755`) can be skipped.
+2. **The served candidate stays a valid rollback target.** The served commit's certified
+   candidate (selected as `select` selects it) must be retained with at least
+   `RETENTION_MIN_DAYS` (14) days left. Otherwise the target deploys and the summary says
+   why, so the certified rollback and Dinify-Frontend's journey gate never sit on an
+   artifact about to expire.
+
+| inside the check | result |
+|---|---|
+| every changed path not shipped, candidate retained ≥ 14 days | `AUTO-SKIP-NO-SHIPPED-CHANGE` |
+| a shipped path changed | `AUTO-PROCEED` |
+| candidate missing, expired, < 14 days, ambiguous run, unreadable expiry | `AUTO-PROCEED` |
+| unreadable or truncated tree, API failure, classifier error or no decision | `AUTO-PROCEED` |
+
+Outside the check nothing moved: an unreadable served commit and divergent histories fail
+closed, a stale target is `AUTO-SKIP-STALE`, and a manual dispatch never reaches it. The
+skip's summary reads `No shipped change since <served>; not deployed.`, followed by the
+changed paths (up to 20) and the retention. A forward move the check let through reports
+`Shipped-change check: <why>`. The served commit may therefore lag `main`; nothing here
+approves a commit.
 
 ## Legacy rollback — the approval point
 
@@ -534,7 +582,8 @@ runs' own records, read through the GitHub API. None of it is a later live probe
 rest on the source, the suites and the local host model:
 - certified rollback;
 - same-commit directory reuse;
-- the `AUTO-SKIP-*` decisions, including refusing a stale automatic run;
+- the `AUTO-SKIP-*` decisions, including refusing a stale automatic run and
+  `AUTO-SKIP-NO-SHIPPED-CHANGE`;
 - the host refusing a lapsed deadline or a payload-tree mismatch;
 - DEGRADED and restore-previous;
 - a legacy rollback under this procedure.
@@ -569,6 +618,7 @@ approved in Dinify-Frontend.
 | `remote` | the host procedure **as `deploy.yml` embeds it**, under a host model: install, identical reuse, **same-SHA substitution refused**, 9 hostile archives, digest mismatch, a consistent-but-different archive, the deadline at start and mid-install, certified and legacy rollback, health and `index.html` failures restoring, permissions. It also runs **the pre-change procedure** (`tests/baseline/remote-eb54c92.sh`, extracted verbatim and pinned to the history when present) against the same states as distinguishing controls |
 | `workflow` | the privilege boundary (static); certification ordering and gate skipping (simulated sequencing); the verifier's import graph; the remote-script writer, the upload re-hash and the ordering guard **executed** under stubs; and the verify step executing the **real CLI** from a fixture checkout |
 | `cli` | `choose-run` ambiguity; unknown options refused; the byte-for-byte served check against a local server |
+| `shipped` | the shipped-path table (allowlist, always-shipped precedence, lookalikes, the `release/README.md` / `release/lib/shipped.mjs` pair); the tree comparison (renames on both sides, symlinks and submodules shipped, truncated or malformed trees refused); the retention guard (30 days skips, 14 skips, 13 and 13.9 deploy, missing, expired, unreadable expiry, no run); the `shipped-change` CLI; the 4 November 2026 replay over this repository's own git objects. `workflow` executes the guard with the **real classifier** under stubbed `gh`/`curl` (skip, deploy, every fall-through, manual, unchanged fail-closed paths, the replay) and the summary step |
 
 **Mutation table.** Seventeen source mutations were each applied alone, and each failed
 a named subset:
@@ -606,6 +656,18 @@ Eight more were run for the source binding, and each failed only its own case or
 Every new regression case was first run against the unfixed code: 12 of the 13 failed,
 and the 13th is the control that must not change. The staged case was added after that
 run, to distinguish the index from the commit, and it is pinned by the last mutation.
+
+Six more were run for the shipped-change check (`shipped` and `workflow` together), and
+each failed named tests:
+
+| mutation | failed |
+|---|---|
+| the skip branch removed from the guard | 4 (the guard's skip control, the precedence pair, 30 days left and the replay through the guard) |
+| the allowlist winning over the always-shipped rules | 9 (seven always-shipped paths, the precedence case and renames out of or into `src/`) |
+| a symlink treated as skippable | 2 |
+| a truncated tree accepted | 3 |
+| the retention guard dropped | 15 |
+| the manual-dispatch exit removed | 2 |
 
 **Two pre-existing oracles were corrected, not deleted.**
 - `scripts/tests/mock-isolation.test.mjs` asserted that the deploy builds and gates the

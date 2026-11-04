@@ -167,6 +167,14 @@ Steps 3–10 are otherwise not built.
   `deploy.yml` no longer builds. Pre-contract releases (`eb54c92` and earlier) stay
   reachable by an unchanged, labelled LEGACY rollback, and retiring that is the owner's
   pending decision. See "Deployment" and `release/README.md`.
+- **No shipped change, no deploy: ✅ IMPLEMENTED, not yet exercised live.** An automatic
+  forward move that changes only paths on an explicit not-shipped allowlist
+  (documentation, `dependency-audit/` outside its scanner, the two Claude workflows), while
+  the served commit's candidate is retained with at least 14 days left, is a green
+  `AUTO-SKIP-NO-SHIPPED-CHANGE`: the served commit — and Dinify-Frontend's approval of it —
+  stays put, so the served commit may lag `main`. Anything the check cannot establish
+  deploys; a manual dispatch never reaches it. See "No shipped change, no deploy" under
+  "Deployment".
 
 ### What Step 1 deliberately does NOT claim
 The backend reports several concepts as unconfigured because the models behind them do
@@ -2460,7 +2468,9 @@ nothing more:
 - a certified ROLLBACK — the artifact for `a7ef20c` is retained until 2026-12-25 per its
   listing;
 - REUSE of an already-installed certified directory for the same commit;
-- the `AUTO-SKIP-*` decisions, including refusing a stale automatic run;
+- the `AUTO-SKIP-*` decisions, including refusing a stale automatic run and
+  `AUTO-SKIP-NO-SHIPPED-CHANGE` (below), whose first real skip will show in a later run's
+  summary;
 - the host REFUSING a lapsed assessment deadline or a payload-tree mismatch;
 - the **DEGRADED** outcome and the host restoring the previous release after a failed
   post-switch check;
@@ -2560,9 +2570,12 @@ real check rather than a cached echo.
 ### The two ways it runs
 
 **AUTOMATIC (`workflow_run`)** — after the Admin CI workflow completes successfully for
-a **push to main**, the exact SHA that CI certified is deployed. Never "whatever main is
-now": the target is the triggering run's `head_sha` and nothing else. Automatic runs are
-always `deploy` — there is no automatic rollback — and they are **forward-only** (below).
+a **push to main**, the exact SHA that CI certified is the target. Never "whatever main
+is now": the target is the triggering run's `head_sha` and nothing else. Automatic runs
+are always `deploy` — there is no automatic rollback — and they are **forward-only**
+(below). **The served commit may lag `main`**: a merge that changes no shipped input is
+not deployed (`AUTO-SKIP-NO-SHIPPED-CHANGE`, below), so `release.txt` keeps naming the
+last commit that did.
 
 `workflow_run.workflows` can only match a workflow's mutable DISPLAY NAME, so `"CI"` in
 the trigger is a coarse pre-filter GitHub forces on us and is **deliberately not the
@@ -2638,6 +2651,7 @@ so a stale automatic run never authenticates to AWS at all.
 | situation | decision | effect |
 |---|---|---|
 | target descends from served SHA | `AUTO-PROCEED` | deploy normally |
+| target descends from served SHA, nothing changed since it ships, and the served candidate is retained ≥ 14 days | `AUTO-SKIP-NO-SHIPPED-CHANGE` | green skip; no AWS, S3 or SSM; the served commit stays where it is |
 | target == served SHA and EVERY admitted file matches publicly | `AUTO-SKIP-IDENTICAL-ARTIFACT` | green no-op; no AWS, S3 or SSM |
 | target == served SHA but some file differs or is unreachable | `AUTO-SKIP-SAME-COMMIT` | green no-op that says it is NOT evidence this candidate is served; promote with a manual deploy if intended |
 | target is an ancestor of served SHA | `AUTO-SKIP-STALE` | green skip; no AWS, S3 or SSM |
@@ -2649,6 +2663,74 @@ capabilities that must stay available. 0C.1 proved them on the live host under t
 pre-contract procedure; a certified rollback has not yet run there. A skip is reported
 honestly in the job summary with the target, the served SHA and the reason; it is never
 dressed up as a deployment.
+
+### No shipped change, no deploy — `AUTO-SKIP-NO-SHIPPED-CHANGE`
+Dinify-Frontend's release-readiness evaluation approves EXACT Admin commits
+(`release/policy.json` there), so every move of the served commit turns it red until a
+reviewed frontend "Admin refresh" approves the new one. On 4 November 2026 four Admin
+merges moved it four times, and #59 (a Dependabot bump of the Claude workflows) landed
+between a refresh's preparation and its merge, so that refresh approved a commit Admin no
+longer served. A merge that changes nothing Admin ships now leaves the served commit, and
+any approval of it, where they were. **Nothing here approves a commit, or pretends to:**
+the approval stays human, and a skip only declines to move.
+
+The refinement sits INSIDE the forward-only guard, on the one branch where the target
+descends from the served commit — a workflow-level `paths` filter does not apply to
+`workflow_run`. The guard reads the served commit's tree and its CI candidate through the
+API (the job's existing `actions: read`, nothing wider), and the trusted verifier decides
+(`node trusted/release/cli.mjs shipped-change`, `release/lib/shipped.mjs`, pure). It skips
+only when BOTH hold:
+
+1. **Every changed path is NOT SHIPPED.** The trees are compared entry by entry (path,
+   mode, object), both sides of every change are judged, and a path ships nothing only if
+   it is on the allowlist AND on none of the always-shipped rules, which win:
+
+   | not shipped (allowlist) | why |
+   |---|---|
+   | `**/*.md` | `angular.json` copies no assets, `tsconfig.app.json` compiles only `src/main.ts`, Tailwind scans only `src/**/*.{html,ts}`, and there is no `public/` |
+   | `docs/**` | documentation (none exists yet) |
+   | `dependency-audit/**` except `dependency-audit/scanner/**` | not in the compile graph, no install lifecycle reads it, and the deploy reads it from the workflow revision, never the target |
+   | `.github/workflows/claude.yml`, `claude-code-review.yml` | comment/issue/review automation, no `id-token`, referenced by neither `ci.yml` nor `deploy.yml` |
+
+   **Always shipped:** `src/**`, `public/**`, `package*.json`, `angular.json`,
+   `tsconfig*.json`, `tailwind.config.js` (those four by basename, at any depth),
+   `ci.yml`, `deploy.yml`, and `dependency-audit/scanner/**` (its manifest and lock are
+   certified inputs CI installs). **Everything else is shipped by default** — `release/`
+   included, so `release/README.md` skips while `release/lib/shipped.mjs` deploys: a change
+   to the allowlist itself always deploys, and so does any change to how Admin deploys.
+   **Only a regular file (`100644`/`100755`) can be skipped**; a symlink or submodule at an
+   allowlisted path ships.
+2. **The served commit's certified candidate is retained with at least 14 days left**
+   (`RETENTION_MIN_DAYS`). The candidate is the one the existing rule selects — the latest
+   attempt's of the one successful push-to-main CI run for the served commit. Missing,
+   expired, expiring within 14 days, an ambiguous run or an unreadable expiry: the target
+   deploys, and the summary says why. That makes the skip SELF-HEALING: a run of
+   documentation-only merges can never leave the certified rollback, or Dinify-Frontend's
+   journey gate (which refuses an expired artifact), pointing at an artifact about to
+   lapse.
+
+**Failure direction.** Anything inside the new check that cannot be established — an
+unreadable or truncated tree, an API failure, a classifier error — DEPLOYS
+(`AUTO-PROCEED`), exactly as before it existed. Everything outside it is unchanged: an
+unreadable served commit and divergent histories still FAIL CLOSED red, a stale target is
+still `AUTO-SKIP-STALE`, and **a manual dispatch never reaches the check** — it stays the
+unconditional override.
+
+**The summary** states a skip as `No shipped change since <served>; not deployed.`, lists
+the changed paths (up to 20) and the served candidate's retention; a forward move the
+check let through carries `Shipped-change check: <why it deploys>`.
+
+**Frontend consequence.** A served commit older than Admin's `main` breaks nothing there:
+its gate compares the served commit only with the approved list, and re-derives a receipt
+at the exact commit through the API. A refresh therefore approves the SERVED commit, and
+the interval it reviews includes any skipped merges beneath it. A change to `deploy.yml`
+always deploys and moves the receipt-bearing blob, so it always needs a refresh that
+reviews it.
+
+Pinned by `release/tests/shipped.test.mjs` (the path table, the precedence pair, the tree
+comparison, the retention matrix, the CLI and the 4 November REPLAY over this repository's
+own git objects: #57 and #56 deploy, #58 and #59 skip) and the executed guard and summary
+tests in `release/tests/workflow.test.mjs`.
 
 ### What makes the run green
 Nothing the workflow believes about itself. The box asserts `DEPLOYED-HEAD: <sha>` only

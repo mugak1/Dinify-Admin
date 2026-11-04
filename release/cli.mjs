@@ -16,6 +16,10 @@
  *   verify         (deploy, PRIVILEGED; no network, no npm) decide AGAIN over its own facts
  *                  and require the uploaded admission to agree
  *   served         --origin --admission F [--cache-bust X]      fetch every admitted file back
+ *   shipped-change --served --target --facts DIR --served-facts DIR
+ *                  (deploy, automatic forward moves only) does the move change anything
+ *                  Admin ships, and is the served candidate retained? Prints the decision;
+ *                  exit 0 whenever one is reached, skip or deploy (release/lib/shipped.mjs)
  *
  * Exit status: 0 success · 1 refused · 2 unusable input · 64 usage. There is no option that
  * skips a check, substitutes a scanner or policy, or accepts a refusal.
@@ -35,6 +39,7 @@ import { assess, diagnosticNotes } from './lib/assessment.mjs';
 import { ADMISSION_DOC, commitFacts, decideAdmission, selectCertification, trustedTrees, verifyAdmission } from './lib/admission.mjs';
 import { certify, freeze, inspectCandidate, prebuild } from './lib/certification.mjs';
 import { ID_RE, SHA_RE, admissionArtifactName, isObject, loadReleasePolicy, parseJson, recordBytes, reason } from './lib/common.mjs';
+import { decideShippedChange } from './lib/shipped.mjs';
 import { sha256Hex, walkTree } from './lib/tree.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -127,6 +132,7 @@ const OPTIONS = {
   evaluate: ['target', 'mode', 'source', 'facts', 'candidate', 'out', 'replay', 'run-id', 'run-attempt', 'revision', 'outputs'],
   verify: ['target', 'mode', 'source', 'facts', 'candidate', 'admission', 'run-id', 'run-attempt', 'admission-id', 'admission-digest', 'admission-attempt', 'revision', 'out', 'outputs'],
   served: ['origin', 'admission', 'cache-bust'],
+  'shipped-change': ['served', 'target', 'facts', 'served-facts'],
 };
 
 function main(argv) {
@@ -270,11 +276,31 @@ function main(argv) {
       console.log(`verified: ${v.kind} ${v.mode} of ${v.target}${v.kind === 'certified' ? ` — payload sha256:${v.payloadTree}, promotable until ${new Date(Number(v.deadlineEpoch) * 1000).toISOString()}` : ' — LEGACY: not certified, not freshly assessed'}`);
       return 0;
     }
+    case 'shipped-change': {
+      // A DEPLOY decision is still exit 0: the caller skips only on {skip: true}, and treats
+      // a non-zero exit — a usage error, an unusable argument — as "deploy as before".
+      if (!SHA_RE.test(String(a.served)) || !SHA_RE.test(String(a.target)) || !a.facts || !a['served-facts']) {
+        console.error('shipped-change: --served and --target must be full SHAs, and --facts and --served-facts directories');
+        return 64;
+      }
+      const { policy } = loadReleasePolicy(ROOT);
+      const f = (dir, n) => readJson(join(dir, n));
+      const sf = a['served-facts'];
+      const d = decideShippedChange({
+        served: a.served, target: a.target,
+        servedCommit: f(sf, 'commit.json'), servedTree: f(sf, 'tree.json'),
+        targetCommit: f(a.facts, 'commit.json'), targetTree: f(a.facts, 'tree.json'),
+        policy, ciWorkflow: f(sf, 'ci-workflow.json'), run: f(sf, 'run.json'), artifacts: f(sf, 'artifacts.json'),
+        now: Date.now(),
+      });
+      console.log(JSON.stringify(d));
+      return 0;
+    }
     case 'served': {
       return served(a).then((code) => code);
     }
     default:
-      console.error('usage: node release/cli.mjs <prebuild|freeze|certify|commit-facts|choose-run|select|evaluate|verify|served> [options]');
+      console.error('usage: node release/cli.mjs <prebuild|freeze|certify|commit-facts|choose-run|select|evaluate|verify|served|shipped-change> [options]');
       return 64;
   }
 }

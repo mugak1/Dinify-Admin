@@ -110,6 +110,30 @@ name: Deploy Admin
 # "identical commit" and "identical artifact" are never the same claim. It runs before
 # the role is validated and before OIDC, so a stale automatic run never authenticates to
 # AWS. It applies to automatic runs ONLY.
+#
+# ══════════════════════════════════════════════════════════════════════════════════
+# NO SHIPPED CHANGE, NO DEPLOY — A REFINEMENT OF THE FORWARD MOVE (AUTOMATIC RUNS ONLY)
+# ══════════════════════════════════════════════════════════════════════════════════
+#
+# Dinify-Frontend's release-readiness evaluation approves exact Admin commits, so every
+# move of the served commit needs a reviewed frontend refresh. When the target descends
+# from the served commit, the guard compares the two commits' trees through the API and
+# SKIPS (AUTO-SKIP-NO-SHIPPED-CHANGE, green, no AWS) only when BOTH hold:
+#
+#   - every changed path is NOT SHIPPED: on the explicit allowlist in release/lib/shipped.mjs
+#     (**/*.md, docs/**, dependency-audit/** except dependency-audit/scanner/**, and the two
+#     Claude workflows), on none of the always-shipped rules (src/**, public/**,
+#     package*.json, angular.json, tsconfig*.json, tailwind.config.js, ci.yml, deploy.yml,
+#     dependency-audit/scanner/**), and a regular file on both sides. Everything else —
+#     release/ included, so a change to the allowlist itself — counts as shipped;
+#   - the SERVED commit's certified candidate is retained with at least 14 days left, so
+#     the certified rollback and Dinify-Frontend's journey gate never sit on an artifact
+#     about to expire.
+#
+# Anything that check cannot establish (an unreadable or truncated tree, an API failure,
+# a classifier error, an unreadable expiry) DEPLOYS, exactly as before it existed. The
+# served commit therefore may lag main by merges that ship nothing. Nothing here approves
+# a commit: a skip only declines to move. A manual dispatch never reaches the check.
 
 on:
   # Automatic. `workflow_run.workflows` can only match on the workflow's DISPLAY NAME,
@@ -1125,6 +1149,12 @@ jobs:
       # or a pre-contract build) is a green SKIP that says so — it is never presented as
       # evidence that this candidate is served.
       #
+      # A FORWARD MOVE THAT SHIPS NOTHING IS A SKIP TOO (AUTO-SKIP-NO-SHIPPED-CHANGE): when
+      # every path changed since the served commit is on the not-shipped allowlist in
+      # release/lib/shipped.mjs AND the served commit's candidate is retained with at least
+      # 14 days left. Anything that check cannot establish deploys, as before it existed.
+      # An unreadable served commit and divergent histories still fail closed.
+      #
       # THE STEP ALWAYS RUNS (after verification), including for manual runs, where it
       # immediately returns proceed=true: a skipped step's outputs are empty, and every
       # downstream `if:` would then have to encode "empty means yes".
@@ -1201,7 +1231,40 @@ jobs:
           rm -f ordering.json
 
           if [ "$O_STATUS" = "ahead" ] && [ "$O_BASE" = "$SERVED" ]; then
-            emit true AUTO-PROCEED "$SERVED" "target descends from the served commit — this is a forward move"
+            # NO SHIPPED CHANGE, NO DEPLOY. Reached only for a forward move. Every fact is
+            # gathered here, best effort: a failed read leaves its file absent, and the trusted
+            # classifier then decides DEPLOY. A classifier that does not run to a decision is
+            # DEPLOY too. Only {skip: true, code: no_shipped_change} skips.
+            SF=served-facts
+            rm -rf "$SF" shipped-change.json
+            mkdir -p "$SF"
+            fetch() { gh api "/repos/${GITHUB_REPOSITORY}/$1" > "$SF/$2" 2>/dev/null || rm -f "$SF/$2"; }
+            fetch "git/commits/${SERVED}" commit.json
+            S_TREE="$(jq -r '.tree.sha // empty' "$SF/commit.json" 2>/dev/null || true)"
+            if [[ "$S_TREE" =~ ^[0-9a-f]{40}$ ]]; then fetch "git/trees/${S_TREE}?recursive=1" tree.json; fi
+            fetch "actions/workflows/ci.yml" ci-workflow.json
+            fetch "actions/workflows/ci.yml/runs?head_sha=${SERVED}&branch=main&event=push&status=success&per_page=100" runs.json
+            S_RUN="$(node trusted/release/cli.mjs choose-run --target "$SERVED" --listing "$SF/runs.json" 2>/dev/null)" || S_RUN=""
+            if [[ "$S_RUN" =~ ^[1-9][0-9]{0,19}$ ]]; then
+              fetch "actions/runs/${S_RUN}" run.json
+              fetch "actions/runs/${S_RUN}/artifacts?per_page=100" artifacts.json
+            fi
+            if node trusted/release/cli.mjs shipped-change --served "$SERVED" --target "$TARGET_SHA" --facts facts --served-facts "$SF" > shipped-change.json 2>/dev/null; then
+              SC_SKIP="$(jq -r '.skip // empty' shipped-change.json 2>/dev/null || true)"
+              SC_CODE="$(jq -r '.code // empty' shipped-change.json 2>/dev/null || true)"
+              SC_REASON="$(jq -r '.reason // empty' shipped-change.json 2>/dev/null | tr -d '\r\n' || true)"
+            else
+              SC_SKIP=false; SC_CODE=unavailable
+              SC_REASON="the shipped-change check did not run to a decision; deploying"
+              rm -f shipped-change.json
+            fi
+            [ -n "${SC_REASON:-}" ] || SC_REASON="the shipped-change check gave no reason; deploying"
+            echo "shipped_check=${SC_REASON}" >> "$GITHUB_OUTPUT"
+            if [ "$SC_SKIP" = "true" ] && [ "$SC_CODE" = "no_shipped_change" ]; then
+              emit false AUTO-SKIP-NO-SHIPPED-CHANGE "$SERVED" "No shipped change since ${SERVED}; not deployed"
+            else
+              emit true AUTO-PROCEED "$SERVED" "target descends from the served commit — this is a forward move (${SC_REASON})"
+            fi
           elif [ "$O_BASE" = "$TARGET_SHA" ]; then
             emit false AUTO-SKIP-STALE "$SERVED" "target is an ancestor of the served commit (compare: ${O_STATUS}); a newer release is already live, so this stale automatic run will not downgrade it"
           else
@@ -1953,6 +2016,7 @@ jobs:
           DECISION: ${{ steps.ordering.outputs.decision }}
           SERVED_SHA: ${{ steps.ordering.outputs.served_sha }}
           ORDER_REASON: ${{ steps.ordering.outputs.reason }}
+          SHIPPED_CHECK: ${{ steps.ordering.outputs.shipped_check }}
           CERT_RUN: ${{ steps.facts.outputs.run_id }}
           CERT_ATTEMPT: ${{ steps.facts.outputs.run_attempt }}
           CERT_ARTIFACT: ${{ steps.facts.outputs.artifact_id }}
@@ -1982,6 +2046,17 @@ jobs:
               echo "- Ordering decision: \`${DECISION:-not reached}\` — ${ORDER_REASON:-no reason recorded}"
               if [ -n "${SERVED_SHA:-}" ]; then
                 echo "- Public origin was serving: \`${SERVED_SHA}\`"
+              fi
+              if [ "${DECISION:-}" = "AUTO-SKIP-NO-SHIPPED-CHANGE" ]; then
+                echo ""
+                echo "No shipped change since \`${SERVED_SHA}\`; not deployed."
+                echo ""
+                echo "- Changed since the served commit, all on the not-shipped allowlist (release/lib/shipped.mjs):"
+                jq -r '.changed[:20][] | "  - `\(.path)` (\(.change))"' shipped-change.json 2>/dev/null || echo "  - (the list could not be read)"
+                jq -r 'if (.changed | length) > 20 then "  - … and \((.changed | length) - 20) more" else empty end' shipped-change.json 2>/dev/null || true
+                echo "- Served candidate retention: $(jq -r '.retention.detail' shipped-change.json 2>/dev/null || echo 'unreadable')"
+              elif [ -n "${SHIPPED_CHECK:-}" ]; then
+                echo "- Shipped-change check: ${SHIPPED_CHECK}"
               fi
             fi
 
